@@ -1,0 +1,337 @@
+"""
+Tool schemas for Chisel formal verification workflow.
+Defines structured actions as function declarations for the LLM to call.
+
+5 Stages:
+  1. build_top_module - Generate TestTop.scala with InclusiveCache
+  2. write_assertions - Add deadlock detection assertions using ChiselFV
+  3. invoke_verification - Compile and run formal verification
+  4. waveform_explanation - Analyze counterexample waveforms
+  5. propose_bugfix - Fix identified bugs
+"""
+
+from typing import Dict, List, Any, Optional
+from copy import deepcopy
+
+# Supported formal verification stages
+FORMAL_STAGES = ["build_top_module", "write_assertions", "invoke_verification", 
+                 "waveform_explanation", "propose_bugfix"]
+
+
+STAGE_COMPLETION_PARAMS = {
+    "stage_complete": {
+        "type": "boolean",
+        "description": "Set to true if this action completes the current stage",
+        "default": False
+    }
+}
+
+def add_complete_params(properties: Dict) -> Dict:
+    """Add stage completion parameters to a properties dict."""
+    result = deepcopy(properties)
+    result.update(STAGE_COMPLETION_PARAMS)
+    return result
+
+WAVEFORM_TOOLS = [
+    {
+        "name": "waveform_find_signals",
+        "description": "Find signals in the waveform matching a pattern",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Pattern to search for in signal names"
+                },
+                "regex": {
+                    "type": "boolean",
+                    "description": "Whether the pattern is a regex",
+                    "default": False
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return",
+                    "default": 50
+                },
+            },
+            "required": ["pattern"]
+        }
+    },
+    {
+        "name": "waveform_get_signal_value",
+        "description": "Get the values of one or more signals at their corresponding time points. Accepts parallel arrays: signal_names[i] is queried at times[i]. Signal names must be exact waveform names (including bit-range suffix like ' [15:0]' when present).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "signal_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of full hierarchical signal names to query"
+                },
+                "times": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "List of time points corresponding to each signal (must be same length as signal_names)"
+                }
+            },
+            "required": ["signal_names", "times"]
+        }
+    },
+    {
+        "name": "waveform_trace_signal",
+        "description": "Trace a signal's value changes over a time range",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "signal_name": {"type": "string", "description": "Full hierarchical name of the signal"},
+                "start_time": {"type": "integer", "description": "Optional start time"},
+                "end_time": {"type": "integer", "description": "Optional end time"},
+                "max_changes": {"type": "integer", "description": "Maximum changes to return", "default": 100}
+            },
+            "required": ["signal_name"]
+        }
+    },
+    {
+        "name": "waveform_get_active_signals",
+        "description": "Get all non-zero signals at a specific time point",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "time": {"type": "integer", "description": "Time point to query"},
+                "scope_pattern": {"type": "string", "description": "Optional pattern to filter by scope"},
+                "max_results": {"type": "integer", "description": "Maximum results", "default": 100}
+            },
+            "required": ["time"]
+        }
+    },
+    {
+        "name": "waveform_compare_signals",
+        "description": "Compare multiple signals at multiple time points",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "signal_names": {"type": "array", "items": {"type": "string"}, "description": "List of signal names"},
+                "times": {"type": "array", "items": {"type": "integer"}, "description": "List of time points"}
+            },
+            "required": ["signal_names", "times"]
+        }
+    },
+    {
+        "name": "waveform_find_transitions",
+        "description": "Find all time points where a signal transitions between values",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "signal_name": {"type": "string", "description": "Full hierarchical name of the signal"},
+                "from_value": {"type": "string", "description": "Value to transition from"},
+                "to_value": {"type": "string", "description": "Value to transition to"},
+                "max_matches": {"type": "integer", "description": "Maximum transitions", "default": 50}
+            },
+            "required": ["signal_name", "from_value", "to_value"]
+        }
+    }
+]
+
+WRITE_REPORT_TOOL = {
+    "name": "write_report",
+    "description": "Write the counterexample analysis report to counterexample_analysis.md in the work directory. This is the final step to complete the stage.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "Markdown content of the analysis report"
+            },
+            "stage_complete": {"type": "boolean", "description": "Set to true if this action completes the current stage", "default": False},
+            "error_type": {
+                "type": "string",
+                "enum": ["dut_bug", "assertion_error", "setup_error"],
+                "description": "Type of error found in counterexample (REQUIRED if stage_complete=true). Choose: 'dut_bug' for real DUT bugs, 'assertion_error' for assertion writing errors, 'setup_error' for top module configuration errors"
+            }
+        },
+        "required": ["content"]
+    }
+}
+
+def create_read_files_tool(extra_description: str = "") -> Dict:
+    """
+    Create a read_files tool schema.
+    
+    Args:
+        extra_description: Additional context for the description
+    """
+    base_desc = "Read source files to correlate with waveform signals" if not extra_description else extra_description
+    
+    return {
+        "name": "read_files",
+        "description": base_desc,
+        "parameters": {
+            "type": "object",
+            "properties": add_complete_params({
+                "file_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of file paths relative to extra_bench directory"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Reason for reading these files"
+                }
+            }),
+            "required": ["file_paths", "reason"]
+        }
+    }
+
+
+# Reset stage tool - only for benchmark build_top_module
+RESET_STAGE_TOOL = {
+    "name": "reset_stage",
+    "description": "Reset the stage to its initial state, restoring all files to their original content. Use this when you realize your previous outputs have fundamental issues that require starting fresh (e.g., wrong module structure, incorrect assumptions, or misunderstanding of requirements).",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "description": "Detailed explanation of what was wrong with the previous output and why a reset is needed. This helps avoid making the same mistakes again."
+            },
+            "issues_identified": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of specific issues in the previous output that led to the need for reset"
+            }
+        },
+        "required": ["reason", "issues_identified"]
+    }
+}
+
+BUILD_TOP_TOOL_SCHEMAS = [
+    {
+        "name": "confirm_existing_harness",
+        "description": "Confirm that the existing verification harness is correct and complete. Use this INSTEAD of rewriting when a harness class/object designed for generating Verilog already exists and appears correct.",
+        "parameters": {
+            "type": "object",
+            "properties": add_complete_params({
+                "harness_file": {
+                    "type": "string",
+                    "description": "Path to the existing harness file (relative to extra_bench directory)"
+                },
+                "analysis": {
+                    "type": "string",
+                    "description": "Brief analysis of why the existing harness is correct (e.g., 'Proper module instantiation, ready for assertions')"
+                }
+            }),
+            "required": ["harness_file", "analysis", "stage_complete"]
+        }
+    },
+    {
+        "name": "write_file",
+        "description": "Write or modify a Chisel/Scala source file in the extra_bench directory. Use this ONLY if no suitable verification harness exists or it has errors that need fixing.",
+        "parameters": {
+            "type": "object",
+            "properties": add_complete_params({
+                "file_path": {
+                    "type": "string",
+                    "description": "Relative path from extra_bench directory (e.g., 'TestHarness.scala')"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Complete Scala source code for the file"
+                }
+            }),
+            "required": ["file_path", "content"]
+        }
+    },
+    create_read_files_tool("Read source files to understand the existing design. All .scala files in extra_bench are already provided in the prompt, so only use this if you need to re-examine specific files."),
+    RESET_STAGE_TOOL
+]
+
+WRITE_ASSERTIONS_TOOL_SCHEMAS = [
+    {
+        "name": "write_assertions",
+        "description": "Add formal verification assertions to the Chisel design. Use ChiselFV APIs or Chisel LTL assertions to specify properties to verify.",
+        "parameters": {
+            "type": "object",
+            "properties": add_complete_params({
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the file to modify (relative to extra_bench directory)"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Complete Scala source code WITH assertions"
+                }
+            }),
+            "required": ["file_path", "content"]
+        }
+    },
+    create_read_files_tool("Read source files to understand signal structure for assertion writing")
+]
+
+WAVEFORM_EXPLANATION_TOOL_SCHEMAS = (
+    WAVEFORM_TOOLS + 
+    [create_read_files_tool("Read source files to correlate with waveform signals")] +
+    [WRITE_REPORT_TOOL]
+)
+
+PROPOSE_BUGFIX_TOOL_SCHEMAS = [
+    create_read_files_tool("Read source files to understand the code that needs fixing"),
+    {
+        "name": "write_fix",
+        "description": "Write the fixed source file in the extra_bench directory.",
+        "parameters": {
+            "type": "object",
+            "properties": add_complete_params({
+                "file_path": {
+                    "type": "string",
+                    "description": "Path relative to extra_bench directory"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Complete fixed source code"
+                },
+                "bugfix_report": {
+                    "type": "string",
+                    "description": "Markdown report describing the bug fix (required if stage_complete=true). Include: 1) What was the bug, 2) How it was fixed, 3) Why this fix is correct."
+                }
+            }),
+            "required": ["file_path", "content"]
+        }
+    }
+]
+
+
+def get_tool_schemas(formal_stage: str = "build_top_module", target: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Get the appropriate tool schemas for a formal verification stage.
+    
+    Args:
+        formal_stage: Which stage we're in ('build_top_module', 'write_assertions', 
+                     'waveform_explanation', 'propose_bugfix')
+        target: Verification target (benchmark name like 'gigamax')
+        
+    Returns:
+        List of tool schema dictionaries
+    """
+    stage_schemas = {
+        "build_top_module": BUILD_TOP_TOOL_SCHEMAS,
+        "write_assertions": WRITE_ASSERTIONS_TOOL_SCHEMAS,
+        "waveform_explanation": WAVEFORM_EXPLANATION_TOOL_SCHEMAS,
+        "propose_bugfix": PROPOSE_BUGFIX_TOOL_SCHEMAS,
+    }
+    return stage_schemas.get(formal_stage, stage_schemas["build_top_module"])
+
+
+def convert_tool_call_to_action(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert a function call (tool name + arguments) to action format.
+    
+    Args:
+        tool_name: Name of the tool/function being called
+        tool_args: Arguments passed to the tool
+        
+    Returns:
+        Action dictionary in the format expected by execute_actions
+    """
+    action = {"type": tool_name}
+    action.update(tool_args)
+    return action
