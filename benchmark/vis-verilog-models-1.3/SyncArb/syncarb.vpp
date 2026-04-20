@@ -1,0 +1,70 @@
+// Synchronous arbiter from McMillan's thesis.
+//
+// Author: Fabio Somenzi <Fabio@Colorado.EDU>
+
+`let MSB = 15
+`let N = `MSB + 1
+
+module syncArb(clock,req,ack);
+    input  clock;
+    input  [`MSB:0] req;
+    output [`MSB:0] ack;
+
+    reg [`MSB:0]    lreq;
+    wire [`N:0]     token;
+    wire [`N:0]     grant;
+    wire [`N:0]     override;
+    wire [`MSB:0]   tokenInit;
+
+    initial lreq = 0;
+
+    always @ (posedge clock) lreq = req;
+
+    assign tokenInit = `N'b1;
+    assign override[`N] = 0;
+    assign grant[0] = ~override[0];
+    assign token[0] = token[`N];
+
+    `for (i = 0; i < `N; i++)
+    `let ip1` = `i + 1
+    cell c::`i (clock,lreq[`i],ack[`i],token[`i],token[`ip1],tokenInit[`i],
+                grant[`i],grant[`ip1],override[`ip1],override[`i]);
+    `endfor
+
+endmodule // syncArb
+
+
+module cell(clock,req,ack,tokenIn,tokenOut,tokenInit,grantIn,grantOut,
+	    overrideIn,overrideOut);
+    input  clock;
+    input  req;
+    output ack;
+    input  tokenIn;
+    output tokenOut;
+    input  tokenInit;
+    input  grantIn;
+    output grantOut;
+    input  overrideIn;
+    output overrideOut;
+
+    reg    token;
+    reg    waiting;
+    wire   tw;
+
+    initial begin
+	token = tokenInit;
+	waiting = 0;
+    end // initial begin
+
+    always @ (posedge clock) begin
+	waiting = req & (waiting | token);
+	token = tokenIn;
+    end // always @ (posedge clock)
+
+    assign tw = token & waiting;
+    assign ack = req & (grantIn | tw);
+    assign tokenOut = token;
+    assign grantOut = grantIn & ~req;
+    assign overrideOut = overrideIn | tw;
+
+endmodule // cell

@@ -1,0 +1,87 @@
+A simple arbitration circuit for VIS TTC
+Yuji Kukimoto
+kukimoto@eecs.berkeley.edu
+
+STG: see figures.ps
+circuit structure: see figures.ps
+
+Overall picture:
+
+Three requesting modules (called clients) are competing to get a bus
+access. At any point, only one module is allowed to get a bus access. 
+Each client has a controller attached to it, from which an
+acknowledgment is given.  All the controllers communicate with an
+arbiter so that at any time at most one controller gives an
+acknowledgment.  The arbiter is a simple three-state machine. It has
+a single output indicating which controller can be selected among the
+three at each time tick.  If the "active" input of the controller is
+0, the output is X, meaning that no one is selected.
+
+The protocol here is that a controller takes a control from the
+arbiter if it is selected by the arbiter and it has a request.
+Otherwise, the control is passed to the next controller.  A signal
+pass_ctrl is set to one iff the controller needs to pass a control to
+another controller. There are two cases: 1) when the controller is
+done processing a request, 2) when the controller has no request
+waiting, but is selected. In both cases, the variable is set to one in
+the next clock so that another controller waiting for an access can
+take a control. The "active" signal of the arbiter is set to one iff
+one of the pass_ctrl is set to one.
+
+A client has to keep a request signal high until an acknowledgment is
+given. Even after an acknowledgment is returned from the
+corresponding controller, req can be high for a finite amount of time. 
+This means that different requests take different time to complete. 
+Fairness constraints arise here since we do not want to keep req high
+for infinite time.
+
+I. CTL Model Checking
+
+A. Property:
+
+  1. mutual exclusion
+  2. AG(req->AF(ack))
+
+  # safety: mutual exclusion
+  AG ( !(ackA = 1 * ackB = 1 + ackB = 1 * ackC = 1 + ackC = 1 * ackA=1) );
+
+  # liveness: 
+  AG( (reqA = 1) -> AF(ackA = 1) );
+  AG( (reqB = 1) -> AF(ackB = 1) );
+  AG( (reqC = 1) -> AF(ackC = 1) );
+
+B. Fairness:
+
+  !(clientA.state=HAVE_TOKEN);
+  !(clientB.state=HAVE_TOKEN);
+  !(clientC.state=HAVE_TOKEN);
+
+C. Files:
+
+  arbiter.v: a fair arbiter. the liveness property passes under fairness
+  constraints. arbiter_bug.v is another version of arbiter.v, where the state
+  transition graph of the arbiter is slightly different. This is not a
+  fair arbiter.
+
+  arbiter.fair: fairness constraints
+
+  arbiter.ctl: ctl files
+
+II. Language emptiness check:
+
+A. File: arbiter_le.v
+
+An observer is added to check if the liveness property for clientA is
+satisfied. The observer is a non-deterministic machine which
+represents the complement of the liveness property.  Ending up in
+state BAD in the observer means that the behavior is bad. Thus,
+observer.state=BAD is added to the fairness constraints.  The
+corresponding fairness file is arbiter_le.fair. The language emptiness
+check passes, implying that the design is correct.
+
+B. Note:
+
+Complementing the liveness property is not so intuitive even though
+the property is very simple. It turned out that we really need a
+non-deterministic machine to representing this property under Buchi
+constraint.

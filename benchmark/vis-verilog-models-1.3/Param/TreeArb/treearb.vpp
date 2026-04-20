@@ -1,0 +1,190 @@
+/*
+ * Tree arbiter derived from the one of Adnan Aziz, which in turn is based
+ * on the one in David Dill's thesis.  The aribter of Aziz tries to improve
+ * efficiency by not returning the token every time to the root of the tree.
+ * However, it has bugs that cause starvation.  This version fixes those bugs.
+ *
+ * Author: Fabio Somenzi <Fabio@Colorado.EDU>
+ */
+
+typedef enum {idle, request, lock, release} phase;
+
+/*
+ * The inteconnections between the processors and the cells.
+ *
+ */
+`let N = 4;
+
+module main (clk);
+    input clk;
+
+    `let j = 0;
+    `let jp1 = 1;
+    `let odd = `N & 1;
+    `for (n = (`N + 1) >> 1; n > 1; n = (n + 1) >> 1)
+    `for (i = 0; i < `n; i++)
+    `let t = 2 * `i;
+    `let u = `t + 1;
+    phase wire r`j::_`t, r`j::_`u; wire a`j::_`t, a`j::_`u;
+    arbitCell C`j::_`i (clk, 0, r`j::_`t, r`j::_`u, a`j::_`t, a`j::_`u, r`jp1::_`i, a`jp1::_`i);
+    `endfor
+    `if (`odd)
+    assign r`j::_`u = idle;
+    `endif
+    `let j = `jp1;
+    `let jp1 = `j + 1;
+    `let odd = n & 1;
+
+    `endfor
+    phase wire r`j::_0, r`j::_1; wire a`j::_0, a`j::_1;
+    arbitCell C`j::_0 (clk, 1, r`j::_0, r`j::_1, a`j::_0, a`j::_1, r`jp1::_0, a`jp1::_0);
+
+    phase wire r`jp1::_0; wire a`jp1::_0;
+    assign a`jp1::_0 = 0;
+
+    `for (i = 0; i < `N; i++)
+    proc P`i (clk, a0_`i, r0_`i);
+    `endfor
+
+endmodule // main
+
+
+/*
+ * A process loops through four states: idle, request, lock, and release.
+ * The transitions from idle to request, and from lock to release are
+ * nondeterministic.
+ */
+module proc (clk, ack, req);
+    input  clk;
+    input  ack;
+    output req;
+
+    wire   ack;
+    phase reg req;
+    wire   choice;
+
+    assign choice = $ND(0,1);
+
+    initial req = idle;
+
+    always @(posedge clk) begin
+	if (req == idle  && choice == 1) begin
+	    req = request;
+        end else if (req == request && ack == 1) begin
+	    req = lock;
+        end else if (req == lock && choice == 1) begin
+            req = release;
+        end else if (req == release) begin
+            req = idle;
+        end
+    end
+
+endmodule // proc
+
+
+/*
+ * The arbiter cell has two inputs from children and two outputs to chidren.
+ * One input from parent, and one output to parent. The latch holdToken
+ * corresponds to whether the cell holds the token. The latch prevLeft
+ * is used to keep track of which way the token went last,
+ * to impart fairness in the scheduling of the children.
+ */
+module arbitCell (clk, topCell, urLeft, urRight, uaLeft, uaRight, xr, xa);
+    input  clk;
+    input  topCell, urLeft, urRight, xa;
+    output uaLeft, uaRight, xr;
+
+    wire   topCell, uaLeft, uaRight, xa;
+    phase wire urLeft, urRight, xr;
+
+    wire   uaLeft, uaRight;
+
+    reg    prevLeft;
+    initial prevLeft = 0;
+
+    reg    processedLeft, processedRight;
+    initial processedLeft = 0;
+    initial processedRight = 0;
+
+    wire   mustGiveParent; /* essentially a macro for checking
+			     if must release the token to parent */
+    assign mustGiveParent = (processedLeft || urLeft != request) &&
+	   (processedRight || urRight != request) && !topCell;
+
+    reg    holdToken;
+    initial holdToken = topCell;
+
+    wire   childOwns; /* essentially a macro for checking
+		        if a descendant owns the token */
+    assign childOwns = urLeft == lock || urRight == lock;
+
+    wire   giveChild; /* essentially a macro for checking
+		        if a child is being given the token */
+    assign giveChild = uaLeft || uaRight;
+
+    /*
+     * Condition under which the token is given to the left child
+     * Must own token, have request from left, and either no request from
+     * right or if there is a request from the right it should be left's
+     * turn (since right went the last time )
+     */
+    assign uaLeft = !mustGiveParent && holdToken && urLeft == request
+	   && (urRight != request || !prevLeft);
+
+    /*
+     * same as above for right
+     */
+    assign uaRight = !mustGiveParent && holdToken && urRight == request
+	   && (urLeft != request || prevLeft);
+
+    wire   requesting;
+    assign requesting = urLeft == request || urRight == request;
+    /*
+     * signal to parent:
+     *
+     *   1. request if don't own the token,
+     *   2. lock if descendant has locked the token
+     *   3. release if child has released token
+     *   4. idle otherwise
+     */
+    assign xr = !holdToken && requesting ? request
+	   : childOwns ? lock
+	   : holdToken && !topCell && (mustGiveParent || !requesting) ? release
+	   : idle;
+
+    always @(posedge clk) begin
+	/*
+	 * keep track of whether we hold the token or not
+	 */
+	if (xa) begin
+  	    holdToken = 1;
+	    processedLeft = 0;
+            processedRight = 0;
+        end else if (giveChild) begin
+	    holdToken = 0;
+        end else if (urLeft == release || urRight == release) begin
+	    holdToken = 1;
+        end else if (xr == release) begin
+	    holdToken = 0;
+        end
+
+	/*
+	 * keep track of which child got the token last
+	 */
+	if (uaLeft) begin
+            prevLeft  = 1;
+	end else if (uaRight) begin
+            prevLeft  = 0;
+	end
+
+	/*
+	 * child has finished processing the token
+	 */
+	if (urLeft == release) begin
+	    processedLeft = 1;
+	end else if (urRight == release) begin
+	    processedRight = 1;
+	end
+    end
+
+endmodule // arbitCell

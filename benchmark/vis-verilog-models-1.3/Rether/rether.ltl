@@ -1,0 +1,131 @@
+# LTL Properties for the two rether models (RTF and SQO).  Differences in
+# outcome between the two are noted below.  This set of properties consists
+# of 13 of the 14 properties in the Du et al. paper, followed by other
+# properties of interest.  The 13 properties were derived from their English
+# descriptions in the paper, rather than from the mu-calculus.  The omitted
+# one cannot be expressed in LTL.
+
+
+# Definition of useful predicates.
+
+# A real-time transmission occurs.
+\define SRT	rt<*0*>=1 + rt<*1*>=1 + rt<*2*>=1 + rt<*3*>=1
+# A non-real-time transmission occurs.
+\define SNRT	nrt<*0*>=1 + nrt<*1*>=1 + nrt<*2*>=1 + nrt<*3*>=1
+# A transmission of either type occurs.
+\define S0	\SRT + \SNRT
+# This variant of the previous predicate is used to tighten the
+# original T3T property.  Since the "admitted" nodes are always polled
+# in ID order, if Node 0 performs an RT transmission, then it is the
+# first transmission of a token rotation cycle.  Hence, the second
+# transmission can be anything but an RT transmission by Node 0.
+\define SM0	rt<*1*>=1 + rt<*2*>=1 + rt<*3*>=1 + \SNRT
+# These three predicates are used to tighten T3T for the SQO policy.
+\define S1	 rt<*0*>=1 +  rt<*1*>=1 +  rt<*2*>=1 +
+		nrt<*0*>=1 + nrt<*1*>=1 + nrt<*2*>=1
+\define S2	 rt<*1*>=1 +  rt<*2*>=1 +  rt<*3*>=1 +
+		nrt<*0*>=1 + nrt<*1*>=1 + nrt<*2*>=1
+\define S3	 rt<*1*>=1 +  rt<*2*>=1 +  rt<*3*>=1 +
+		nrt<*1*>=1 + nrt<*2*>=1 + nrt<*3*>=1
+
+
+# Properties from Du, Smolka, and Cleaveland.
+
+#PASS: CC: Token rotation cycle completion.
+G(start=1 -> X(start=0 U cycle=1));
+
+#PASS: RT0-3: Bandwidth guarantee for RT nodes.
+G(res<*0*>=1 -> (F(rt<*0*>=1) *
+                 ((cycle=1 * X(rt<*0*>=1 R cycle=0)) R rt<*0*>=0)));
+G(res<*1*>=1 -> (F(rt<*1*>=1) *
+                 ((cycle=1 * X(rt<*1*>=1 R cycle=0)) R rt<*1*>=0)));
+G(res<*2*>=1 -> (F(rt<*2*>=1) *
+                 ((cycle=1 * X(rt<*2*>=1 R cycle=0)) R rt<*2*>=0)));
+G(res<*3*>=1 -> (F(rt<*3*>=1) *
+                 ((cycle=1 * X(rt<*3*>=1 R cycle=0)) R rt<*3*>=0)));
+# These properties can also be written thus, but then there are some
+# vacuous passes due to the fact that rt<*i*>=1 implies cycle=0.
+#G(res<*0*>=1 -> (rt<*0*>=0 U (cycle=1 * X(cycle=0 U rt<*0*>=1))));
+#G(res<*1*>=1 -> (rt<*1*>=0 U (cycle=1 * X(cycle=0 U rt<*1*>=1))));
+#G(res<*2*>=1 -> (rt<*2*>=0 U (cycle=1 * X(cycle=0 U rt<*2*>=1))));
+#G(res<*3*>=1 -> (rt<*3*>=0 U (cycle=1 * X(cycle=0 U rt<*3*>=1))));
+
+#PASS: NS0-3: No starvation for NRT traffic.
+G F nrt<*0*>=1;
+G F nrt<*1*>=1;
+G F nrt<*2*>=1;
+G F nrt<*3*>=1;
+
+#PASS: RTT: At least one RT data transmission in each cycle.
+G(start=1 -> (\SRT R cycle=0));
+
+#PASS: NRT: At least one NRT data transmission in each cycle.
+G(start=1 -> (\SNRT R cycle=0));
+
+#PASS: T3T: A total of three data transmissions in each cycle.  This property
+# has a number of vacuous passes with either policy.  See below for
+# strengthened properties that pass non vacuously for one policy, but fail
+# for the other.
+G(start=1 -> (\S0 R X(\SM0 R X(\S0 R cycle=0))));
+
+#PASS: RTF: RT-first property.
+G(\SNRT -> (cycle=1 R !\SRT));
+
+
+# Supplemental properties.
+
+#PASS: Start and cycle are mutually exclusive.
+G(start=0 + cycle=0);
+
+#PASS: Mutual exclusion.
+G ((!\SRT + !\SNRT) *
+   (rt<*0*>=0 + rt<*1*>=0) * (rt<*0*>=0 + rt<*2*>=0) *
+   (rt<*0*>=0 + rt<*3*>=0) * (rt<*1*>=0 + rt<*2*>=0) *
+   (rt<*1*>=0 + rt<*3*>=0) * (rt<*2*>=0 + rt<*3*>=0) *
+   (nrt<*0*>=0 + nrt<*1*>=0) * (nrt<*0*>=0 + nrt<*2*>=0) *
+   (nrt<*0*>=0 + nrt<*3*>=0) * (nrt<*1*>=0 + nrt<*2*>=0) *
+   (nrt<*1*>=0 + nrt<*3*>=0) * (nrt<*2*>=0 + nrt<*3*>=0));
+
+#PASS: New cycles start and end infinitely often.  The second is actually
+# redundant, since we have proved that cycle=1 follows inevitably start=1.
+G F start=1;
+G F cycle=1;
+
+#PASS: At least one RT allocation.
+G !RT_count[1:0]=0;
+G (node<*0*>=1 + node<*1*>=1 + node<*2*>=1 + node<*3*>=1);
+
+#PASS: At most one reservation per cycle for each node.
+G(res<*0*>=0 + X(cycle=1 R res<*0*>=0));
+G(res<*1*>=0 + X(cycle=1 R res<*1*>=0));
+G(res<*2*>=0 + X(cycle=1 R res<*2*>=0));
+G(res<*3*>=0 + X(cycle=1 R res<*3*>=0));
+
+#PASS: All nodes with reserved bandwidth at the begginning of the cycle
+# perform their RT transmission during the cycle.
+G(start=1 * node<*0*>=1 -> (rt<*0*>=1 R cycle=0));
+G(start=1 * node<*1*>=1 -> (rt<*1*>=1 R cycle=0));
+G(start=1 * node<*2*>=1 -> (rt<*2*>=1 R cycle=0));
+G(start=1 * node<*3*>=1 -> (rt<*3*>=1 R cycle=0));
+
+#PASS: RT requests are served in ID order.
+G(rt<*1*>=0 + (cycle=1 R rt<*0*>=0));
+G(rt<*2*>=0 + (cycle=1 R rt<*1*>=0));
+G(rt<*3*>=0 + (cycle=1 R rt<*2*>=0));
+
+#PASS: This stronger version of the T3T property holds for the RTF policy.
+# It says that in each cycle there are exactly three transmissions: The first
+# is always an RT transmission; the last is always an NRT transmission; and
+# the middle one can be anything but an RT transmission by Node 0.
+G(start=1 -> (\SRT R X(\SM0 R X(\SNRT R cycle=0))));
+
+#PASS: This stronger version of the T3T property holds for the SQO policy.
+# It says that in each cycle there are exactly three transmissions: The first
+# cannot be by Node 3; the second cannot be rt<*0*> or nrt<*3*>; and the
+# the third cannot be by Node 0.
+G(start=1 -> (\S1 R X(\S2 R X(\S3 R cycle=0))));
+
+#PASS: Only for the SQO policy.  In the SQO policy the token is given to
+# each node in ID order so that res<*3*>=1 can only happen on the clock
+# cycle immediately preceding the end of the token rotation cycle.
+G(res<*3*>=1 -> X cycle=1);

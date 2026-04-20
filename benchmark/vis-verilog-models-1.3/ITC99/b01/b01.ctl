@@ -1,0 +1,12 @@
+#PASS:
+AG EX TRUE;
+AG EF stato=a;
+AG(EX(OUTP=1) * EX(OUTP=0));
+AG(AX(OVERFLW=0) + AX(OVERFLW=1));
+AG(OVERFLW=1 -> AX:2(OVERFLW=0));
+
+#FAIL:
+AG AF stato=a;
+AF OUTP=1;
+AF OVERFLW=1;
+AG !stato=wf0;

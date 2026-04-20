@@ -1,0 +1,58 @@
+# The directory contains information about the cache content
+# that is coherent with the information in the cache controller
+# If the block is in state SHARED in the cache controller, its corresponding
+# bit is set in the Rlist of the directory
+
+AG(((direc.cache_Rlist1<*1*> = 1) -> AX((cc1.block_state=SHARED) * (cc1.block_add<0>=1))) + ((((cc1.block_state=SHARED) * (cc1.block_add<0>=1))) -> (direc.cache_Rlist1<*1*> = 1)));
+
+# The directory contains information about the cache content
+# that is coherent with the information in the cache controller
+# If the block is in state EXCLUSIVE in the cache controller, its corresponding
+# bit is set in the Wlist of the directory
+
+AG(((cc1.block_state = EXCLUSIVE)*(cc1.block_add<0> = 0)) ->  (direc.cache_Wlist1<*0*> = 1));
+
+# Two caches do not have exclusive access to the same block
+
+AG(((cc1.block_state=EXCLUSIVE) * (cc2.block_state=EXCLUSIVE)) ->
+         (((cc1.block_add<0> = 0) *(cc2.block_add<0>=1)+
+          ((cc1.block_add<0> = 1)*(cc2.block_add<0>=0)))));
+
+# If a cache has exclusive access to a block, then the other cache
+# has no access to that block 
+# Property for block 0 owned by cache 1
+
+AG(((cc1.block_state=EXCLUSIVE) * (cc1.block_add<0> = 0)) ->
+    ((cc2.block_state=INVALID) + ! (cc2.block_add<0> = 0)) );
+
+# liveness property one: a read request from processor 1 will eventually
+# be serviced
+
+AG (( proc1.proc_state = READING ) -> AF (proc1.acknowledge = 1));
+AG(proc1.proc_state = READING -> AF(proc1.proc_state=IDLE));
+
+# If a cache has exclusive access to a block, then the other cache
+# has no access to that block 
+# Property for block 0 owned by cache 1
+
+AG(((cc1.block_state=EXCLUSIVE) * (cc1.block_add<0> = 1)) ->
+    ((cc2.block_state=INVALID) + ! (cc2.block_add<0> = 1)));
+
+# The directory contains information about the cache content
+# that is coherent with the information in the cache controller
+# If the block is in state SHARED in the cache controller, its corresponding
+# bit is set in the Rlist of the directory
+AG(((direc.cache_Rlist1<*0*> = 1) -> AX((cc1.block_state=SHARED) * (cc1.block_add<0>=0))) +
+   ((((cc1.block_state=SHARED) * (cc1.block_add<0>=1))) -> (direc.cache_Rlist1<*0*> = 1)));
+
+# The directory contains information about the cache content
+# that is coherent with the information in the cache controller
+# If the block is in state EXCLUSIVE in the cache controller, its corresponding
+# bit is set in the Wlist of the directory
+# FAILS
+AG(((cc1.cache_req = blk_rreq)*(direc.arbiter_state = ONE)*(cc1.blk_add<0>=0)*(direc.cache_Wlist2<*0*> = 1)) -> (cc2.block_state = EXCLUSIVE));
+
+
+# Safety property one: a read request from processor 1 will eventually
+# be serviced
+AG (( proc1.proc_state = READING ) -> AF (proc1.acknowledge = 1));

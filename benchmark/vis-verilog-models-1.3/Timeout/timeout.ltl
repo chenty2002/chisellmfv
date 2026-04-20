@@ -1,0 +1,35 @@
+# The alarm will inevitably ring.
+#FAIL: If no timeout is set, the alarm will not ring.
+F ring=1;
+
+# If the timeout is set, the alarm will ring.
+#FAIL: If the process terminates before the timeout,
+#      the alarm will be reset.
+G(timeToAlarm[0]=1 -> F ring=1);
+
+#PASS: If the timeout is set and the process takes at least
+#      as long as the timeout, the alarm will ring.
+G(state=COMPUTING * timeToAlarm[3:0]==remainingCpuTime[3:0] -> F ring=1);
+
+#PASS: Another way to say that a true timeout will cause an alarm.
+G(state=START -> X(earlyTermination=1 -> F ring=1));
+
+#PASS: In the finish state all CPU time has been spent.
+G(state=FINISH -> remainingCpuTime[3:0]=0);
+
+#PASS: The remaining CPU time can change from 0 only in the START state.
+G(state=START + (remainingCpuTime[3:0]=0 -> X remainingCpuTime[3:0]=0));
+
+#PASS: The FINISH state is always reached.
+F state=FINISH;
+
+#PASS: In the end, the accumulated CPU time equals the minimum of the time
+#      required to complete the process and the timeout value.
+G(state=FINISH -> ((earlyTermination=1 * realCpuTime[3:0]==saveTimeOut[3:0]) +
+                   (earlyTermination=0 * realCpuTime[3:0]==saveCpuTime[3:0])));
+
+#PASS: No time left when in the final state.
+G(state=FINISH -> remainingCpuTime[3:0]=0);
+
+#PASS: the alarm rings when the timeout expires.
+G(ring=1 -> timeToAlarm[3:0]=0);

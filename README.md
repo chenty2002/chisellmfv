@@ -22,6 +22,7 @@ Verilog by first converting it to Chisel.
 - **Verilog → Chisel conversion workflow** driven by compile-error feedback
 - **Benchmarks out-of-the-box**
   - `RTLLM`, `verilog-eval` — registered as git submodules
+  - `vis-verilog-models-1.3` — vendored in-tree
 - **Chisel build stack as submodules** — `chiselfv`, `pylibfst-cache`
 - **Causal root-cause analysis** via the `VerilogCausalAnalysis` submodule,
   automatically invoked during the `waveform_explanation` stage
@@ -34,7 +35,8 @@ Verilog by first converting it to Chisel.
 chisellmfv/
 ├── benchmark/
 │   ├── RTLLM/                     ← submodule
-│   └── verilog-eval/              ← submodule
+│   ├── verilog-eval/              ← submodule
+│   └── vis-verilog-models-1.3/    ← vendored
 ├── chisel/
 │   ├── build.sbt                  ← top-level sbt (aggregates chiselfv)
 │   ├── Makefile

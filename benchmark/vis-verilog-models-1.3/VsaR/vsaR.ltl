@@ -1,0 +1,178 @@
+\define IF	State[2:0]=0
+\define ID	State[2:0]=1
+\define EXE	State[2:0]=2
+\define MEM	State[2:0]=3
+\define WB	State[2:0]=4
+\define R0eqR1	Registers<*0*>[4:0]==Registers<*1*>[4:0]
+\define R0eqR2	Registers<*0*>[4:0]==Registers<*2*>[4:0]
+\define R0eqR3	Registers<*0*>[4:0]==Registers<*3*>[4:0]
+\define R1eqR2	Registers<*1*>[4:0]==Registers<*2*>[4:0]
+\define R1eqR3	Registers<*1*>[4:0]==Registers<*3*>[4:0]
+\define R2eqR3	Registers<*2*>[4:0]==Registers<*3*>[4:0]
+\define AeqR0	A[4:0]==Registers<*0*>[4:0]
+\define AeqR1	A[4:0]==Registers<*1*>[4:0]
+\define AeqR2	A[4:0]==Registers<*2*>[4:0]
+\define AeqR3	A[4:0]==Registers<*3*>[4:0]
+\define BeqR0	B[4:0]==Registers<*0*>[4:0]
+\define BeqR1	B[4:0]==Registers<*1*>[4:0]
+\define BeqR2	B[4:0]==Registers<*2*>[4:0]
+\define BeqR3	B[4:0]==Registers<*3*>[4:0]
+\define AeqB	A[4:0]==B[4:0]
+
+#PASS: The program counter is always aligned on a half-word boundary.
+G(PC[0]=0 * NPC[0]=0);
+
+#PASS: Register R0 is never written.
+G(Registers<*0*>[4:0]=0);
+
+#PASS: The state is between 0 and 4.
+G(State[2]=0 + State[1:0]=0);
+
+#PASS: If the two source fields are the same, the ALU input registers
+# will hold the same value during the EXE, MEM, and WB states.
+G(adFld1[1:0]==adFld2[1:0] -> (State[2:1]=0 + A[4:0]==B[4:0]));
+
+#PASS: In case of branch, Cond is consistent with A in the MEM and WB states.
+G(branch=1 * State[2]=1 -> ((Cond=1 -> A[4:0]=0) * (A[4:0]=0 -> Cond=1)));
+
+#PASS: a XOR a = 0.
+G(regRegALU=1 * funFld[2:0]=b100 * adFld1[1:0]==adFld2[1:0] ->
+  (State[2]=1 -> ALUOutput[4:0]=0));
+
+#PASS: XOR is performed correctly.
+G(regRegALU=1 * funFld[2:0]=b100 * 
+  (State[2]=1 + State[1:0]=0 + State[1:0]=3) ->
+   (A[4]==B[4] -> ALUOutput[4]=0) * (ALUOutput[4]=0 -> A[4]==B[4]) *
+   (A[3]==B[3] -> ALUOutput[3]=0) * (ALUOutput[3]=0 -> A[3]==B[3]) *
+   (A[2]==B[2] -> ALUOutput[2]=0) * (ALUOutput[2]=0 -> A[2]==B[2]) *
+   (A[1]==B[1] -> ALUOutput[1]=0) * (ALUOutput[1]=0 -> A[1]==B[1]) *
+   (A[0]==B[0] -> ALUOutput[0]=0) * (ALUOutput[0]=0 -> A[0]==B[0]));
+
+#PASS: a OR a = a AND a = a.
+G(regRegALU=1 * funFld[2:1]=b01 * adFld1[1:0]==adFld2[1:0] ->
+  (State[2]=1 -> ALUOutput[4:0]==A[4:0]));
+
+#PASS: AND is performed correctly.
+G(regRegALU=1 * funFld[2:0]=b010 * 
+  (State[2]=1 + State[1:0]=0 + State[1:0]=3) ->
+   (A[4]=1 * B[4]=1 -> ALUOutput[4]=1) * (ALUOutput[4]=1 -> A[4]=1 * B[4]=1) *
+   (A[3]=1 * B[3]=1 -> ALUOutput[3]=1) * (ALUOutput[3]=1 -> A[3]=1 * B[3]=1) *
+   (A[2]=1 * B[2]=1 -> ALUOutput[2]=1) * (ALUOutput[2]=1 -> A[2]=1 * B[2]=1) *
+   (A[1]=1 * B[1]=1 -> ALUOutput[1]=1) * (ALUOutput[1]=1 -> A[1]=1 * B[1]=1) *
+   (A[0]=1 * B[0]=1 -> ALUOutput[0]=1) * (ALUOutput[0]=1 -> A[0]=1 * B[0]=1));
+
+#PASS: OR is performed correctly.
+G(regRegALU=1 * funFld[2:0]=b011 * 
+  (State[2]=1 + State[1:0]=0 + State[1:0]=3) ->
+   (A[4]=0 * B[4]=0 -> ALUOutput[4]=0) * (ALUOutput[4]=0 -> A[4]=0 * B[4]=0) *
+   (A[3]=0 * B[3]=0 -> ALUOutput[3]=0) * (ALUOutput[3]=0 -> A[3]=0 * B[3]=0) *
+   (A[2]=0 * B[2]=0 -> ALUOutput[2]=0) * (ALUOutput[2]=0 -> A[2]=0 * B[2]=0) *
+   (A[1]=0 * B[1]=0 -> ALUOutput[1]=0) * (ALUOutput[1]=0 -> A[1]=0 * B[1]=0) *
+   (A[0]=0 * B[0]=0 -> ALUOutput[0]=0) * (ALUOutput[0]=0 -> A[0]=0 * B[0]=0));
+
+#PASS: a - a = 0.
+G(regRegALU=1 * funFld[2:0]=b001 * adFld1[1:0]==adFld2[1:0] ->
+  (State[2]=1 -> ALUOutput[4:0]=0));
+
+#PASS: if the destination is R1 or R3, R2 is not affected by this instruction.
+G(\ID *
+  (regRegALU=1 * adFld3[0]=1 + regRegALU=0 * adFld2[0]=1) * 
+  Registers<*2*>[4:0]=21 -> X:4(Registers<*2*>[4:0]=21));
+
+#PASS: In the decode, execute, and memory access states, PC and NPC differ
+# exactly by 2.  Hence, if the bit next to the MSB of PC is 0, then the MSBs
+# of PC and NPC must be the same, etc..
+G(State[0]=1 + State[1]=1 ->
+  (PC[1]=0 -> (NPC[4:2]==PC[4:2]) *
+   PC[2]=0 -> (NPC[4:3]==PC[4:3]) *
+   PC[3]=0 -> (NPC[4]==PC[4])));
+
+#PASS: Illegal instructions do not modify the register file.
+G(\ID * opcode[2:1]=b11 ->
+  (Registers<*1*>[4:0]=21 -> X:4(Registers<*1*>[4:0]=21)) *
+  (Registers<*2*>[4:0]=21 -> X:4(Registers<*2*>[4:0]=21)) *
+  (Registers<*3*>[4:0]=21 -> X:4(Registers<*3*>[4:0]=21)));
+
+#PASS: In case of a taken branch, ALUOutput ends up in the PC.
+G(State[2]=1 * branch=1 * Cond=1 * !(ALUOutput[4:0]==NPC[4:0]) ->
+  !(PC[4:0]==NPC[4:0]));
+
+#PASS: If no branch is taken, PC and NPC are the same in the WB state.
+G(State[2]=1 * (branch=0 + Cond=0) -> PC[4:0]==NPC[4:0]);
+
+#PASS: If no branch is taken, eventually the PC will attain any even value;
+# for instance, 11110.
+G(F(branch=1 + PC[4:0]=b11110));
+
+#PASS: A right shift followed by a left shift leaves a register unchanged,
+# except possibly for the LSB.
+G(\ID * regRegALU=1 * adFld1[1:0]=1 * adFld3[1:0]=1 *
+  funFld[2:1]=3 * Registers<*1*>[4:1]=b0101 ->
+  X:5(regRegALU=1 * funFld[2:0]=0 * adFld1[1:0]=1 * adFld2[1:0]=1 *
+      adFld3[1:0]=1 -> X:5(Registers<*1*>[4:1]=b0101)));
+
+#PASS: A register only changes if it is the destination of an instruction.
+G(Registers<*1*>[4:0]=b01010 ->
+  ((regRegALU=1 * adFld3[1:0]=1 + regRegALU=0 * adFld2[1:0]=1) R
+   Registers<*1*>[4:0]=b01010));
+
+#PASS: The register file is only modified when transitioning from WB to IF.
+G(\IF * Registers<*1*>[4:0]=b10101 * Registers<*2*>[4:0]=b01010 *
+  Registers<*3*>[4:0]=b10101 -> X:4(Registers<*1*>[4:0]=b10101 *
+  Registers<*2*>[4:0]=b01010 * Registers<*3*>[4:0]=b10101));
+
+#PASS: IR is only modified when transitioning from IF to ID.
+G(\ID * IR[11:0]=b101010101010 -> X:4(IR[11:0]=b101010101010));
+
+#PASS: NPC is only modified when transitioning from IF to ID.
+G(\ID * NPC[4:0]=b10101 -> X:4(NPC[4:0]=b10101));
+
+#PASS: A and B are only modified when transitioning from ID to EXE.
+G(\EXE * A[4:0]=b10101 * B[4:0]=b01010 -> X:4(A[4:0]=b10101 *
+  B[4:0]=b01010));
+
+#PASS: ALUOutput is only modified when transitioning from EXE to MEM.
+G(\MEM * ALUOutput[4:0]=b10101 -> X:4(ALUOutput[4:0]=b10101));
+
+#PASS: Cond is only modified when transitioning from EXE to MEM.
+G(\MEM * Cond=1 -> X:4(Cond=1));
+
+#PASS: LMD is only modified when transitioning from MEM to WB.
+G(\WB * LMD[4:0]=b10101 -> X:4(LMD[4:0]=b10101));
+
+#PASS: PC is only modified when transitioning from MEM to WB.
+G(\WB * PC[4:0]=b10101 -> X:4(PC[4:0]=b10101));
+
+#PASS: Choosing R0 as branch register always leads to a taken branch.
+G(\WB * branch=1 * adFld1[1:0]=0 -> PC[4:0]==ALUOutput[4:0]);
+
+#PASS: These states are a bit hard to reach, but they are reachable.
+!G!(Registers<*1*>[4:2]=3 * Registers<*2*>[4:2]=2 * Registers<*3*>[4:2]=1 *
+    LMD[4:0]=0 * ALUOutput[4:0]=0 * PC[4:0]=30);
+
+#PASS: Since A and B come from the register file, they cannot both be
+# different from all registers and different among themselves, because
+# only one of the registers may have been updated since they were fetched.
+#!EF(Registers<*1*>[4:3]=3 * Registers<*2*>[4:3]=2 * Registers<*3*>[4:3]=1 *
+#    A[4:0]=1 * B[4:0]=2);
+G(\R0eqR1 + \R0eqR2 + \R0eqR3 + \R1eqR2 + \R1eqR3 + \R2eqR3 + \AeqR0 +
+  \AeqR1 + \AeqR2 + \AeqR3 + \BeqR0 + \BeqR1 + \BeqR2 + \BeqR3 + \AeqB);
+
+#PASS: Unlike the previous case, A and B are the same. Hence these states are
+# reachable.
+!G!(Registers<*1*>[4:2]=3 * Registers<*2*>[4:2]=2 * Registers<*3*>[4:2]=1 *
+    LMD[4:0]=0 * A[4:0]=1 * B[4:0]=1);
+
+#PASS: Only one register can change as a result of an instruction. The
+# register that changes receives its value from either ALUOutput or LMD.
+G(\IF *
+  Registers<*1*>[4:0]=1 * Registers<*2*>[4:0]=2 * Registers<*3*>[4:0]=3 ->
+  X:5(Registers<*1*>[4:0]=1 * Registers<*2*>[4:0]=2 *
+      (Registers<*3*>[4:0]=3 + Registers<*3*>[4:0]==ALUOutput[4:0] +
+       Registers<*3*>[4:0]==LMD[4:0]) +
+      Registers<*1*>[4:0]=1 * Registers<*3*>[4:0]=3 *
+      (Registers<*2*>[4:0]=2 + Registers<*2*>[4:0]==ALUOutput[4:0] +
+       Registers<*2*>[4:0]==LMD[4:0]) +
+      Registers<*2*>[4:0]=2 * Registers<*3*>[4:0]=3 *
+      (Registers<*1*>[4:0]=1 + Registers<*1*>[4:0]==ALUOutput[4:0] +
+       Registers<*1*>[4:0]==LMD[4:0])));

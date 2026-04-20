@@ -171,8 +171,8 @@ if [[ -f "${SCRIPT_DIR}/requirements.txt" ]]; then
 fi
 
 # --- 2) Fetch hdlConvertor source submodule -------------------------------
-log "[2/4] Fetching hdlConvertor sources (recursive submodule update)"
-git submodule update --init --recursive
+log "[2/4] Fetching hdlConvertor sources"
+git submodule update --init
 [[ -d "${SCRIPT_DIR}/hdlConvertor" ]] || die "hdlConvertor directory missing after submodule update."
 
 # --- 3) Patch + build ------------------------------------------------------
