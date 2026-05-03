@@ -7,12 +7,14 @@ import os
 from typing import Dict, List, Any, Optional, Callable
 
 from .waveform_actions import execute_waveform_action, WaveformActions
+from ..causal_analysis import CausalAnalysisActions
 
 
 def execute_stage_actions(
     actions: List[Dict[str, Any]], 
     work_dir: str,
     waveform_actions: Optional[WaveformActions],
+    causal_actions: Optional[CausalAnalysisActions],
     read_file_func: Callable,
     write_file_func: Callable,
     logger,
@@ -27,6 +29,7 @@ def execute_stage_actions(
         work_dir: Working directory for the target
         workspace_dir: Root workspace directory
         waveform_actions: WaveformActions instance (if available)
+        causal_actions: CausalAnalysisActions instance (if causal JSON is available)
         read_file_func: Function to read files
         write_file_func: Function to write files
         logger: Logger instance
@@ -65,6 +68,9 @@ def execute_stage_actions(
             
             elif action_type.startswith("waveform_"):
                 result = _execute_waveform_action(action, waveform_actions)
+
+            elif action_type.startswith("causal_"):
+                result = _execute_causal_action(action, causal_actions)
             
             else:
                 result["error"] = f"Unknown action type: {action_type}"
@@ -82,6 +88,9 @@ def execute_stage_actions(
 def _execute_read_files(action: Dict[str, Any], work_dir: str, read_file_func) -> Dict[str, Any]:
     """Execute read_files action."""
     file_paths = action.get("file_paths", [])
+    line_start = action.get("line_start")
+    line_end = action.get("line_end")
+    max_chars = action.get("max_chars")
     files_result = []
     
     for fp in file_paths:
@@ -90,11 +99,21 @@ def _execute_read_files(action: Dict[str, Any], work_dir: str, read_file_func) -
             fp = os.path.join(work_dir, fp)
         content = read_file_func(fp)
         success = "Error reading file" not in content
+        display_content = None
+        read_meta: Dict[str, Any] = {}
+        if success:
+            display_content, read_meta = _filter_read_content(
+                content,
+                line_start=line_start,
+                line_end=line_end,
+                max_chars=max_chars,
+            )
         files_result.append({
             "file_path": fp,
-            "content": content if success else None,
+            "content": display_content if success else None,
             "error": content if not success else None,
             "success": success,
+            **read_meta,
         })
     
     return {
@@ -102,6 +121,45 @@ def _execute_read_files(action: Dict[str, Any], work_dir: str, read_file_func) -
         "files": files_result,
         "success": all(f["success"] for f in files_result)
     }
+
+
+def _filter_read_content(
+    content: str,
+    line_start: Optional[int] = None,
+    line_end: Optional[int] = None,
+    max_chars: Optional[int] = None,
+) -> tuple[str, Dict[str, Any]]:
+    """Apply optional line/char limits to read_files results."""
+    original_chars = len(content)
+    original_lines = content.count("\n") + (1 if content else 0)
+    selected = content
+    meta: Dict[str, Any] = {
+        "original_chars": original_chars,
+        "original_lines": original_lines,
+        "truncated": False,
+    }
+
+    if line_start is not None or line_end is not None:
+        start = max(int(line_start or 1), 1)
+        end = int(line_end or original_lines)
+        end = max(end, start)
+        lines = content.splitlines()
+        selected_lines = lines[start - 1:end]
+        selected = "\n".join(
+            f"{line_no}: {line}"
+            for line_no, line in enumerate(selected_lines, start=start)
+        )
+        meta["line_start"] = start
+        meta["line_end"] = min(end, original_lines)
+
+    if max_chars is not None and max_chars > 0 and len(selected) > max_chars:
+        selected = selected[:max_chars] + "\n... [truncated by max_chars]"
+        meta["truncated"] = True
+        meta["returned_chars"] = len(selected)
+    else:
+        meta["returned_chars"] = len(selected)
+
+    return selected, meta
 
 
 def _execute_write_file(action: Dict[str, Any], work_dir: str, write_file_func) -> Dict[str, Any]:
@@ -220,6 +278,20 @@ def _execute_waveform_action(action: Dict[str, Any], waveform_actions: Optional[
             "error": "Waveform actions not available",
             "success": False
         }
+
+
+def _execute_causal_action(
+    action: Dict[str, Any],
+    causal_actions: Optional[CausalAnalysisActions]
+) -> Dict[str, Any]:
+    """Execute causal-analysis JSON query actions."""
+    if causal_actions:
+        return causal_actions.execute(action)
+    return {
+        "type": action.get("type", ""),
+        "error": "Causal analysis JSON is not available for this waveform",
+        "success": False
+    }
 
 
 def _execute_confirm_existing_harness(

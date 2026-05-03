@@ -17,7 +17,9 @@ Supported variable names (in order of precedence):
 Endpoint / model overrides (optional — otherwise the defaults in
 `llm_properties.py` are used):
 
-    CHISELLMFV_LLM_URL, CHISELLMFV_LLM_MODEL, ...
+    CHISELLMFV_LLM_URL, CHISELLMFV_LLM_BASE_URL, CHISELLMFV_LLM_MODEL, ...
+    CHISELLMFV_LLM_EXTRA_BODY (JSON object)
+    CHISELLMFV_ENABLE_PROMPT_CACHE_KEY (true/false; OpenAI defaults to true)
 """
 
 from __future__ import annotations
@@ -116,7 +118,10 @@ def get_endpoint_overrides() -> Dict[str, Optional[str]]:
     _load_env_file(_ENV_FILE)
     return {
         "llm_url": _env_first("CHISELLMFV_LLM_URL"),
+        "llm_base_url": _env_first("CHISELLMFV_LLM_BASE_URL"),
         "llm_model": _env_first("CHISELLMFV_LLM_MODEL"),
+        "llm_extra_body": _env_first("CHISELLMFV_LLM_EXTRA_BODY"),
+        "enable_prompt_cache_key": _env_first("CHISELLMFV_ENABLE_PROMPT_CACHE_KEY"),
         "embedding_url": _env_first("CHISELLMFV_EMBEDDING_URL"),
         "embedding_model": _env_first("CHISELLMFV_EMBEDDING_MODEL"),
         "reranker_url": _env_first("CHISELLMFV_RERANKER_URL"),

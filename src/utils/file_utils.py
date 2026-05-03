@@ -178,7 +178,7 @@ def load_files_from_directory(
     """
     sources = {}
     try:
-        for filename in os.listdir(directory):
+        for filename in sorted(os.listdir(directory)):
             if filename.endswith(extension):
                 full_path = os.path.join(directory, filename)
                 if os.path.isfile(full_path):
@@ -247,7 +247,7 @@ def capture_stage_snapshot(work_dir: str, logger: Optional[logging.Logger] = Non
         return snapshot
     
     try:
-        for filename in os.listdir(work_dir):
+        for filename in sorted(os.listdir(work_dir)):
             if filename.endswith('.scala') or filename.endswith('.md'):
                 full_path = os.path.join(work_dir, filename)
                 if os.path.isfile(full_path):
@@ -292,7 +292,7 @@ def restore_stage_snapshot(
     
     try:
         # First, delete all current .scala and .md files
-        for filename in os.listdir(work_dir):
+        for filename in sorted(os.listdir(work_dir)):
             if filename.endswith('.scala') or filename.endswith('.md'):
                 full_path = os.path.join(work_dir, filename)
                 if os.path.isfile(full_path):
@@ -354,7 +354,7 @@ def get_directory_files(
         return files
     
     try:
-        for filename in os.listdir(directory):
+        for filename in sorted(os.listdir(directory)):
             if any(filename.endswith(ext) for ext in extensions):
                 if os.path.isfile(os.path.join(directory, filename)):
                     files.append(filename)

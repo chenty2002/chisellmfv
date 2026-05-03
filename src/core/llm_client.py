@@ -1,15 +1,19 @@
 import json
 import logging
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, List, Any, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 import requests
-import tiktoken
+try:
+    import tiktoken
+except ImportError:  # pragma: no cover - exercised only in minimal envs
+    tiktoken = None
 
 from ..utils.llm_properties import *
 from ..utils.config import get_endpoint_overrides
 
 # Global tokenizer instance for efficiency
-_tokenizer_cache: Dict[str, tiktoken.Encoding] = {}
+_tokenizer_cache: Dict[str, Any] = {}
 
 
 class TokenBudgetExceeded(Exception):
@@ -42,7 +46,8 @@ class LLMClient:
                  embedding_url: Optional[str] = None,
                  reranker_url: Optional[str] = None,
                  embedding_model: Optional[str] = None,
-                 reranker_model: Optional[str] = None):
+                 reranker_model: Optional[str] = None,
+                 llm_extra_body: Optional[Dict[str, Any]] = None):
         """
         Initialize the LLM client.
 
@@ -55,6 +60,7 @@ class LLMClient:
             max_token_budget: Maximum total tokens allowed across all API calls
             llm_url / embedding_url / reranker_url: Optional endpoint overrides
             embedding_model / reranker_model: Optional model overrides
+            llm_extra_body: Optional extra request fields for chat completion API
         """
         overrides = get_endpoint_overrides()
 
@@ -66,9 +72,17 @@ class LLMClient:
             reranker_model or overrides["reranker_model"] or RERANKER_MODEL
         )
 
-        self.llm_url = llm_url or overrides["llm_url"] or LLM_URL
+        llm_url_override = llm_url or overrides["llm_url"] or overrides["llm_base_url"] or LLM_URL
+        self.llm_url = self._normalize_llm_url(llm_url_override)
         self.embedding_url = embedding_url or overrides["embedding_url"] or EMBEDDING_URL
         self.reranker_url = reranker_url or overrides["reranker_url"] or RERANKER_URL
+
+        extra_body_override = overrides.get("llm_extra_body")
+        self.llm_extra_body = llm_extra_body or self._parse_extra_body(extra_body_override)
+        self.enable_prompt_cache_key = self._should_enable_prompt_cache_key(
+            overrides.get("enable_prompt_cache_key"),
+            self.llm_url,
+        )
 
         self.api_key = api_key or LLM_API_KEY
         self.embedding_api_key = embedding_api_key or EMBEDDING_API_KEY
@@ -82,20 +96,66 @@ class LLMClient:
             "embedding_calls": 0,
             "reranker_calls": 0,
             "llm_prompt_tokens": 0,
+            "llm_cached_prompt_tokens": 0,
+            "llm_cache_miss_prompt_tokens": 0,
             "llm_completion_tokens": 0,
             "llm_total_tokens": 0,
+            "llm_reasoning_tokens": 0,
             "embedding_prompt_tokens": 0,
             "embedding_completion_tokens": 0,
             "embedding_total_tokens": 0,
             "reranker_input_tokens": 0,
             "reranker_output_tokens": 0
         }
+        self.llm_usage_by_key: Dict[str, Dict[str, int]] = {}
 
         if not self.api_key:
             raise ValueError(_MISSING_API_KEY_MSG)
 
+    @staticmethod
+    def _normalize_llm_url(url: str) -> str:
+        """Accept either full chat-completions URL or an OpenAI-compatible base URL."""
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(f"Invalid LLM URL: {url}")
+
+        path = (parsed.path or "").rstrip("/")
+        if path.endswith("/chat/completions"):
+            return url
+
+        normalized_path = f"{path}/chat/completions" if path else "/chat/completions"
+        return parsed._replace(path=normalized_path, params="", query="", fragment="").geturl()
+
+    @staticmethod
+    def _parse_extra_body(extra_body_raw: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Parse JSON object from CHISELLMFV_LLM_EXTRA_BODY env var if provided."""
+        if not extra_body_raw:
+            return None
+        try:
+            payload = json.loads(extra_body_raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "CHISELLMFV_LLM_EXTRA_BODY must be a valid JSON object string"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise ValueError("CHISELLMFV_LLM_EXTRA_BODY must decode to a JSON object")
+        return payload
+
+    @staticmethod
+    def _should_enable_prompt_cache_key(raw_value: Optional[str], llm_url: str) -> bool:
+        """Enable OpenAI prompt-cache routing by default only for OpenAI URLs.
+
+        Some OpenAI-compatible providers reject unknown top-level fields. Set
+        CHISELLMFV_ENABLE_PROMPT_CACHE_KEY=true to opt in for another provider.
+        """
+        if raw_value is not None:
+            return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+        return urlparse(llm_url).netloc.endswith("api.openai.com")
+
     def _make_api_request(self, url: str, headers: dict, payload: dict, 
-                          api_type: str = "llm") -> dict:
+                          api_type: str = "llm",
+                          request_metadata: Optional[Dict[str, str]] = None) -> dict:
         """
         Common API request handler with error handling and token tracking.
         
@@ -126,19 +186,41 @@ class LLMClient:
         if "usage" in result:
             usage = result["usage"]
             current_request_tokens = usage.get("total_tokens", 0)
+            cached_tokens, miss_tokens = self._extract_prompt_cache_usage(usage)
+            completion_details = usage.get("completion_tokens_details") or {}
+            reasoning_tokens = completion_details.get("reasoning_tokens", 0)
+            hit_rate = (
+                cached_tokens / usage.get("prompt_tokens", 0)
+                if usage.get("prompt_tokens", 0) else 0.0
+            )
             print(f'LLM response: {usage.get("prompt_tokens", 0)} prompt tokens, '
                   f'{usage.get("completion_tokens", 0)} completion tokens, '
-                  f'{current_request_tokens} total tokens')
+                  f'{current_request_tokens} total tokens, '
+                  f'{cached_tokens} cached prompt tokens ({hit_rate:.1%} hit rate)')
             if self.logger:
                 self.logger.info(f'Token usage - Prompt: {usage.get("prompt_tokens", 0)}, '
                                  f'Completion: {usage.get("completion_tokens", 0)}, '
-                                 f'Total: {current_request_tokens}')
+                                 f'Total: {current_request_tokens}, '
+                                 f'Cached Prompt: {cached_tokens}, '
+                                 f'Cache Miss Prompt: {miss_tokens}, '
+                                 f'Cache Hit Rate: {hit_rate:.1%}, '
+                                 f'Reasoning: {reasoning_tokens}')
         
             if api_type == "llm":
                 self.token_usage["llm_calls"] += 1
                 self.token_usage["llm_prompt_tokens"] += usage.get("prompt_tokens", 0)
+                self.token_usage["llm_cached_prompt_tokens"] += cached_tokens
+                self.token_usage["llm_cache_miss_prompt_tokens"] += miss_tokens
                 self.token_usage["llm_completion_tokens"] += usage.get("completion_tokens", 0)
                 self.token_usage["llm_total_tokens"] += usage.get("total_tokens", 0)
+                self.token_usage["llm_reasoning_tokens"] += reasoning_tokens
+                self._record_llm_usage_breakdown(
+                    request_metadata=request_metadata,
+                    usage=usage,
+                    cached_tokens=cached_tokens,
+                    miss_tokens=miss_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                )
             elif api_type == "embedding":
                 self.token_usage["embedding_calls"] += 1
                 self.token_usage["embedding_prompt_tokens"] += usage.get("prompt_tokens", 0)
@@ -156,6 +238,67 @@ class LLMClient:
         self._check_token_budget()
         
         return result
+
+    def _record_llm_usage_breakdown(
+        self,
+        request_metadata: Optional[Dict[str, str]],
+        usage: Dict[str, Any],
+        cached_tokens: int,
+        miss_tokens: int,
+        reasoning_tokens: int,
+    ) -> None:
+        """Aggregate LLM usage by stage/prompt/tool key for benchmark analysis."""
+        metadata = dict(request_metadata or {})
+        metadata.setdefault("model", self.model)
+        key_parts = [
+            f"{name}={metadata[name]}"
+            for name in ("stage", "target", "prompt_version", "tool_schema_hash", "model")
+            if metadata.get(name)
+        ]
+        key = "|".join(key_parts) if key_parts else "unlabeled"
+
+        bucket = self.llm_usage_by_key.setdefault(
+            key,
+            {
+                "calls": 0,
+                "prompt_tokens": 0,
+                "cached_prompt_tokens": 0,
+                "cache_miss_prompt_tokens": 0,
+                "completion_tokens": 0,
+                "reasoning_tokens": 0,
+                "total_tokens": 0,
+            },
+        )
+        bucket["calls"] += 1
+        bucket["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        bucket["cached_prompt_tokens"] += cached_tokens
+        bucket["cache_miss_prompt_tokens"] += miss_tokens
+        bucket["completion_tokens"] += usage.get("completion_tokens", 0)
+        bucket["reasoning_tokens"] += reasoning_tokens
+        bucket["total_tokens"] += usage.get("total_tokens", 0)
+
+    @staticmethod
+    def _extract_prompt_cache_usage(usage: Dict[str, Any]) -> Tuple[int, int]:
+        """Return cached and uncached prompt-token counts across API variants.
+
+        DeepSeek non-streaming responses expose `prompt_cache_hit_tokens` and
+        `prompt_cache_miss_tokens`; OpenAI exposes cached tokens under
+        `prompt_tokens_details.cached_tokens`.
+        """
+        prompt_tokens = usage.get("prompt_tokens", 0) or 0
+        prompt_details = usage.get("prompt_tokens_details") or {}
+
+        cached = (
+            usage.get("prompt_cache_hit_tokens")
+            or prompt_details.get("cached_tokens")
+            or usage.get("cached_tokens")
+            or 0
+        )
+        miss = usage.get("prompt_cache_miss_tokens")
+        if miss is None:
+            miss = max(prompt_tokens - cached, 0)
+
+        return int(cached or 0), int(miss or 0)
     
     def _check_token_budget(self) -> None:
         """Check if cumulative token usage exceeds the configured budget.
@@ -192,7 +335,11 @@ class LLMClient:
                         messages: List[Dict[str, Any]],
                         tools: List[Dict[str, Any]],
                         max_tokens: int = 16384, 
-                        temperature: float = 0.5) -> Dict[str, Any]:
+                        temperature: float = 0.5,
+                        tool_choice: Optional[Union[str, Dict[str, Any]]] = "required",
+                        prompt_cache_key: Optional[str] = None,
+                        prompt_cache_retention: Optional[str] = None,
+                        usage_metadata: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """
         Chat completion with message history and function calling support.
         Uses standard agent loop format with role: assistant + role: tool messages.
@@ -204,6 +351,9 @@ class LLMClient:
             tools: List of tool/function declarations
             max_tokens: Maximum number of tokens to generate
             temperature: Sampling temperature (0-1)
+            tool_choice: OpenAI-compatible tool choice policy. Defaults to
+                         "required" so the API enforces the workflow's
+                         tool-only prompt contract.
             
         Returns:
             Dictionary containing:
@@ -217,17 +367,32 @@ class LLMClient:
             "tools": [{"type": "function", "function": tool} for tool in tools],
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "stream": False,
         }
+        if tools and tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if prompt_cache_key and self.enable_prompt_cache_key:
+            payload["prompt_cache_key"] = prompt_cache_key
+        if prompt_cache_retention and self.enable_prompt_cache_key:
+            payload["prompt_cache_retention"] = prompt_cache_retention
+        if self.llm_extra_body:
+            # This client sends raw HTTP JSON, so provider-specific request
+            # fields belong at the top level rather than under SDK-only
+            # wrappers such as `extra_body`.
+            payload.update(self.llm_extra_body)
 
         # Count tokens in all messages
-        prompt_tokens = sum(count_tokens(str(m.get("content", ""))) for m in messages)
-        print(f'LLM chat_with_tools request: {prompt_tokens} tokens and {len(tools)} tools')
+        prompt_tokens = count_tokens(json.dumps(messages, ensure_ascii=False, default=str))
+        tool_tokens = count_tokens(json.dumps(payload.get("tools", []), ensure_ascii=False, sort_keys=True))
+        print(f'LLM chat_with_tools request: ~{prompt_tokens + tool_tokens} prompt/tool tokens '
+              f'({prompt_tokens} message, {tool_tokens} tool) and {len(tools)} tools')
 
         result = self._make_api_request(
             self.llm_url,
             self._create_headers(self.api_key),
             payload,
-            "llm"
+            "llm",
+            request_metadata=usage_metadata,
         )
 
         # Parse response
@@ -344,7 +509,12 @@ class LLMClient:
         Returns:
             Dictionary containing token usage statistics
         """
-        return self.token_usage.copy()
+        usage = self.token_usage.copy()
+        usage["llm_usage_by_key"] = {
+            key: bucket.copy()
+            for key, bucket in self.llm_usage_by_key.items()
+        }
+        return usage
     
     def print_token_usage(self, logger: Optional[logging.Logger] = None) -> None:
         """
@@ -356,7 +526,12 @@ class LLMClient:
             "=" * 40,
             f"LLM Calls: {usage['llm_calls']}",
             f"  Prompt Tokens: {usage['llm_prompt_tokens']}",
+            f"  Cached Prompt Tokens: {usage['llm_cached_prompt_tokens']}",
+            f"  Cache Miss Prompt Tokens: {usage['llm_cache_miss_prompt_tokens']}",
+            f"  Cache Hit Rate: "
+            f"{(usage['llm_cached_prompt_tokens'] / usage['llm_prompt_tokens'] * 100.0) if usage['llm_prompt_tokens'] else 0.0:.1f}%",
             f"  Completion Tokens: {usage['llm_completion_tokens']}",
+            f"  Reasoning Tokens: {usage['llm_reasoning_tokens']}",
             f"  Total Tokens: {usage['llm_total_tokens']}",
             "",
             f"Embedding Calls: {usage['embedding_calls']}",
@@ -371,6 +546,21 @@ class LLMClient:
             f"Total API Calls: {usage['llm_calls'] + usage['embedding_calls'] + usage['reranker_calls']}",
             f"Total Tokens: {usage['llm_total_tokens'] + usage['embedding_total_tokens'] + usage['reranker_input_tokens'] + usage['reranker_output_tokens']}",
         )
+        if self.llm_usage_by_key:
+            usage_summary += ("", "LLM Cache Breakdown:")
+            for key, bucket in sorted(self.llm_usage_by_key.items()):
+                prompt = bucket["prompt_tokens"]
+                hit_rate = (
+                    bucket["cached_prompt_tokens"] / prompt * 100.0
+                    if prompt else 0.0
+                )
+                usage_summary += (
+                    f"  {key}",
+                    f"    calls={bucket['calls']} prompt={prompt} "
+                    f"cached={bucket['cached_prompt_tokens']} "
+                    f"miss={bucket['cache_miss_prompt_tokens']} "
+                    f"hit_rate={hit_rate:.1f}% total={bucket['total_tokens']}",
+                )
         
         print("\n".join(usage_summary))
         if logger:
@@ -382,6 +572,7 @@ class LLMClient:
         """
         for key in self.token_usage:
             self.token_usage[key] = 0
+        self.llm_usage_by_key.clear()
 
     def get_total_tokens_used(self) -> int:
         """Return total tokens used across all API types (LLM + embedding + reranker)."""
@@ -403,7 +594,7 @@ class LLMClient:
         return max(0.0, remaining / self.max_token_budget * 100.0)
 
 
-def get_tokenizer(model: str = "cl100k_base") -> tiktoken.Encoding:
+def get_tokenizer(model: str = "cl100k_base") -> Any:
     """
     Get a tokenizer instance with caching for efficiency.
     
@@ -418,6 +609,9 @@ def get_tokenizer(model: str = "cl100k_base") -> tiktoken.Encoding:
         A tiktoken Encoding instance
     """
     global _tokenizer_cache
+
+    if tiktoken is None:
+        raise ImportError("tiktoken is not installed")
     
     if model not in _tokenizer_cache:
         try:
@@ -448,6 +642,11 @@ def count_tokens(text: str, model: str = "cl100k_base") -> int:
     """
     if not text:
         return 0
+
+    if tiktoken is None:
+        # Fallback for environments without tiktoken. API-reported usage remains
+        # authoritative; this estimate is only used for local request logging.
+        return max(1, len(text) // 4)
     
     tokenizer = get_tokenizer(model)
     tokens = tokenizer.encode(text)
@@ -467,6 +666,9 @@ def count_tokens_batch(texts: List[str], model: str = "cl100k_base") -> List[int
     """
     if not texts:
         return []
+
+    if tiktoken is None:
+        return [count_tokens(text, model) for text in texts]
     
     tokenizer = get_tokenizer(model)
     return [len(tokenizer.encode(text)) for text in texts]

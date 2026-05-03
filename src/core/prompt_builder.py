@@ -13,10 +13,14 @@ This module provides:
 - build_tool_result_message(): Builds tool result messages (for `role: tool`)
 """
 
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
+import hashlib
 import json
 import os
 from ..utils.llm_properties import MAX_ITERATIONS, WAVEFORM_MAX_ITER
+
+
+PROMPT_VERSION = "formal-v2-cache-aware"
 
 
 CHISEL6_LTL_DOC = """
@@ -216,10 +220,10 @@ def build_system_prompt(
     
     Args:
         stage: Current stage (build_top_module, write_assertions, etc.)
-        target: Verification target (benchmark name)
-        chisel_dir: Path to chisel directory
-        workspace_dir: Root workspace directory
-        work_dir_files: List of .scala and .md files in work directory (for benchmark targets)
+        target/chisel_dir/workspace_dir/work_dir_files: Kept for API compatibility.
+            Benchmark-specific context is intentionally emitted in the user
+            prompt so the system prompt keeps a long cacheable prefix across
+            benchmark targets.
         
     Returns:
         System prompt string for the `role: system` message
@@ -239,6 +243,8 @@ def build_system_prompt(
     
     base_prompt.extend([
         "",
+        f"## Prompt Version: {PROMPT_VERSION}",
+        "",
         "## Response Format Requirements",
         "- You MUST respond ONLY with tool calls. Never respond with plain text.",
         "- Always use the provided tools to perform actions",
@@ -246,7 +252,6 @@ def build_system_prompt(
         "- Set `stage_complete=true` in your final tool call when the stage objective is achieved",
         "",
         f"## Current Stage: {stage.replace('_', ' ').title()}",
-        f"## Target: {target}",
         "",
         f"## Iteration Limit",
         f"Maximum iterations allowed: {max_iter}. Make each iteration count.",
@@ -255,32 +260,71 @@ def build_system_prompt(
     
     stage_section = _build_generic_stage_prompt(stage)
     
-    # Directory structure
-    path_info = [
-        "## Directory Structure",
-        f"- Benchmark: `{target}`",
-        f"- Work Directory: `{chisel_dir}/extra_bench/{target}/`",
-        f"- Source Files: All .scala files in the work directory",
-        f"- Generated Verilog: `{chisel_dir}/extra_bench/{target}/generated/`",
-        f"- Verilog Output: `{workspace_dir}/verilog/extra_bench/{target}/`",
+    cache_note = [
+        "## Benchmark Context",
+        "Benchmark-specific target names, paths, source manifests, waveform paths,",
+        "and prior reports are provided in the user message. Prefer relative paths",
+        "when calling tools.",
         "",
     ]
     
-    # Add work_dir files list if provided
-    if work_dir_files:
-        path_info.extend([
-            "## Work Directory Contents",
-        ])
-        for f in work_dir_files:
-            path_info.append(f"- `{f}`")
-        path_info.append("")
-    
-    path_info.extend([
-        "**Writable Directory:** Work Directory for source modifications.",
+    return "\n".join(base_prompt + stage_section + cache_note)
+
+
+def _display_path(path: Optional[str], workspace_dir: Optional[str]) -> str:
+    """Prefer stable relative paths in prompts while keeping unknown paths intact."""
+    if not path:
+        return ""
+    if workspace_dir:
+        try:
+            return os.path.relpath(path, workspace_dir)
+        except ValueError:
+            pass
+    return path
+
+
+def _scala_symbol_summary(content: str) -> str:
+    """Extract a compact symbol summary to help the model choose files to read."""
+    import re
+
+    symbols: List[str] = []
+    package_match = re.search(r"^\s*package\s+([\w.]+)", content, re.MULTILINE)
+    if package_match:
+        symbols.append(f"package {package_match.group(1)}")
+
+    for kind, name in re.findall(
+        r"^\s*(class|object|trait)\s+([A-Za-z_]\w*)",
+        content,
+        flags=re.MULTILINE,
+    )[:12]:
+        symbols.append(f"{kind} {name}")
+
+    return ", ".join(symbols) if symbols else "no top-level symbols detected"
+
+
+def _format_source_manifest(scala_sources: Dict[str, str]) -> List[str]:
+    """Render a compact deterministic source manifest instead of full files."""
+    lines = [
+        "## Source Manifest",
         "",
-    ])
-    
-    return "\n".join(base_prompt + stage_section + path_info)
+        "Source files are summarized here to keep benchmark prompts small. Use",
+        "`read_files` to inspect exact code before confirming, modifying, or fixing",
+        "a file.",
+        "",
+    ]
+
+    for fpath in sorted(scala_sources):
+        content = scala_sources[fpath]
+        fname = os.path.basename(fpath)
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+        line_count = content.count("\n") + (1 if content else 0)
+        lines.append(
+            f"- `{fname}`: {line_count} lines, {len(content)} chars, "
+            f"sha256:{digest}; symbols: {_scala_symbol_summary(content)}"
+        )
+
+    lines.extend(["", "---", ""])
+    return lines
 
 
 def build_user_prompt(
@@ -303,32 +347,44 @@ def build_user_prompt(
         User prompt string for the initial `role: user` message
     """
     sections = []
+    env = context.get("environment", {})
+    workspace_dir = context.get("workspace_dir")
+    target = env.get("target") or env.get("benchmark", "")
+    
+    # User query/task first: it is mostly stage-static in benchmark runs, which
+    # improves prompt-cache locality before benchmark-specific data appears.
+    sections.extend([
+        "## Task",
+        context.get("user_query", "Complete the current stage of formal verification."),
+        "",
+        "## Benchmark Context",
+        f"- Benchmark: `{target}`",
+        f"- Work Directory: `{_display_path(env.get('work_dir'), workspace_dir)}`",
+        f"- Source Directory: `{_display_path(env.get('verify_src'), workspace_dir)}`",
+        f"- Generated Verilog: `chisel/extra_bench/{target}/generated/`",
+        f"- Verilog Output: `verilog/extra_bench/{target}/`",
+        "- Writable Directory: the benchmark work directory",
+        "",
+    ])
+
+    if context.get("existing_harness_files"):
+        sections.append("## Existing Harness Candidates")
+        for path in sorted(context.get("existing_harness_files", [])):
+            sections.append(f"- `{_display_path(path, workspace_dir)}`")
+        sections.append("")
     
     # Add source files if provided
     if scala_sources and stage != "invoke_verification":
-        sections.append("## Source Files")
-        sections.append("")
-        for fpath, content in scala_sources.items():
-            fname = os.path.basename(fpath)
-            sections.extend([
-                f"### {fname}",
-                f"**Path:** `{fpath}`",
-                "```scala",
-                content,
-                "```",
-                "",
-            ])
-        sections.append("---")
-        sections.append("**Note:** All source files above are already loaded. Only use `read_files` for files NOT listed above.")
-        sections.append("")
+        sections.extend(_format_source_manifest(scala_sources))
     
     # Waveform metadata for waveform_explanation stage
     if stage == "waveform_explanation" and "waveform_path" in context.get("environment", {}):
         waveform_path = context["environment"]["waveform_path"]
+        waveform_display_path = _display_path(waveform_path, workspace_dir)
         waveform_filename = os.path.basename(waveform_path)
         sections.extend([
             "## Waveform Information",
-            f"- Waveform File: `{waveform_path}`",
+            f"- Waveform File: `{waveform_display_path}`",
             f"- Waveform Filename: `{waveform_filename}`",
             "",
         ])
@@ -353,6 +409,7 @@ def build_user_prompt(
 
         # Causal analysis prior evidence (optional, from VerilogCausalAnalysis submodule)
         causal_report = context.get("environment", {}).get("causal_analysis_report")
+        causal_index = context.get("environment", {}).get("causal_analysis_index")
         if causal_report:
             sections.extend([
                 "## Prior Causal Analysis (auxiliary evidence)",
@@ -360,9 +417,30 @@ def build_user_prompt(
                 "The following report was produced by an independent Verilog causal-analysis tool",
                 "(`VerilogCausalAnalysis`). Treat it as PRIOR evidence: it may suggest candidate",
                 "root-cause signals and a causal DAG, but you must still verify each claim against",
-                "the waveform and source code before finalising your analysis.",
+                "the waveform and source code before finalising your analysis. Prefer the structured",
+                "`causal_get_roots`, `causal_trace_path`, and `causal_get_node_evidence` tools when",
+                "you need details from the DAG instead of repeatedly searching the waveform blindly.",
                 "",
                 causal_report,
+                "",
+                "---",
+                "",
+            ])
+        if causal_index:
+            sections.extend([
+                "## Structured Causal DAG Index",
+                "",
+                "A compact index of the causal DAG is available below; query the full JSON through",
+                "the causal_* tools when you need exact node/edge evidence.",
+                "",
+                "```json",
+                json.dumps(
+                    causal_index,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "```",
                 "",
                 "---",
                 "",
@@ -383,13 +461,6 @@ def build_user_prompt(
             "",
         ])
     
-    # User query/task
-    sections.extend([
-        "## Task",
-        context.get("user_query", "Complete the current stage of formal verification."),
-        "",
-    ])
-    
     return "\n".join(sections)
 
 
@@ -409,8 +480,9 @@ def build_tool_result_message(
     Returns:
         Message dictionary with role: tool
     """
-    # Format result content
-    content = json.dumps(result, ensure_ascii=False, indent=2)
+    # Format result content compactly; exact JSON is preserved, but repeated tool
+    # turns no longer pay for pretty-print whitespace.
+    content = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
     
     return {
         "role": "tool",
@@ -463,6 +535,7 @@ def _build_generic_stage_prompt(stage: str) -> list:
             "You MUST follow these steps in order:",
             "",
             "**Step 1: Analyze Existing Files**",
+            "- Use the source manifest to choose files, then call `read_files` for exact source before deciding.",
             "- Check if source files contain an object that:",
             "  1. Is named `VerilogGenerator` in package `llmverify`",
             "  2. Instantiates the DUT (design under test)",
@@ -476,7 +549,7 @@ def _build_generic_stage_prompt(stage: str) -> list:
             "  Use `write_file` to create/fix the generator",
             "",
             "## Guidelines for New Generator (if needed)",
-            "- Analyze the provided Scala source files to understand the design",
+            "- Analyze the relevant Scala source files via `read_files` to understand the design",
             "- Create `VerilogGenerator.scala` with proper structure:",
             "  ```scala",
             "  package llmverify",
@@ -504,7 +577,7 @@ def _build_generic_stage_prompt(stage: str) -> list:
             "Add formal verification assertions to the Chisel design.",
             "",
             "## Guidelines",
-            "- Analyze the design logic from the source files",
+            "- Use the source manifest to select files, then call `read_files` for exact design logic",
             "- Identify critical properties to verify",
             "- Add assertions using Chisel's formal verification APIs",
             "- Consider using ChiselFV APIs or Chisel LTL assertions",

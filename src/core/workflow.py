@@ -19,6 +19,7 @@ This implementation uses standard agent loop with message history:
 
 import os
 import json
+import hashlib
 from typing import List, Dict, Any, Optional
 import logging
 
@@ -27,16 +28,21 @@ from ..utils.llm_properties import MAX_ITERATIONS, WAVEFORM_MAX_ITER
 from ..utils.llm_logging import LLMLogger
 from ..utils.file_utils import *
 from .prompt_builder import (
+    PROMPT_VERSION,
     build_system_prompt,
     build_user_prompt,
     build_tool_result_message,
     build_compilation_error_message
 )
+from .context_manager import EvidenceNotebook, compact_messages_with_notebook
 from .waveform_actions import WaveformActions
 from .tool_schemas import get_tool_schemas, convert_tool_call_to_action
 from .actions import execute_stage_actions
 from .build_operations import BuildOperations
-from ..causal_analysis import run_causal_analysis_if_available
+from ..causal_analysis import (
+    CausalAnalysisActions,
+    run_causal_analysis_result_if_available,
+)
 
 
 class FormalWorkflow:
@@ -79,6 +85,7 @@ class FormalWorkflow:
         self.waveform_path = waveform_path
         self.current_stage = stage
         self.target = target
+        self.causal_actions: Optional[CausalAnalysisActions] = None
         
         # Initialize paths based on target
         self._init_paths()
@@ -262,6 +269,7 @@ class FormalWorkflow:
         
         iterations = []
         iteration_count = 0
+        waveform_notebook = EvidenceNotebook() if stage == "waveform_explanation" else None
         self._repeated_tool_call_counts: Dict[str, int] = {}
         self._repeated_tool_call_notified: set = set()
         
@@ -270,6 +278,7 @@ class FormalWorkflow:
         self.logger.info(f"Captured stage snapshot: {list(self._stage_snapshot.keys())}")
         
         tool_schemas = get_tool_schemas(stage, target=self.target)
+        cache_metadata = self._build_prompt_cache_metadata(stage, tool_schemas)
         
         # Load Scala sources for initial prompt
         scala_for_prompt = None
@@ -281,18 +290,29 @@ class FormalWorkflow:
 
         # Run Verilog causal analysis as prior evidence for waveform_explanation.
         # The generated summary is attached to the context and injected into the
-        # LLM user prompt as additional root-cause hints.
+        # LLM user prompt as additional root-cause hints. The structured JSON is
+        # also exposed through causal_* tools so the model can query it on demand.
+        self.causal_actions = None
         if stage == "waveform_explanation" and self.waveform_path:
             try:
-                causal_report = run_causal_analysis_if_available(
+                causal_result = run_causal_analysis_result_if_available(
                     workspace_dir=self.workspace_dir,
                     logger=self.logger,
                     fst_path=self.waveform_path,
                     target=self.target,
                 )
-                if causal_report:
+                if causal_result and causal_result.summary:
                     self.logger.info("Causal analysis report attached to waveform_explanation prompt.")
-                    context.setdefault("environment", {})["causal_analysis_report"] = causal_report
+                    context.setdefault("environment", {})["causal_analysis_report"] = causal_result.summary
+                if causal_result and causal_result.json_report:
+                    self.causal_actions = CausalAnalysisActions(
+                        json_report=causal_result.json_report,
+                        summary=causal_result.summary,
+                        output_dir=causal_result.output_dir,
+                    )
+                    context.setdefault("environment", {})["causal_analysis_index"] = (
+                        self.causal_actions.get_index()
+                    )
             except Exception as e:
                 # Never fail the workflow because the auxiliary analyser stumbled.
                 self.logger.warning(f"Causal analysis failed to run: {e}")
@@ -304,7 +324,12 @@ class FormalWorkflow:
             self._log_llm_request(stage, i, [messages[0], messages[-1]], tool_schemas)
             
             # Use chat_with_tools for agent loop style API call
-            response = self.llm.chat_with_tools(messages, tool_schemas)
+            response = self.llm.chat_with_tools(
+                messages,
+                tool_schemas,
+                prompt_cache_key=cache_metadata["prompt_cache_key"],
+                usage_metadata=cache_metadata,
+            )
             
             try:
                 self._log_llm_response(stage, i, response)
@@ -317,10 +342,17 @@ class FormalWorkflow:
                     
                     if result.get("stage_complete"):
                         return result["result"]
+
+                    self._maybe_compact_waveform_context(
+                        stage, context, messages, waveform_notebook
+                    )
                 else:
                     # LLM returned text instead of tool calls - add error message and retry
                     iteration_count = self._handle_text_response(
                         response, stage, context, iterations, iteration_count, messages
+                    )
+                    self._maybe_compact_waveform_context(
+                        stage, context, messages, waveform_notebook
                     )
                     
             except TokenBudgetExceeded:
@@ -336,11 +368,32 @@ class FormalWorkflow:
                     "role": "user",
                     "content": f"Error occurred: {str(e)}. Please try again with tool calls only."
                 })
+                self._maybe_compact_waveform_context(
+                    stage, context, messages, waveform_notebook
+                )
         
         return {
             "success": False,
             "iterations": iterations,
             "error": "Max iterations reached",
+        }
+
+    def _build_prompt_cache_metadata(
+        self,
+        stage: str,
+        tool_schemas: List[Dict[str, Any]],
+    ) -> Dict[str, str]:
+        """Build stable cache metadata for providers and usage reports."""
+        tool_hash = hashlib.sha256(
+            json.dumps(tool_schemas, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:10]
+        prompt_hash = hashlib.sha256(PROMPT_VERSION.encode("utf-8")).hexdigest()[:8]
+        return {
+            "prompt_cache_key": f"chisellmfv:formal:{stage}:p{prompt_hash}:t{tool_hash}",
+            "stage": stage,
+            "target": self.target,
+            "prompt_version": PROMPT_VERSION,
+            "tool_schema_hash": tool_hash,
         }
     
     def _build_initial_messages(
@@ -474,6 +527,28 @@ class FormalWorkflow:
                     }
         
         return {"stage_complete": False, "iteration_count": iteration_count}
+
+    def _maybe_compact_waveform_context(
+        self,
+        stage: str,
+        context: Dict[str, Any],
+        messages: List[Dict[str, Any]],
+        notebook: Optional[EvidenceNotebook],
+    ) -> None:
+        """Compact long waveform histories into a deterministic evidence notebook."""
+        if stage != "waveform_explanation" or notebook is None:
+            return
+
+        iterations = context.get("iterations", [])
+        if iterations:
+            notebook.record_iteration(iterations[-1])
+
+        changed = compact_messages_with_notebook(messages, notebook)
+        if changed:
+            self.logger.info(
+                "Compacted waveform_explanation message history into evidence notebook "
+                f"({len(messages)} messages retained)."
+            )
 
     def _handle_repeated_tool_calls(
         self,
@@ -699,6 +774,7 @@ class FormalWorkflow:
             actions=actions,
             work_dir=self.work_dir,
             waveform_actions=self.waveform_actions,
+            causal_actions=self.causal_actions,
             read_file_func=self.read_file,
             write_file_func=self.write_file,
             reset_stage_func=self.reset_stage,

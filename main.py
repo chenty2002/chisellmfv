@@ -22,7 +22,7 @@ ChiselLMFV - 统一入口
 import os
 import sys
 import argparse
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 # 将 src 目录添加到路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -41,16 +41,19 @@ def main_formal(args):
     from src.utils.logger import get_logger
     from src.core.tool_schemas import FORMAL_STAGES
 
+    targets = _parse_formal_targets(args)
+
     # 设置日志
+    log_target = "batched" if len(targets) > 1 else targets[0]
     if args.full:
         logger = get_logger(__name__, console_output=False, clear_log=True,
-                            base_name=f"application-formal-full-{args.target}.log")
+                            base_name=f"application-formal-full-{log_target}.log")
     elif args.stage:
         logger = get_logger(__name__, console_output=False, clear_log=True,
-                            base_name=f"application-formal-{args.stage}-{args.target}.log")
+                            base_name=f"application-formal-{args.stage}-{log_target}.log")
     else:
         logger = get_logger(__name__, console_output=False, clear_log=True,
-                            base_name=f"application-formal-{args.target}.log")
+                            base_name=f"application-formal-{log_target}.log")
 
     # 创建 LLM 客户端
     max_tokens = getattr(args, 'max_tokens', None)
@@ -58,18 +61,39 @@ def main_formal(args):
     if max_tokens:
         logger.info(f"Token budget set to {max_tokens}")
 
-    # 创建工作流
-    workflow = FormalWorkflow(
-        llm_client=llm_client,
-        chisel_dir=args.chisel_dir,
-        workspace_dir=args.workspace_dir,
-        logger=logger,
-        target=args.target,
-        waveform_path=args.waveform,
-        stage=args.stage if args.stage else FORMAL_STAGES[0],
-    )
-
     try:
+        if args.full and len(targets) > 1:
+            success = _run_stage_batched_formal(
+                args=args,
+                targets=targets,
+                llm_client=llm_client,
+                logger=logger,
+                workflow_cls=FormalWorkflow,
+                formal_stages=FORMAL_STAGES,
+            )
+            _exit(llm_client, logger, success=success)
+
+        if args.stage and len(targets) > 1:
+            success = _run_multi_target_stage(
+                args=args,
+                targets=targets,
+                llm_client=llm_client,
+                logger=logger,
+                workflow_cls=FormalWorkflow,
+            )
+            _exit(llm_client, logger, success=success)
+
+        target = targets[0]
+        workflow = FormalWorkflow(
+            llm_client=llm_client,
+            chisel_dir=args.chisel_dir,
+            workspace_dir=args.workspace_dir,
+            logger=logger,
+            target=target,
+            waveform_path=args.waveform,
+            stage=args.stage if args.stage else FORMAL_STAGES[0],
+        )
+
         if args.full:
             start_stage = args.start_stage if args.start_stage else FORMAL_STAGES[0]
             logger.info(f"Starting full workflow from stage: {start_stage}")
@@ -82,7 +106,7 @@ def main_formal(args):
 
                 workflow.current_stage = stage
                 result = workflow.process_task(
-                    user_query=get_default_query(stage=stage, target=args.target),
+                    user_query=get_default_query(stage=stage, target=target),
                 )
                 success = result.get("success", False)
 
@@ -125,6 +149,129 @@ def main_formal(args):
         logger.error(f"Token budget exceeded during formal workflow: {e}")
         print(f"\nStopping: {e}")
         _exit(llm_client, logger, success=False)
+
+
+def _parse_formal_targets(args) -> List[str]:
+    """Parse either --target or comma-separated --targets."""
+    raw_targets = getattr(args, "targets", None)
+    if raw_targets:
+        targets = [target.strip() for target in raw_targets.split(",") if target.strip()]
+        if targets:
+            return targets
+    return [args.target]
+
+
+def _run_multi_target_stage(
+    args,
+    targets: List[str],
+    llm_client,
+    logger,
+    workflow_cls,
+) -> bool:
+    """Run one requested stage across several targets."""
+    ok = True
+    for target in targets:
+        logger.info("=" * 80)
+        logger.info(f"Running stage {args.stage} for target: {target}")
+        logger.info("=" * 80)
+        workflow = workflow_cls(
+            llm_client=llm_client,
+            chisel_dir=args.chisel_dir,
+            workspace_dir=args.workspace_dir,
+            logger=logger,
+            target=target,
+            waveform_path=args.waveform if len(targets) == 1 else None,
+            stage=args.stage,
+        )
+        result = workflow.process_task(
+            user_query=get_default_query(stage=args.stage, target=target),
+        )
+        if not result.get("success", False):
+            logger.error(f"Stage {args.stage} failed for target {target}")
+            ok = False
+    return ok
+
+
+def _run_stage_batched_formal(
+    args,
+    targets: List[str],
+    llm_client,
+    logger,
+    workflow_cls,
+    formal_stages: List[str],
+) -> bool:
+    """Run full formal workflow stage-first across targets for prompt-cache locality."""
+    start_stage = args.start_stage if args.start_stage else formal_stages[0]
+    start_idx = formal_stages.index(start_stage)
+    active: Dict[str, bool] = {target: True for target in targets}
+    failed: Dict[str, str] = {}
+    state: Dict[str, Dict[str, Any]] = {
+        target: {"waveform_path": None, "verification_passed": False}
+        for target in targets
+    }
+
+    logger.info(f"Starting stage-batched full workflow from stage: {start_stage}")
+    logger.info(f"Targets: {', '.join(targets)}")
+
+    for stage in formal_stages[start_idx:]:
+        runnable = [target for target in targets if active[target]]
+        if not runnable:
+            break
+
+        logger.info("=" * 80)
+        logger.info(f"Stage-batched run: {stage} for {len(runnable)} active targets")
+        logger.info("=" * 80)
+
+        for target in runnable:
+            waveform_path = state[target].get("waveform_path") if stage == "waveform_explanation" else None
+            if stage == "waveform_explanation" and not waveform_path:
+                failed[target] = "missing_counterexample_waveform"
+                active[target] = False
+                logger.error(f"Target {target} has no waveform path for waveform_explanation")
+                continue
+
+            logger.info(f"Running stage {stage} for target: {target}")
+            workflow = workflow_cls(
+                llm_client=llm_client,
+                chisel_dir=args.chisel_dir,
+                workspace_dir=args.workspace_dir,
+                logger=logger,
+                target=target,
+                waveform_path=waveform_path,
+                stage=stage,
+            )
+            result = workflow.process_task(
+                user_query=get_default_query(stage=stage, target=target),
+            )
+
+            if not result.get("success", False):
+                failed[target] = stage
+                active[target] = False
+                logger.error(f"Stage {stage} failed for target {target}")
+                continue
+
+            if stage == "invoke_verification":
+                detail = result.get("stage_result", {})
+                if detail.get("verification_passed", False):
+                    active[target] = False
+                    state[target]["verification_passed"] = True
+                    logger.info(f"Target {target}: all assertions proven; skipping CEX stages")
+                    continue
+
+                cex_path = detail.get("counterexample_path")
+                if cex_path:
+                    state[target]["waveform_path"] = cex_path
+                    logger.info(f"Target {target}: counterexample waveform {cex_path}")
+                else:
+                    failed[target] = "missing_counterexample_waveform"
+                    active[target] = False
+                    logger.error(f"Target {target}: verification failed but no waveform was found")
+
+    if failed:
+        logger.error(f"Stage-batched workflow failures: {failed}")
+    else:
+        logger.info("Stage-batched workflow completed successfully")
+    return not failed
 
 
 def main_verilog2chisel(args):
@@ -231,6 +378,8 @@ def parse_args():
                                help='工作空间目录（默认: .）')
     formal_parser.add_argument('--target', type=str, default='gigamax',
                                help='验证目标：benchmark 名称（默认: gigamax）')
+    formal_parser.add_argument('--targets', type=str, default=None,
+                               help='逗号分隔的多个 benchmark 名称；--full 时按 stage 批处理以提高 prompt cache 命中率')
     formal_parser.add_argument('--waveform', type=str, help='波形文件路径（仅 waveform_explanation 阶段）')
     formal_parser.add_argument('--max-tokens', type=int, default=None,
                                help='Token 总量限制（所有 API 调用累计，超出后停止）')

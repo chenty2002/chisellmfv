@@ -132,6 +132,79 @@ WAVEFORM_TOOLS = [
     }
 ]
 
+CAUSAL_TOOLS = [
+    {
+        "name": "causal_get_roots",
+        "description": "Query structured VerilogCausalAnalysis JSON for ranked root-cause candidate nodes. Use this before manually expanding many waveform signals.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of root candidates to return",
+                    "default": 10
+                },
+                "min_score": {
+                    "type": "number",
+                    "description": "Optional minimum suspect score filter"
+                }
+            }
+        }
+    },
+    {
+        "name": "causal_trace_path",
+        "description": "Trace causal paths in the structured causal DAG, typically from root candidates toward the endpoint assertion failure.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source_node_id": {
+                    "type": "string",
+                    "description": "Optional source/root node id. If omitted, paths from roots are considered."
+                },
+                "target_node_id": {
+                    "type": "string",
+                    "description": "Optional destination node id. If omitted, the endpoint node is used."
+                },
+                "signal": {
+                    "type": "string",
+                    "description": "Optional signal-name substring used to choose candidate source nodes"
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum path depth to traverse",
+                    "default": 12
+                },
+                "max_paths": {
+                    "type": "integer",
+                    "description": "Maximum number of paths to return",
+                    "default": 5
+                }
+            }
+        }
+    },
+    {
+        "name": "causal_get_node_evidence",
+        "description": "Get detailed node evidence from VerilogCausalAnalysis JSON, including incoming/outgoing edges and RTL references.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "node_id": {
+                    "type": "string",
+                    "description": "Exact causal node id"
+                },
+                "signal": {
+                    "type": "string",
+                    "description": "Signal-name substring to find a node when node_id is unknown"
+                },
+                "cycle": {
+                    "type": "integer",
+                    "description": "Optional cycle filter when searching by signal"
+                }
+            }
+        }
+    }
+]
+
 WRITE_REPORT_TOOL = {
     "name": "write_report",
     "description": "Write the counterexample analysis report to counterexample_analysis.md in the work directory. This is the final step to complete the stage.",
@@ -172,6 +245,18 @@ def create_read_files_tool(extra_description: str = "") -> Dict:
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "List of file paths relative to extra_bench directory"
+                },
+                "line_start": {
+                    "type": "integer",
+                    "description": "Optional 1-based first line to read from each file"
+                },
+                "line_end": {
+                    "type": "integer",
+                    "description": "Optional 1-based last line to read from each file"
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Optional maximum characters to return per file after line filtering"
                 },
                 "reason": {
                     "type": "string",
@@ -241,7 +326,7 @@ BUILD_TOP_TOOL_SCHEMAS = [
             "required": ["file_path", "content"]
         }
     },
-    create_read_files_tool("Read source files to understand the existing design. All .scala files in extra_bench are already provided in the prompt, so only use this if you need to re-examine specific files."),
+    create_read_files_tool("Read source files to understand the existing design. The prompt only includes a source manifest, so read exact files before confirming or modifying code. Use line_start/line_end when possible."),
     RESET_STAGE_TOOL
 ]
 
@@ -269,6 +354,7 @@ WRITE_ASSERTIONS_TOOL_SCHEMAS = [
 
 WAVEFORM_EXPLANATION_TOOL_SCHEMAS = (
     WAVEFORM_TOOLS + 
+    CAUSAL_TOOLS +
     [create_read_files_tool("Read source files to correlate with waveform signals")] +
     [WRITE_REPORT_TOOL]
 )
