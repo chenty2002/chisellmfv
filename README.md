@@ -63,6 +63,7 @@ chisellmfv/
 │   ├── utils/
 │   └── verilog2chisel/
 ├── scripts/
+│   ├── run_vis_chisel_formal_experiment.py ← vis-chisel batch experiment runner
 │   ├── install_hdlConvertor.sh    ← source-install fallback for hdlConvertor
 │   └── reset_data.sh
 ├── main.py                        ← unified CLI entry point
@@ -194,6 +195,17 @@ python main.py formal --stage propose_bugfix --target gigamax
 # Budget the total tokens across all API calls
 python main.py formal --full --target gigamax --max-tokens 20000000
 ```
+
+### One-click run for all 50 vis-chisel benchmarks
+
+```bash
+# From repo root; rerunnable with the same run directory name
+python scripts/run_vis_chisel_formal_experiment.py --run-name vischisel-50 --force
+```
+
+This command runs the full formal workflow on the script's curated 50-benchmark
+set (`--selection-mode curated --count 50` by default) and writes results to:
+`log/vis_chisel_formal/vischisel-50/`.
 
 ### Verilog → Chisel conversion
 
