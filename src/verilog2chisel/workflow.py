@@ -17,6 +17,7 @@ import subprocess
 from typing import Dict, List, Any, Optional, Tuple
 
 from ..core.llm_client import LLMClient
+from ..core.prompt_builder import build_assistant_tool_call_message
 from ..utils.llm_properties import *
 from ..utils.file_utils import read_file as utils_read_file, write_file as utils_write_file
 from ..utils.llm_logging import LLMLogger
@@ -418,22 +419,11 @@ class Verilog2ChiselWorkflow:
             function_calls = response["function_calls"]
             raw_message = response.get("raw_message", {})
             
-            # Add assistant message with tool_calls to history
-            assistant_message = {
-                "role": "assistant",
-                "content": raw_message.get("content", None),
-                "tool_calls": [
-                    {
-                        "id": fc["id"],
-                        "type": "function",
-                        "function": {
-                            "name": fc["name"],
-                            "arguments": json.dumps(fc["arguments"], ensure_ascii=False)
-                        }
-                    }
-                    for fc in function_calls
-                ]
-            }
+            # Add assistant message with tool_calls to history.
+            assistant_message = build_assistant_tool_call_message(
+                raw_message,
+                function_calls,
+            )
             messages.append(assistant_message)
             
             # Execute actions and build tool result messages
@@ -592,4 +582,3 @@ class Verilog2ChiselWorkflow:
             response, stage="Verilog2Chisel", iteration=iteration, truncate_content=False
         )
         self.logger.info(log_msg)
-

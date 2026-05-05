@@ -31,6 +31,7 @@ from .prompt_builder import (
     PROMPT_VERSION,
     build_system_prompt,
     build_user_prompt,
+    build_assistant_tool_call_message,
     build_tool_result_message,
     build_compilation_error_message
 )
@@ -482,22 +483,11 @@ class FormalWorkflow:
         iterations.append(iteration)
         context["iterations"].append(iteration)
         
-        # Add assistant message with tool_calls to history
-        assistant_message = {
-            "role": "assistant",
-            "content": raw_message.get("content", None),
-            "tool_calls": [
-                {
-                    "id": fc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": fc["name"],
-                        "arguments": json.dumps(fc["arguments"], ensure_ascii=False)
-                    }
-                }
-                for fc in function_calls
-            ]
-        }
+        # Add assistant message with tool_calls to history.
+        assistant_message = build_assistant_tool_call_message(
+            raw_message,
+            function_calls,
+        )
         messages.append(assistant_message)
         
         # Add tool result messages to history

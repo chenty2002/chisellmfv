@@ -492,6 +492,46 @@ def build_tool_result_message(
     }
 
 
+def build_assistant_tool_call_message(
+    raw_message: Dict[str, Any],
+    function_calls: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Build an assistant history message after a tool-call response.
+
+    DeepSeek thinking mode requires assistant.reasoning_content to be carried
+    forward whenever that assistant turn made tool calls, so preserve it from
+    the raw API message when present.
+    """
+    message = {
+        "role": "assistant",
+        "content": raw_message.get("content", None),
+    }
+
+    if "name" in raw_message:
+        message["name"] = raw_message["name"]
+    if "reasoning_content" in raw_message:
+        message["reasoning_content"] = raw_message.get("reasoning_content")
+
+    raw_tool_calls = raw_message.get("tool_calls")
+    if raw_tool_calls:
+        message["tool_calls"] = raw_tool_calls
+    else:
+        message["tool_calls"] = [
+            {
+                "id": fc["id"],
+                "type": "function",
+                "function": {
+                    "name": fc["name"],
+                    "arguments": json.dumps(fc["arguments"], ensure_ascii=False)
+                }
+            }
+            for fc in function_calls
+        ]
+
+    return message
+
+
 def build_compilation_error_message(error: str) -> str:
     """
     Build a message for compilation errors to append to the conversation.

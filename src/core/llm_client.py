@@ -78,7 +78,12 @@ class LLMClient:
         self.reranker_url = reranker_url or overrides["reranker_url"] or RERANKER_URL
 
         extra_body_override = overrides.get("llm_extra_body")
-        self.llm_extra_body = llm_extra_body or self._parse_extra_body(extra_body_override)
+        raw_extra_body = (
+            llm_extra_body
+            if llm_extra_body is not None
+            else self._parse_extra_body(extra_body_override)
+        )
+        self.llm_extra_body = self._normalize_provider_extra_body(raw_extra_body)
         self.enable_prompt_cache_key = self._should_enable_prompt_cache_key(
             overrides.get("enable_prompt_cache_key"),
             self.llm_url,
@@ -111,6 +116,24 @@ class LLMClient:
 
         if not self.api_key:
             raise ValueError(_MISSING_API_KEY_MSG)
+
+    @staticmethod
+    def _logger_writes_to_console(logger: Optional[logging.Logger]) -> bool:
+        """Return True when logger propagation reaches a non-file stream handler."""
+        current = logger
+        while current:
+            for handler in current.handlers:
+                if isinstance(handler, logging.StreamHandler) and not isinstance(
+                    handler, logging.FileHandler
+                ):
+                    return True
+            if not current.propagate:
+                break
+            parent = current.parent
+            if parent is current:
+                break
+            current = parent
+        return False
 
     @staticmethod
     def _normalize_llm_url(url: str) -> str:
@@ -153,6 +176,89 @@ class LLMClient:
             return raw_value.strip().lower() in {"1", "true", "yes", "on"}
         return urlparse(llm_url).netloc.endswith("api.openai.com")
 
+    def _is_deepseek_endpoint(self) -> bool:
+        host = urlparse(self.llm_url).netloc.lower()
+        return host == "api.deepseek.com" or host.endswith(".deepseek.com")
+
+    @staticmethod
+    def _coerce_bool(value: Any) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        return bool(value)
+
+    @staticmethod
+    def _normalize_deepseek_reasoning_effort(value: Any) -> str:
+        effort = str(value).strip().lower()
+        return "max" if effort in {"max", "xhigh"} else "high"
+
+    def _normalize_provider_extra_body(
+        self,
+        extra_body: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Normalize provider-specific extra request fields before sending JSON."""
+        if not extra_body:
+            return extra_body
+
+        payload = dict(extra_body)
+        if not self._is_deepseek_endpoint():
+            return payload
+
+        if "enable_thinking" in payload and "thinking" not in payload:
+            enabled = self._coerce_bool(payload.pop("enable_thinking"))
+            thinking: Dict[str, Any] = {
+                "type": "enabled" if enabled else "disabled",
+            }
+            reasoning_effort = payload.pop("reasoning_effort", None)
+            if enabled and reasoning_effort is not None:
+                thinking["reasoning_effort"] = (
+                    self._normalize_deepseek_reasoning_effort(reasoning_effort)
+                )
+            payload["thinking"] = thinking
+        else:
+            payload.pop("enable_thinking", None)
+
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict):
+            normalized_thinking = dict(thinking)
+            if "reasoning_effort" in normalized_thinking:
+                normalized_thinking["reasoning_effort"] = (
+                    self._normalize_deepseek_reasoning_effort(
+                        normalized_thinking["reasoning_effort"]
+                    )
+                )
+            payload["thinking"] = normalized_thinking
+
+        return payload
+
+    def _deepseek_reasoning_mode_requested(self, payload: Dict[str, Any]) -> bool:
+        model = str(payload.get("model", self.model)).lower()
+        if "reasoner" in model:
+            return True
+
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict):
+            thinking_type = str(thinking.get("type", "enabled")).strip().lower()
+            return thinking_type != "disabled"
+
+        if "enable_thinking" in payload:
+            return self._coerce_bool(payload["enable_thinking"])
+
+        # DeepSeek v4 defaults to thinking mode when it is not explicitly disabled.
+        return True
+
+    def _adjust_payload_for_provider(self, payload: Dict[str, Any]) -> None:
+        if not self._is_deepseek_endpoint():
+            return
+
+        if (
+            payload.get("tool_choice") == "required"
+            and self._deepseek_reasoning_mode_requested(payload)
+        ):
+            # DeepSeek thinking/reasoner mode rejects required tool choice. The
+            # prompt still asks for tool-only output; workflow retry handling
+            # catches the rare plain-text response.
+            payload["tool_choice"] = "auto"
+
     def _make_api_request(self, url: str, headers: dict, payload: dict, 
                           api_type: str = "llm",
                           request_metadata: Optional[Dict[str, str]] = None) -> dict:
@@ -182,7 +288,7 @@ class LLMClient:
         result = response.json()
         
         
-        # Log and print token usage for this request
+        # Log token usage; print only when the logger will not show it on console.
         if "usage" in result:
             usage = result["usage"]
             current_request_tokens = usage.get("total_tokens", 0)
@@ -193,18 +299,19 @@ class LLMClient:
                 cached_tokens / usage.get("prompt_tokens", 0)
                 if usage.get("prompt_tokens", 0) else 0.0
             )
-            print(f'LLM response: {usage.get("prompt_tokens", 0)} prompt tokens, '
-                  f'{usage.get("completion_tokens", 0)} completion tokens, '
-                  f'{current_request_tokens} total tokens, '
-                  f'{cached_tokens} cached prompt tokens ({hit_rate:.1%} hit rate)')
+            token_usage_message = (
+                f'Prompt: {usage.get("prompt_tokens", 0)}, '
+                f'Completion: {usage.get("completion_tokens", 0)}, '
+                f'Total: {current_request_tokens}, '
+                f'Cached Prompt: {cached_tokens}, '
+                f'Cache Miss Prompt: {miss_tokens}, '
+                f'Cache Hit Rate: {hit_rate:.1%}, '
+                f'Reasoning: {reasoning_tokens}'
+            )
             if self.logger:
-                self.logger.info(f'Token usage - Prompt: {usage.get("prompt_tokens", 0)}, '
-                                 f'Completion: {usage.get("completion_tokens", 0)}, '
-                                 f'Total: {current_request_tokens}, '
-                                 f'Cached Prompt: {cached_tokens}, '
-                                 f'Cache Miss Prompt: {miss_tokens}, '
-                                 f'Cache Hit Rate: {hit_rate:.1%}, '
-                                 f'Reasoning: {reasoning_tokens}')
+                self.logger.info(f"Token usage - {token_usage_message}")
+            if not self._logger_writes_to_console(self.logger):
+                print(f"LLM response token usage - {token_usage_message}")
         
             if api_type == "llm":
                 self.token_usage["llm_calls"] += 1
@@ -353,7 +460,8 @@ class LLMClient:
             temperature: Sampling temperature (0-1)
             tool_choice: OpenAI-compatible tool choice policy. Defaults to
                          "required" so the API enforces the workflow's
-                         tool-only prompt contract.
+                         tool-only prompt contract. Provider adapters may
+                         downgrade unsupported policies before sending.
             
         Returns:
             Dictionary containing:
@@ -380,6 +488,7 @@ class LLMClient:
             # fields belong at the top level rather than under SDK-only
             # wrappers such as `extra_body`.
             payload.update(self.llm_extra_body)
+        self._adjust_payload_for_provider(payload)
 
         # Count tokens in all messages
         prompt_tokens = count_tokens(json.dumps(messages, ensure_ascii=False, default=str))
@@ -400,15 +509,27 @@ class LLMClient:
         message = choice["message"]
         
         if "tool_calls" in message and message["tool_calls"]:
-            function_calls = [
-                {
-                    "name": tc["function"]["name"],
-                    "arguments": json.loads(tc["function"]["arguments"]),
-                    "id": tc["id"]
+            function_calls, parse_errors = self._parse_function_tool_calls(
+                message["tool_calls"]
+            )
+            if parse_errors:
+                error_text = (
+                    "ERROR: The model returned a tool call whose arguments were "
+                    "not valid JSON. Retry with complete, valid JSON arguments "
+                    "for every tool call."
+                )
+                if self.logger:
+                    self.logger.warning(
+                        "%s Details: %s",
+                        error_text,
+                        json.dumps(parse_errors, ensure_ascii=False),
+                    )
+                return {
+                    "type": "text",
+                    "content": error_text,
+                    "raw_message": message,
+                    "tool_parse_errors": parse_errors,
                 }
-                for tc in message["tool_calls"]
-                if tc["type"] == "function"
-            ]
             return {
                 "type": "function_calls",
                 "function_calls": function_calls,
@@ -420,6 +541,50 @@ class LLMClient:
                 "content": message.get("content", ""),
                 "raw_message": message
             }
+
+    @staticmethod
+    def _parse_function_tool_calls(
+        tool_calls: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        function_calls: List[Dict[str, Any]] = []
+        parse_errors: List[Dict[str, Any]] = []
+
+        for idx, tool_call in enumerate(tool_calls):
+            if tool_call.get("type") != "function":
+                continue
+
+            function = tool_call.get("function") or {}
+            raw_arguments = function.get("arguments", "{}")
+            if isinstance(raw_arguments, dict):
+                arguments = raw_arguments
+            else:
+                if raw_arguments is None:
+                    raw_arguments = "{}"
+                elif not isinstance(raw_arguments, str):
+                    raw_arguments = str(raw_arguments)
+                try:
+                    arguments = json.loads(raw_arguments)
+                except json.JSONDecodeError as exc:
+                    parse_errors.append(
+                        {
+                            "index": idx,
+                            "id": tool_call.get("id"),
+                            "name": function.get("name"),
+                            "error": str(exc),
+                            "arguments_prefix": raw_arguments[:500],
+                        }
+                    )
+                    continue
+
+            function_calls.append(
+                {
+                    "name": function["name"],
+                    "arguments": arguments,
+                    "id": tool_call["id"],
+                }
+            )
+
+        return function_calls, parse_errors
     
     def get_embeddings(self, text: str) -> List[float]:
         """Generate an embedding vector for the provided text.
@@ -516,7 +681,11 @@ class LLMClient:
         }
         return usage
     
-    def print_token_usage(self, logger: Optional[logging.Logger] = None) -> None:
+    def print_token_usage(
+        self,
+        logger: Optional[logging.Logger] = None,
+        include_cache_breakdown: bool = False,
+    ) -> None:
         """
         Print a formatted summary of token usage statistics.
         """
@@ -546,7 +715,7 @@ class LLMClient:
             f"Total API Calls: {usage['llm_calls'] + usage['embedding_calls'] + usage['reranker_calls']}",
             f"Total Tokens: {usage['llm_total_tokens'] + usage['embedding_total_tokens'] + usage['reranker_input_tokens'] + usage['reranker_output_tokens']}",
         )
-        if self.llm_usage_by_key:
+        if include_cache_breakdown and self.llm_usage_by_key:
             usage_summary += ("", "LLM Cache Breakdown:")
             for key, bucket in sorted(self.llm_usage_by_key.items()):
                 prompt = bucket["prompt_tokens"]
@@ -562,9 +731,11 @@ class LLMClient:
                     f"hit_rate={hit_rate:.1f}% total={bucket['total_tokens']}",
                 )
         
-        print("\n".join(usage_summary))
+        formatted_summary = "\n".join(usage_summary)
+        if not self._logger_writes_to_console(logger):
+            print(formatted_summary)
         if logger:
-            logger.info("\n".join(usage_summary))
+            logger.info(formatted_summary)
     
     def reset_token_usage(self) -> None:
         """
