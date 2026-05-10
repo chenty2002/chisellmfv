@@ -329,6 +329,8 @@ def get_default_query(stage: Optional[str] = None, target: str = "gigamax") -> s
         ),
         "write_assertions": (
             "Add formal verification assertions to the design using ChiselFV or Chisel LTL. "
+            "Place assertions directly inside the original DUT module/class emitted by VerilogGenerator, "
+            "not in a separate *Formal wrapper or sibling module. "
             "Focus on key properties like safety and liveness."
         ),
         "invoke_verification": (
@@ -349,7 +351,8 @@ def get_default_query(stage: Optional[str] = None, target: str = "gigamax") -> s
 
     return (
         f"Verify and add formal verification assertions to the {target} Chisel design. "
-        "Use ChiselFV or Chisel LTL to express key properties."
+        "Use ChiselFV or Chisel LTL to express key properties directly inside the original "
+        "DUT module/class emitted by VerilogGenerator, not in a separate *Formal wrapper."
     )
 
 

@@ -20,7 +20,7 @@ import os
 from ..utils.llm_properties import MAX_ITERATIONS, WAVEFORM_MAX_ITER
 
 
-PROMPT_VERSION = "formal-v2-cache-aware"
+PROMPT_VERSION = "formal-v3-inline-assertions"
 
 
 CHISEL6_LTL_DOC = """
@@ -89,7 +89,17 @@ AssertProperty(mySignal, "label_name")
 
 // Using implicit clock from Module context
 AssertProperty(request |-> Sequence(grant).delay(1, 10))
+
+// With a label on an LTL Property, use the full-argument form
+AssertProperty(request |-> Sequence(grant).delay(1, 10), None, None, Some("request_grant"))
 ```
+
+### CRITICAL: Place Assertions Inside the Emitted DUT Module
+
+`AssertProperty` calls must be inserted directly in the existing Chisel module
+class that `VerilogGenerator` emits. Do not create a separate wrapper or sibling
+module/class such as `FooFormal`, because the Makefile/generator emits the
+original DUT and unused wrapper assertions will not appear in generated Verilog.
 
 ### CRITICAL: No `when` Blocks Around Assertions
 
@@ -110,7 +120,18 @@ CHISELFV_API_DOC = """
 ## ChiselFV API Reference
 
 Import Statement: import chiselFv._
-Wrapper: Wrap target module with trait Formal 
+Trait usage: add `with Formal` to the existing DUT class that is emitted by
+`VerilogGenerator`, then place ChiselFV assertions directly in that class body.
+Do not create a separate `*Formal` wrapper/sibling module for assertions.
+
+Example:
+```scala
+class Arbiter extends Module with Formal {
+  val io = IO(...)
+  ...
+  fvAssert(property, "property_name")
+}
+```
 
 ### Available Assertions (in trait Formal)
 
@@ -534,17 +555,19 @@ def build_assistant_tool_call_message(
 
 def build_compilation_error_message(error: str) -> str:
     """
-    Build a message for compilation errors to append to the conversation.
+    Build a message for final build-check errors to append to the conversation.
     
     Args:
-        error: The compilation error message
+        error: The compilation or generated-output validation error message
         
     Returns:
         Formatted error message string
     """
-    return f"""## Compilation Failed
+    return f"""## Final Build Check Failed
 
-Your code did not compile. Please fix the following errors:
+Your code did not pass the final build check. The design may have failed to compile,
+or generated Verilog/SystemVerilog may be missing required assertions. Please fix the
+following errors:
 
 ```
 {error}
@@ -616,8 +639,18 @@ def _build_generic_stage_prompt(stage: str) -> list:
             "## Objective",
             "Add formal verification assertions to the Chisel design.",
             "",
+            "## CRITICAL Assertion Placement Rules",
+            "- First read the exact `VerilogGenerator` and DUT source to identify the class/module currently emitted by `emitVerilog(new ... )`",
+            "- Add assertions directly inside that original emitted DUT module/class body",
+            "- If using ChiselFV, mix `with Formal` into the original emitted DUT class itself",
+            "- Do NOT create a new wrapper, sibling, or replacement assertion module/class/object, including names ending in `Formal` such as `ArbiterFormal` or `CounterFormal`",
+            "- Do NOT leave assertions only in a module that `VerilogGenerator`/the Makefile does not emit; such assertions will be absent from generated Verilog",
+            "- Keep `VerilogGenerator` targeting the instrumented original DUT unless the existing generator already targets that same class",
+            "- Before setting `stage_complete=true`, re-check that the assertions are in the module that will be compiled by `make verilog`",
+            "",
             "## Guidelines",
             "- Use the source manifest to select files, then call `read_files` for exact design logic",
+            "- When calling file tools, prefer the exact basename from the source manifest, such as `arbiter.scala`; do not prepend `chisel/extra_bench/<benchmark>/`",
             "- Identify critical properties to verify",
             "- Add assertions using Chisel's formal verification APIs",
             "- Consider using ChiselFV APIs or Chisel LTL assertions",

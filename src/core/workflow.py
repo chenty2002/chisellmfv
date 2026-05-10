@@ -642,7 +642,9 @@ class FormalWorkflow:
         
         # Stages that require compilation verification
         if stage in ["build_top_module", "write_assertions", "propose_bugfix"]:
-            compile_result = self.build_ops.verify_compilation()
+            compile_result = self.build_ops.verify_compilation(
+                require_assertions=(stage == "write_assertions")
+            )
             if compile_result["success"]:
                 self.logger.info(f"Stage {stage} compilation verified successfully")
                 result = {
@@ -664,10 +666,10 @@ class FormalWorkflow:
                         context["fix_type"] = error_type
                 return result
             else:
-                self.logger.warning(f"Stage {stage} compilation failed, attaching to iteration {iteration_count}")
+                self.logger.warning(f"Stage {stage} final build check failed, attaching to iteration {iteration_count}")
                 iterations[-1]["compilation_error"] = compile_result["error"]
                 context["iterations"][-1]["compilation_error"] = compile_result["error"]
-                print(f"  Compilation failed, asking LLM to fix...")
+                print(f"  Final build check failed, asking LLM to fix...")
                 
                 # Add compilation error as user message to history
                 error_message = build_compilation_error_message(compile_result["error"])

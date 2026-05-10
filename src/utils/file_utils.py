@@ -84,7 +84,16 @@ def is_path_in_allowed_dirs(file_path: str, allowed_dirs: List[str]) -> bool:
         True if the path is in an allowed directory
     """
     abs_path = os.path.abspath(file_path)
-    return any(abs_path.startswith(os.path.abspath(d)) for d in allowed_dirs if d)
+    for directory in allowed_dirs:
+        if not directory:
+            continue
+        abs_dir = os.path.abspath(directory)
+        try:
+            if os.path.commonpath([abs_path, abs_dir]) == abs_dir:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _is_copyright_or_license(text: str) -> bool:

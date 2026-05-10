@@ -10,6 +10,49 @@ from .waveform_actions import execute_waveform_action, WaveformActions
 from ..causal_analysis import CausalAnalysisActions
 
 
+def _resolve_work_path(file_path: str, work_dir: str) -> str:
+    """
+    Resolve a tool-supplied path to the current benchmark work directory.
+
+    Prompts describe paths as relative to extra_bench, while the executor works
+    inside extra_bench/<target>. Models therefore sometimes return paths like
+    "<target>/foo.scala" or "chisel/extra_bench/<target>/foo.scala". Treat any
+    relative path containing the current target directory as rooted at that
+    target, not as a nested path below work_dir.
+    """
+    work_abs = os.path.abspath(work_dir)
+    work_parent = os.path.dirname(work_abs)
+    target = os.path.basename(work_abs)
+
+    if os.path.isabs(file_path):
+        abs_path = os.path.normpath(file_path)
+        try:
+            inside_extra_bench = os.path.commonpath([abs_path, work_parent]) == work_parent
+        except ValueError:
+            inside_extra_bench = False
+        if inside_extra_bench:
+            rel = os.path.relpath(abs_path, work_parent)
+            parts = [part for part in rel.split(os.sep) if part and part != "."]
+            if target in parts:
+                target_idx = len(parts) - 1 - parts[::-1].index(target)
+                tail = parts[target_idx + 1:]
+                if tail:
+                    return os.path.normpath(os.path.join(work_abs, *tail))
+                return work_abs
+        return abs_path
+
+    normalized = os.path.normpath(file_path)
+    parts = [part for part in normalized.split(os.sep) if part and part != "."]
+    if target in parts:
+        target_idx = len(parts) - 1 - parts[::-1].index(target)
+        tail = parts[target_idx + 1:]
+        if tail:
+            return os.path.normpath(os.path.join(work_abs, *tail))
+        return work_abs
+
+    return os.path.normpath(os.path.join(work_abs, normalized))
+
+
 def execute_stage_actions(
     actions: List[Dict[str, Any]], 
     work_dir: str,
@@ -94,9 +137,7 @@ def _execute_read_files(action: Dict[str, Any], work_dir: str, read_file_func) -
     files_result = []
     
     for fp in file_paths:
-        # For benchmark targets, convert relative path to absolute
-        if not os.path.isabs(fp):
-            fp = os.path.join(work_dir, fp)
+        fp = _resolve_work_path(fp, work_dir)
         content = read_file_func(fp)
         success = "Error reading file" not in content
         display_content = None
@@ -167,9 +208,7 @@ def _execute_write_file(action: Dict[str, Any], work_dir: str, write_file_func) 
     content = action.get("content", "")
     file_path = action.get("file_path", "")
     
-    # For benchmark targets, convert relative path to absolute
-    if not os.path.isabs(file_path):
-        file_path = os.path.join(work_dir, file_path)
+    file_path = _resolve_work_path(file_path, work_dir)
     
     ok, err = write_file_func(file_path, content)
     
@@ -190,8 +229,7 @@ def _execute_write_assertions(
     content = action.get("content", "")
     
     file_path = action.get("file_path", "Main.scala")
-    if not os.path.isabs(file_path):
-        file_path = os.path.join(work_dir, file_path)
+    file_path = _resolve_work_path(file_path, work_dir)
     
     ok, err = write_file_func(file_path, content)
     
@@ -212,9 +250,7 @@ def _execute_write_fix(
     file_path = action.get("file_path", "")
     content = action.get("content", "")
     
-    # For benchmark targets, convert relative path to absolute
-    if not os.path.isabs(file_path):
-        file_path = os.path.join(work_dir, file_path)
+    file_path = _resolve_work_path(file_path, work_dir)
     
     ok, err = write_file_func(file_path, content)
     
@@ -308,11 +344,7 @@ def _execute_confirm_existing_harness(
     harness_file = action.get("harness_file", "")
     analysis = action.get("analysis", "")
     
-    # Convert relative path to absolute for benchmark targets
-    if not os.path.isabs(harness_file):
-        harness_file_abs = os.path.join(work_dir, harness_file)
-    else:
-        harness_file_abs = harness_file
+    harness_file_abs = _resolve_work_path(harness_file, work_dir)
     
     # Verify the file exists
     if not os.path.exists(harness_file_abs):

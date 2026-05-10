@@ -5,6 +5,7 @@ Handles compilation, Verilog file management, and verification setup.
 """
 
 import os
+import re
 import subprocess
 import shutil
 import glob
@@ -183,6 +184,119 @@ class BuildOperations:
             main_file = verilog_files[0]
         
         return main_file
+
+    def _find_generated_verilog_files(self) -> List[str]:
+        """Return generated Verilog/SystemVerilog files under the build output directory."""
+        patterns = [
+            os.path.join(self.generated_dir, "**", "*.sv"),
+            os.path.join(self.generated_dir, "**", "*.v"),
+        ]
+        files: List[str] = []
+        for pattern in patterns:
+            files.extend(glob.glob(pattern, recursive=True))
+        return sorted(set(files))
+
+    def _remove_generated_verilog_files(self) -> None:
+        """Remove stale generated Verilog before checks that inspect current output."""
+        for path in self._find_generated_verilog_files():
+            try:
+                os.remove(path)
+                self.logger.debug(f"Removed stale generated Verilog file: {path}")
+            except OSError as exc:
+                self.logger.warning(f"Failed to remove stale generated Verilog {path}: {exc}")
+
+    @staticmethod
+    def _strip_verilog_comments(content: str) -> str:
+        """Strip Verilog comments so comment text does not satisfy assertion checks."""
+        content = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
+        content = re.sub(r"//.*", "", content)
+        return content
+
+    @classmethod
+    def _count_verilog_assertions(cls, content: str) -> int:
+        """Count common SystemVerilog assertion forms in generated code."""
+        code = cls._strip_verilog_comments(content)
+        assertion_patterns = [
+            r"\bassert\s+property\b",
+            r"\bassert\s+final\s*\(",
+            r"\bassert\s*(?:#\s*\d+\s*)?\(",
+        ]
+        return sum(len(re.findall(pattern, code, flags=re.IGNORECASE)) for pattern in assertion_patterns)
+
+    @classmethod
+    def _contains_verilog_assertion(cls, content: str) -> bool:
+        """Detect common SystemVerilog assertion forms in generated code."""
+        return cls._count_verilog_assertions(content) > 0
+
+    def check_generated_verilog_has_assertions(self) -> Dict[str, Any]:
+        """
+        Verify that generated Verilog/SystemVerilog contains at least one assertion.
+
+        Stage 2 can compile successfully even when assertions were placed in an
+        un-emitted wrapper module. This check catches that case before the stage
+        is accepted.
+        """
+        verilog_files = self._find_generated_verilog_files()
+        if not verilog_files:
+            return {
+                "success": False,
+                "assertion_count": 0,
+                "files_checked": [],
+                "error": f"No generated Verilog/SystemVerilog files found in {self.generated_dir}",
+            }
+
+        assertion_files: List[str] = []
+        assertion_count = 0
+        read_errors: List[str] = []
+        for path in verilog_files:
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+            except OSError as exc:
+                read_errors.append(f"{path}: {exc}")
+                continue
+
+            file_assertion_count = self._count_verilog_assertions(content)
+            if file_assertion_count:
+                assertion_files.append(path)
+                assertion_count += file_assertion_count
+
+        if assertion_files:
+            self.logger.info(
+                "Generated Verilog assertion check passed: "
+                f"found {assertion_count} assertions in "
+                f"{len(assertion_files)} of {len(verilog_files)} files"
+            )
+            return {
+                "success": True,
+                "assertion_count": assertion_count,
+                "files_checked": verilog_files,
+                "assertion_files": assertion_files,
+            }
+
+        files_display = "\n".join(f"- {path}" for path in verilog_files)
+        details = [
+            "Compilation succeeded, but generated Verilog/SystemVerilog contains no assertions.",
+            "",
+            "This usually means the assertions were added only to a module/class that is not emitted by `VerilogGenerator`, such as a standalone `*Formal` wrapper or sibling module.",
+            "",
+            "Rewrite the Chisel source so the assertions are directly inside the original DUT module/class currently emitted by `VerilogGenerator`/`make verilog`.",
+            "Do not create a separate `*Formal` module unless the existing generator already emits that exact instrumented original DUT.",
+            "",
+            "Generated Verilog files checked:",
+            files_display,
+        ]
+        if read_errors:
+            details.extend(["", "Files that could not be read:", *read_errors])
+
+        error = "\n".join(details)
+        self.logger.warning(error)
+        return {
+            "success": False,
+            "assertion_count": 0,
+            "files_checked": verilog_files,
+            "error": error,
+        }
     
     def run_verilog_setup(self, verilog_file: str, run_jaspergold: bool = True) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """
@@ -259,20 +373,52 @@ class BuildOperations:
         self.logger.info(f"Running JasperGold verification in {self.verilog_dir}")
         return run_jaspergold_verification(self.verilog_dir, self.logger)
     
-    def verify_compilation(self) -> Dict[str, Any]:
+    def verify_compilation(self, require_assertions: bool = False) -> Dict[str, Any]:
         """
         Verify that the current code compiles successfully.
         
+        Args:
+            require_assertions: When true, also require generated Verilog to
+                contain at least one assertion after compilation.
+
         Returns:
             Dict with 'success' and optionally 'error' if compilation failed
         """
         self.logger.info("Verifying compilation with 'make verilog'...")
+        if require_assertions:
+            self._remove_generated_verilog_files()
         
         ok, output = self.run_make("verilog")
         
         if ok:
+            if require_assertions:
+                assertion_result = self.check_generated_verilog_has_assertions()
+                if not assertion_result["success"]:
+                    return {
+                        "success": False,
+                        "error": assertion_result["error"],
+                        "output": output,
+                        "action_results": [
+                            {
+                                "type": "run_make",
+                                "success": True,
+                                "output": output,
+                            },
+                            {
+                                "type": "assertion_check",
+                                "success": False,
+                                "output": assertion_result["error"],
+                                "files_checked": assertion_result.get("files_checked", []),
+                                "assertion_count": assertion_result.get("assertion_count", 0),
+                            },
+                        ],
+                    }
+
             self.logger.info("Compilation successful")
-            return {"success": True, "output": output}
+            result = {"success": True, "output": output}
+            if require_assertions:
+                result["assertion_check"] = assertion_result
+            return result
         else:
             # Extract only lines containing [error] for cleaner output
             error_lines = [line for line in output.splitlines() if '[error]' in line.lower()]

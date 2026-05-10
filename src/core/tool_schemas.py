@@ -244,7 +244,7 @@ def create_read_files_tool(extra_description: str = "") -> Dict:
                 "file_paths": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of file paths relative to extra_bench directory"
+                    "description": "List of source file paths. Prefer the basename shown in the source manifest, e.g. 'arbiter.scala'."
                 },
                 "line_start": {
                     "type": "integer",
@@ -298,7 +298,7 @@ BUILD_TOP_TOOL_SCHEMAS = [
             "properties": add_complete_params({
                 "harness_file": {
                     "type": "string",
-                    "description": "Path to the existing harness file (relative to extra_bench directory)"
+                    "description": "Existing harness source file. Prefer the basename shown in the source manifest, e.g. 'arbiter.scala'."
                 },
                 "analysis": {
                     "type": "string",
@@ -316,7 +316,7 @@ BUILD_TOP_TOOL_SCHEMAS = [
             "properties": add_complete_params({
                 "file_path": {
                     "type": "string",
-                    "description": "Relative path from extra_bench directory (e.g., 'TestHarness.scala')"
+                    "description": "Source file to write. Prefer a basename within the benchmark work directory, e.g. 'TestHarness.scala'."
                 },
                 "content": {
                     "type": "string",
@@ -333,17 +333,17 @@ BUILD_TOP_TOOL_SCHEMAS = [
 WRITE_ASSERTIONS_TOOL_SCHEMAS = [
     {
         "name": "write_assertions",
-        "description": "Add formal verification assertions to the Chisel design. Use ChiselFV APIs or Chisel LTL assertions to specify properties to verify.",
+        "description": "Add formal verification assertions directly inside the existing DUT module/class emitted by VerilogGenerator. Use ChiselFV APIs or Chisel LTL assertions; do not create a standalone *Formal wrapper/sibling module whose assertions are not emitted.",
         "parameters": {
             "type": "object",
             "properties": add_complete_params({
                 "file_path": {
                     "type": "string",
-                    "description": "Path to the file to modify (relative to extra_bench directory)"
+                    "description": "Existing emitted DUT source file to modify. Prefer the basename shown in the source manifest, e.g. 'arbiter.scala'."
                 },
                 "content": {
                     "type": "string",
-                    "description": "Complete Scala source code WITH assertions"
+                    "description": "Complete Scala source code with assertions placed in the original emitted DUT module/class"
                 }
             }),
             "required": ["file_path", "content"]
