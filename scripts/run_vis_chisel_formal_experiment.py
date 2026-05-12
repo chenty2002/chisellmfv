@@ -13,6 +13,7 @@ Use --dry-run to print the selected targets without preparing or running.
 Use --prepare-only to create the workspace and manifests without LLM/formal runs.
 Use --end-stage build_top_module to stop after stage 1.
 Use --run-name <name> --start-stage write_assertions to resume the same run at stage 2.
+Use --run-name <name> --rerun-targets a,b to rerun selected benchmarks in-place.
 """
 
 from __future__ import annotations
@@ -43,6 +44,13 @@ FORMAL_STAGES = [
     "waveform_explanation",
     "propose_bugfix",
 ]
+
+ABLATION_MODES = {
+    "no_assertion_presence_gate",
+    "no_causal_prior",
+    "no_waveform_notebook",
+    "no_repeated_waveform_guard",
+}
 
 # Curated for small size plus coverage across counters, arithmetic/data paths,
 # control/protocol examples, parameterized families, ITC99, LTL cases, and
@@ -175,6 +183,17 @@ def parse_args() -> argparse.Namespace:
         help="Optional comma-separated explicit target list. Overrides selection-mode.",
     )
     parser.add_argument(
+        "--rerun-targets",
+        "--rerun-benchmarks",
+        dest="rerun_targets",
+        default=None,
+        help=(
+            "Comma-separated benchmarks from an existing run to rerun through the "
+            "full workflow in the same run directory. Their workspace and "
+            "per-stage result directories are overwritten; other targets are kept."
+        ),
+    )
+    parser.add_argument(
         "--max-loc",
         type=int,
         default=240,
@@ -241,6 +260,14 @@ def parse_args() -> argparse.Namespace:
         "--copy-support-dirs",
         action="store_true",
         help="Copy chisel/chiselfv and VerilogCausalAnalysis instead of symlinking them.",
+    )
+    parser.add_argument(
+        "--ablation",
+        default="none",
+        help=(
+            "Comma-separated ablation modes. Supported: none, "
+            + ", ".join(sorted(ABLATION_MODES))
+        ),
     )
     return parser.parse_args()
 
@@ -317,6 +344,23 @@ def parse_targets(raw_targets: str) -> List[str]:
             deduped.append(target)
             seen.add(target)
     return deduped
+
+
+def parse_ablation_modes(raw_modes: str) -> List[str]:
+    modes = parse_targets(raw_modes or "")
+    if not modes or modes == ["none"]:
+        return []
+    if "none" in modes and len(modes) > 1:
+        raise SystemExit("--ablation=none cannot be combined with other modes")
+    unknown = sorted(set(modes) - ABLATION_MODES)
+    if unknown:
+        raise SystemExit(
+            "Unknown ablation mode(s): "
+            + ", ".join(unknown)
+            + ". Supported modes: none, "
+            + ", ".join(sorted(ABLATION_MODES))
+        )
+    return modes
 
 
 def validate_targets(
@@ -438,6 +482,31 @@ def select_benchmarks(args: argparse.Namespace) -> List[BenchmarkMeta]:
 
 
 def normalize_stage_range(args: argparse.Namespace) -> None:
+    if args.rerun_targets is not None and not args.rerun_target_names:
+        raise SystemExit("--rerun-targets did not contain any benchmark names")
+
+    if args.rerun_target_names:
+        incompatible = []
+        if args.targets:
+            incompatible.append("--targets")
+        if args.stage:
+            incompatible.append("--stage")
+        if args.start_stage:
+            incompatible.append("--start-stage")
+        if args.end_stage:
+            incompatible.append("--end-stage")
+        if args.start_target:
+            incompatible.append("--start-target")
+        if incompatible:
+            raise SystemExit(
+                "--rerun-targets always runs the full workflow; do not combine it with "
+                + ", ".join(incompatible)
+            )
+        args.effective_start_stage = FORMAL_STAGES[0]
+        args.effective_end_stage = FORMAL_STAGES[-1]
+        args.stage_range = list(FORMAL_STAGES)
+        return
+
     if args.stage and (args.start_stage or args.end_stage):
         raise SystemExit("--stage cannot be combined with --start-stage or --end-stage")
 
@@ -492,6 +561,28 @@ def load_existing_workspace(run_dir: Path) -> Path:
     if not workspace_dir.exists():
         raise SystemExit(f"Cannot resume {run_dir}: workspace not found: {workspace_dir}")
     return workspace_dir
+
+
+def select_rerun_benchmarks(
+    run_dir: Path,
+    benchmark_root: Path,
+    raw_targets: str,
+) -> List[BenchmarkMeta]:
+    names = parse_targets(raw_targets)
+    if not names:
+        raise SystemExit("--rerun-targets did not contain any benchmark names")
+
+    existing = load_existing_selection(run_dir, benchmark_root)
+    existing_names = {meta.name for meta in existing}
+    not_in_run = [name for name in names if name not in existing_names]
+    if not_in_run:
+        raise SystemExit(
+            "Cannot rerun benchmarks that are not in the existing run manifest: "
+            + ", ".join(not_in_run)
+        )
+
+    current_metas = collect_benchmark_meta(benchmark_root)
+    return validate_targets(names, current_metas)
 
 
 def should_resume_run(run_dir: Path, args: argparse.Namespace) -> bool:
@@ -549,6 +640,27 @@ def copy_or_link_dir(src: Path, dst: Path, copy: bool) -> None:
         os.symlink(src.resolve(), dst, target_is_directory=True)
 
 
+def remove_path(path: Path) -> bool:
+    if not path.exists() and not path.is_symlink():
+        return False
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    return True
+
+
+def prepare_workspace_target(workspace_dir: Path, meta: BenchmarkMeta) -> None:
+    extra_bench_dir = workspace_dir / "chisel" / "extra_bench"
+    base_extra = REPO_ROOT / "chisel" / "extra_bench"
+    extra_bench_dir.mkdir(parents=True, exist_ok=True)
+    dst = extra_bench_dir / meta.name
+    remove_path(dst)
+    shutil.copytree(Path(meta.path), dst, ignore=ignore_source_artifacts)
+    shutil.copy2(base_extra / "build.sbt", dst / "build.sbt")
+    shutil.copy2(base_extra / "Makefile", dst / "Makefile")
+
+
 def prepare_workspace(
     run_dir: Path,
     selected: Sequence[BenchmarkMeta],
@@ -581,13 +693,65 @@ def prepare_workspace(
         shutil.copy2(base_verilog / filename, verilog_extra_dir / filename)
 
     for meta in selected:
-        src = Path(meta.path)
-        dst = extra_bench_dir / meta.name
-        shutil.copytree(src, dst, ignore=ignore_source_artifacts)
-        shutil.copy2(base_extra / "build.sbt", dst / "build.sbt")
-        shutil.copy2(base_extra / "Makefile", dst / "Makefile")
+        prepare_workspace_target(workspace_dir, meta)
 
     return workspace_dir
+
+
+def prune_stage_events_for_targets(events_path: Path, targets: Sequence[str]) -> int:
+    if not events_path.exists():
+        return 0
+
+    target_set = set(targets)
+    kept_lines: List[str] = []
+    removed = 0
+    for line in events_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            kept_lines.append(line)
+            continue
+        if row.get("target") in target_set:
+            removed += 1
+            continue
+        kept_lines.append(line)
+
+    events_path.write_text(
+        ("\n".join(kept_lines) + "\n") if kept_lines else "",
+        encoding="utf-8",
+    )
+    return removed
+
+
+def prepare_rerun_targets(
+    run_dir: Path,
+    workspace_dir: Path,
+    selected: Sequence[BenchmarkMeta],
+    formal_stages: Sequence[str],
+) -> None:
+    target_names = [meta.name for meta in selected]
+    for meta in selected:
+        prepare_workspace_target(workspace_dir, meta)
+        remove_path(workspace_dir / "verilog" / "extra_bench" / meta.name)
+        remove_path(workspace_dir / "log" / "causal_analysis" / meta.name)
+        for stage in formal_stages:
+            remove_path(stage_artifact_dir(run_dir, formal_stages, stage) / meta.name)
+
+    removed_events = prune_stage_events_for_targets(
+        run_dir / "results" / "stage_events.jsonl",
+        target_names,
+    )
+    write_json(
+        run_dir / "results" / "last_target_rerun.json",
+        {
+            "time": _dt.datetime.now().isoformat(timespec="seconds"),
+            "targets": target_names,
+            "removed_stage_events": removed_events,
+            "stages": list(formal_stages),
+        },
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -666,6 +830,7 @@ def write_manifests(
             "stage_range": args.stage_range,
             "start_target": args.start_target,
             "max_tokens": args.max_tokens,
+            "ablation_modes": args.ablation_modes,
             "targets": targets,
         },
     )
@@ -698,6 +863,7 @@ def record_invocation(
         {
             "time": _dt.datetime.now().isoformat(timespec="seconds"),
             "resumed": resumed,
+            "rerun": bool(getattr(args, "rerun_target_names", [])),
             "run_name": run_dir.name,
             "start_stage": args.effective_start_stage,
             "end_stage": args.effective_end_stage,
@@ -705,8 +871,10 @@ def record_invocation(
             "start_target": args.start_target,
             "target_count": len(selected),
             "targets": [meta.name for meta in selected],
+            "rerun_targets": getattr(args, "rerun_target_names", []),
             "prepare_only": args.prepare_only,
             "max_tokens": args.max_tokens,
+            "ablation_modes": args.ablation_modes,
         },
     )
 
@@ -935,6 +1103,7 @@ def run_stage_batched_formal_range(
                 target=target,
                 waveform_path=waveform_path,
                 stage=stage,
+                ablation_modes=workflow_args.ablation_modes,
             )
             result = workflow.process_task(
                 user_query=workflow_args.get_default_query(stage=stage, target=target),
@@ -1047,6 +1216,7 @@ def run_formal_experiment(
             workspace_dir=str(workspace_dir),
             waveform=None,
             get_default_query=get_default_query,
+            ablation_modes=args.ablation_modes,
         )
         targets = [meta.name for meta in selected]
 
@@ -1081,11 +1251,14 @@ def run_formal_experiment(
         {
             "success": success,
             "resumed": resumed,
+            "rerun": bool(getattr(args, "rerun_target_names", [])),
             "targets": targets,
+            "rerun_targets": getattr(args, "rerun_target_names", []),
             "stages": PROJECT_FORMAL_STAGES,
             "stages_run": args.stage_range,
             "start_stage": args.effective_start_stage,
             "end_stage": args.effective_end_stage,
+            "ablation_modes": args.ablation_modes,
             "log_file": log_file,
         },
     )
@@ -1096,16 +1269,37 @@ def main() -> int:
     args = parse_args()
     args.benchmark_root = args.benchmark_root.resolve()
     args.experiment_root = args.experiment_root.resolve()
+    args.rerun_target_names = parse_targets(args.rerun_targets) if args.rerun_targets else []
+    args.ablation_modes = parse_ablation_modes(args.ablation)
     normalize_stage_range(args)
 
     if args.resume and not args.run_name:
         raise SystemExit("--resume requires --run-name")
+    if args.rerun_target_names and not args.run_name:
+        raise SystemExit("--rerun-targets requires --run-name")
+    if args.rerun_target_names and args.resume:
+        raise SystemExit("--rerun-targets cannot be combined with --resume")
 
     run_name = args.run_name or _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = args.experiment_root / run_name
-    resumed = should_resume_run(run_dir, args)
+    rerunning_targets = bool(args.rerun_target_names)
+    resumed = False if rerunning_targets else should_resume_run(run_dir, args)
 
-    if resumed:
+    if rerunning_targets:
+        if not run_dir.exists():
+            raise SystemExit(f"Cannot rerun targets in missing run directory: {run_dir}")
+        if args.force:
+            print(
+                "Rerunning selected targets; --force is ignored because only "
+                "the requested target artifacts are overwritten."
+            )
+        selected = select_rerun_benchmarks(
+            run_dir=run_dir,
+            benchmark_root=args.benchmark_root,
+            raw_targets=args.rerun_targets,
+        )
+        workspace_dir = load_existing_workspace(run_dir)
+    elif resumed:
         if not run_dir.exists():
             raise SystemExit(f"Cannot resume missing run directory: {run_dir}")
         if args.force:
@@ -1124,6 +1318,7 @@ def main() -> int:
     print(
         "Stage range: "
         f"{args.effective_start_stage} -> {args.effective_end_stage}"
+        + (" (rerun selected targets)" if rerunning_targets else "")
         + (" (resume)" if resumed else "")
     )
     if args.start_target:
@@ -1132,7 +1327,14 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    if not resumed:
+    if rerunning_targets:
+        prepare_rerun_targets(
+            run_dir=run_dir,
+            workspace_dir=workspace_dir,
+            selected=selected,
+            formal_stages=FORMAL_STAGES,
+        )
+    elif not resumed:
         ensure_fresh_run_dir(run_dir, force=args.force)
         workspace_dir = prepare_workspace(
             run_dir=run_dir,

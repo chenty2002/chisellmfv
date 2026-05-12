@@ -26,6 +26,9 @@ Verilog by first converting it to Chisel.
 - **Chisel build stack as submodules** — `chiselfv`, `pylibfst-cache`
 - **Causal root-cause analysis** via the `VerilogCausalAnalysis` submodule,
   automatically invoked during the `waveform_explanation` stage
+- **JasperGold quality evaluation** for generated verification artefacts:
+  build/interface checks, assertion proof quality, assumption hygiene,
+  non-vacuity, mutation testing, SEC regression, and X-prop robustness
 
 ---
 
@@ -59,6 +62,7 @@ chisellmfv/
 ├── VerilogCausalAnalysis/         ← submodule (causal-DAG root-cause engine)
 ├── src/
 │   ├── core/                      ← formal-verification workflow
+│   │   └── jaspergold_quality.py  ← deterministic JasperGold quality runner
 │   ├── causal_analysis/           ← adapter to VerilogCausalAnalysis
 │   ├── utils/
 │   └── verilog2chisel/
@@ -196,11 +200,50 @@ python main.py formal --stage propose_bugfix --target gigamax
 python main.py formal --full --target gigamax --max-tokens 20000000
 ```
 
+### JasperGold quality evaluation
+
+The `quality` command runs a deterministic, non-LLM evaluation flow over an
+emitted Verilog/SystemVerilog candidate. It writes Tcl scripts, JasperGold
+logs, CSV/native reports, mutation artefacts, and a combined JSON record under
+`reports/jg/<case_id>/`.
+
+```bash
+# Counter smoke benchmark with the default checked-in setup.
+.venv/bin/python main.py quality --counter --stages build,assertions
+
+# Full quality smoke on counter. Keep --max-mutants small for quick checks.
+.venv/bin/python main.py quality --counter --all --max-mutants 1
+
+# Evaluate a custom generated candidate.
+.venv/bin/python main.py quality \
+    --case-id my_case \
+    --workdir verilog/extra_bench/my_case \
+    --dut-sv TestTop.sv \
+    --extra-sv ResetCounter.sv \
+    --top MyTop \
+    --clock clock \
+    --reset reset \
+    --expected-inputs clock,reset \
+    --expected-outputs io_out
+```
+
+Supported stages are `build`, `assertions`, `assumptions`, `non_vacuity`,
+`mutation`, `sec`, and `xprop`. The counter smoke baseline is expected to
+enumerate 27 assertions, with 9 `proven` and 18 `cex` results under a short
+proof budget; identical SEC proves the three counter outputs equivalent, and
+X-prop reports all three outputs as non-X-propagatable.
+
 ### One-click run for all 50 vis-chisel benchmarks
 
 ```bash
 # From repo root; rerunnable with the same run directory name
 python scripts/run_vis_chisel_formal_experiment.py --run-name vischisel-50 --force
+
+# Rerun only selected benchmarks inside an existing run directory.
+# This refreshes those benchmark workspaces and overwrites their per-stage results.
+python scripts/run_vis_chisel_formal_experiment.py \
+    --run-name vischisel-50 \
+    --rerun-targets arbiter_arbiter,gcd
 ```
 
 This command runs the full formal workflow on the script's curated 50-benchmark

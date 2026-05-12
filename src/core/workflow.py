@@ -66,6 +66,7 @@ class FormalWorkflow:
         waveform_path: Optional[str] = None,
         stage: str = "build_top_module",
         target: str = "gigamax",
+        ablation_modes: Optional[List[str]] = None,
     ):
         """
         Initialize the formal verification workflow for a single stage.
@@ -78,6 +79,8 @@ class FormalWorkflow:
             waveform_path: Path to counterexample waveform (for waveform stage)
             stage: Which stage to run (single stage only)
             target: Verification target (benchmark name like 'gigamax', 'philo')
+            ablation_modes: Optional experiment switches that disable selected
+                workflow mechanisms for controlled ablation studies.
         """
         self.llm = llm_client
         self.chisel_dir = os.path.join(os.path.abspath(workspace_dir), chisel_dir)
@@ -86,6 +89,7 @@ class FormalWorkflow:
         self.waveform_path = waveform_path
         self.current_stage = stage
         self.target = target
+        self.ablation_modes = set(ablation_modes or [])
         self.causal_actions: Optional[CausalAnalysisActions] = None
         
         # Initialize paths based on target
@@ -166,6 +170,8 @@ class FormalWorkflow:
             "verify_src": self.verify_src_dir,
             "target": self.target,
         }
+        if self.ablation_modes:
+            env_info["ablation_modes"] = sorted(self.ablation_modes)
         
         env_info["work_dir"] = self.work_dir
         env_info["benchmark"] = self.target
@@ -218,6 +224,7 @@ class FormalWorkflow:
             "original_query": user_query,
             "stage": stage,
             "success": False,
+            "ablation_modes": sorted(self.ablation_modes),
         }
         
         context["iterations"] = []
@@ -270,7 +277,12 @@ class FormalWorkflow:
         
         iterations = []
         iteration_count = 0
-        waveform_notebook = EvidenceNotebook() if stage == "waveform_explanation" else None
+        waveform_notebook = (
+            EvidenceNotebook()
+            if stage == "waveform_explanation"
+            and "no_waveform_notebook" not in self.ablation_modes
+            else None
+        )
         self._repeated_tool_call_counts: Dict[str, int] = {}
         self._repeated_tool_call_notified: set = set()
         
@@ -294,7 +306,11 @@ class FormalWorkflow:
         # LLM user prompt as additional root-cause hints. The structured JSON is
         # also exposed through causal_* tools so the model can query it on demand.
         self.causal_actions = None
-        if stage == "waveform_explanation" and self.waveform_path:
+        if (
+            stage == "waveform_explanation"
+            and self.waveform_path
+            and "no_causal_prior" not in self.ablation_modes
+        ):
             try:
                 causal_result = run_causal_analysis_result_if_available(
                     workspace_dir=self.workspace_dir,
@@ -548,6 +564,8 @@ class FormalWorkflow:
         messages: List[Dict[str, Any]],
     ) -> None:
         """Inject guidance when the model repeats identical no-progress tool calls."""
+        if "no_repeated_waveform_guard" in self.ablation_modes:
+            return
         if stage != "waveform_explanation":
             return
 
@@ -643,7 +661,10 @@ class FormalWorkflow:
         # Stages that require compilation verification
         if stage in ["build_top_module", "write_assertions", "propose_bugfix"]:
             compile_result = self.build_ops.verify_compilation(
-                require_assertions=(stage == "write_assertions")
+                require_assertions=(
+                    stage == "write_assertions"
+                    and "no_assertion_presence_gate" not in self.ablation_modes
+                )
             )
             if compile_result["success"]:
                 self.logger.info(f"Stage {stage} compilation verified successfully")

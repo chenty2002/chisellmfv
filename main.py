@@ -22,6 +22,7 @@ ChiselLMFV - 统一入口
 import os
 import sys
 import argparse
+import json
 from typing import Optional, List, Dict, Any
 
 # 将 src 目录添加到路径
@@ -311,6 +312,78 @@ def main_verilog2chisel(args):
         _exit(llm_client, logger, success=False)
 
 
+def main_quality(args):
+    """Run deterministic JasperGold quality evaluation."""
+    from src.core.jaspergold_quality import (
+        JasperGoldQualityRunner,
+        QualityConfig,
+        load_sidecars,
+    )
+
+    if args.counter:
+        args.case_id = args.case_id or "counter"
+        args.workdir = args.workdir or "verilog/extra_bench/counter"
+        args.dut_sv = args.dut_sv or "TestTop.sv"
+        args.extra_sv = args.extra_sv or "ResetCounter.sv"
+        args.top = args.top or "Counter"
+        args.clock = args.clock or "clock"
+        args.reset = args.reset or "reset"
+        args.expected_inputs = args.expected_inputs or "clock,reset"
+        args.expected_outputs = args.expected_outputs or "io_out0,io_out1,io_out2"
+        args.trace_signals = args.trace_signals or "io_out0,io_out1,io_out2"
+
+    stages = _parse_quality_stages(args)
+    config = QualityConfig(
+        case_id=args.case_id,
+        candidate_id=args.candidate_id,
+        workdir=args.workdir,
+        dut_sv=_split_csv(args.dut_sv),
+        extra_sv=_split_csv(args.extra_sv),
+        top=args.top,
+        clock=args.clock,
+        reset=args.reset,
+        report_root=args.reports_dir,
+        expected_inputs=_split_csv(args.expected_inputs),
+        expected_outputs=_split_csv(args.expected_outputs),
+        prove_time_limit=args.prove_time_limit,
+        assume_time_limit=args.assume_time_limit,
+        nv_time_limit=args.nv_time_limit,
+        mutation_time_limit=args.mutation_time_limit,
+        sec_time_limit=args.sec_time_limit,
+        xprop_time_limit=args.xprop_time_limit,
+        jg_timeout=args.jg_timeout,
+        trace_signals=_split_csv(args.trace_signals),
+    )
+    sidecars = load_sidecars(args.sidecar) if "non_vacuity" in stages else []
+    runner = JasperGoldQualityRunner(config)
+    record = runner.run(
+        stages,
+        non_vacuity_sidecars=sidecars,
+        max_mutants=args.max_mutants,
+        sec_spec_sv=_split_csv(args.sec_spec_sv) or None,
+        sec_imp_sv=_split_csv(args.sec_imp_sv) or None,
+    )
+    record_path = os.path.join(args.reports_dir, args.case_id, "quality_record.json")
+    print(json.dumps({
+        "record": record_path,
+        "stages": stages,
+        "scores": record.get("scores", {}),
+    }, indent=2, ensure_ascii=False))
+
+
+def _split_csv(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_quality_stages(args) -> List[str]:
+    if args.all:
+        return ["build", "assertions", "assumptions", "non_vacuity", "mutation", "sec", "xprop"]
+    stages = _split_csv(args.stages)
+    return stages or ["build", "assertions"]
+
+
 def get_default_query(stage: Optional[str] = None, target: str = "gigamax") -> str:
     """
     Get the default query for a stage or full workflow.
@@ -398,6 +471,52 @@ def parse_args():
     v2c_parser.add_argument('--max-tokens', type=int, default=None,
                             help='Token 总量限制（所有 API 调用累计，超出后停止）')
 
+    # JasperGold quality evaluation
+    quality_parser = subparsers.add_parser('quality', help='JasperGold 质量评估')
+    quality_parser.add_argument('--counter', action='store_true',
+                                help='使用 verilog/extra_bench/counter 的默认 smoke 配置')
+    quality_parser.add_argument('--all', action='store_true',
+                                help='运行 build,assertions,assumptions,non_vacuity,mutation,sec,xprop')
+    quality_parser.add_argument('--stages', type=str, default=None,
+                                help='逗号分隔阶段：build,assertions,assumptions,non_vacuity,mutation,sec,xprop')
+    quality_parser.add_argument('--case-id', type=str, default=None,
+                                help='评估 case ID')
+    quality_parser.add_argument('--candidate-id', type=str, default='run_001',
+                                help='候选实现 ID')
+    quality_parser.add_argument('--workdir', type=str, default=None,
+                                help='包含待评估 Verilog 的工作目录')
+    quality_parser.add_argument('--dut-sv', type=str, default=None,
+                                help='逗号分隔 DUT/SystemVerilog 文件，相对 --workdir 或绝对路径')
+    quality_parser.add_argument('--extra-sv', type=str, default='',
+                                help='逗号分隔额外 SystemVerilog 文件，相对 --workdir 或绝对路径')
+    quality_parser.add_argument('--top', type=str, default=None, help='JasperGold top module')
+    quality_parser.add_argument('--clock', type=str, default=None, help='clock 信号')
+    quality_parser.add_argument('--reset', type=str, default=None, help='reset 信号')
+    quality_parser.add_argument('--expected-inputs', type=str, default='',
+                                help='逗号分隔期望 input 端口')
+    quality_parser.add_argument('--expected-outputs', type=str, default='',
+                                help='逗号分隔期望 output 端口')
+    quality_parser.add_argument('--trace-signals', type=str, default='',
+                                help='逗号分隔普通 CEX 中要采样的信号')
+    quality_parser.add_argument('--reports-dir', type=str, default='reports/jg',
+                                help='artifact 根目录')
+    quality_parser.add_argument('--sidecar', type=str, default=None,
+                                help='non-vacuity assertion sidecar JSON')
+    quality_parser.add_argument('--max-mutants', type=int, default=5,
+                                help='mutation 阶段最多生成并运行的 mutants')
+    quality_parser.add_argument('--sec-spec-sv', type=str, default='',
+                                help='SEC spec 文件列表；默认使用 --dut-sv')
+    quality_parser.add_argument('--sec-imp-sv', type=str, default='',
+                                help='SEC implementation 文件列表；默认使用 --dut-sv')
+    quality_parser.add_argument('--prove-time-limit', type=str, default='5s')
+    quality_parser.add_argument('--assume-time-limit', type=str, default='5s')
+    quality_parser.add_argument('--nv-time-limit', type=str, default='5s')
+    quality_parser.add_argument('--mutation-time-limit', type=str, default='5s')
+    quality_parser.add_argument('--sec-time-limit', type=str, default='5s')
+    quality_parser.add_argument('--xprop-time-limit', type=str, default='5s')
+    quality_parser.add_argument('--jg-timeout', type=int, default=900,
+                                help='单个 JasperGold 阶段的进程超时秒数')
+
     return parser.parse_args()
 
 
@@ -409,6 +528,21 @@ def main():
         main_formal(args)
     elif args.command == 'v2c':
         main_verilog2chisel(args)
+    elif args.command == 'quality':
+        required = {
+            "case_id": args.case_id,
+            "workdir": args.workdir,
+            "dut_sv": args.dut_sv,
+            "top": args.top,
+            "clock": args.clock,
+            "reset": args.reset,
+        }
+        if not args.counter and any(value in {None, ""} for value in required.values()):
+            missing = ", ".join(key for key, value in required.items() if value in {None, ""})
+            print(f"错误: quality 缺少必要参数: {missing}")
+            print("可使用 --counter 运行 counter smoke 默认配置")
+            sys.exit(1)
+        main_quality(args)
     else:
         print("错误: 请指定工作流类型 (formal, v2c)")
         print("运行 'python main.py --help' 查看帮助")
