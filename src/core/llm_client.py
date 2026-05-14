@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Dict, List, Any, Optional, Tuple, Union
 from urllib.parse import urlparse
 
@@ -88,6 +89,11 @@ class LLMClient:
             overrides.get("enable_prompt_cache_key"),
             self.llm_url,
         )
+        self.trust_env_proxy = self._should_trust_env_proxy(
+            overrides.get("trust_env_proxy")
+        )
+        self.session = requests.Session()
+        self.session.trust_env = self.trust_env_proxy
 
         self.api_key = api_key or LLM_API_KEY
         self.embedding_api_key = embedding_api_key or EMBEDDING_API_KEY
@@ -116,6 +122,12 @@ class LLMClient:
 
         if not self.api_key:
             raise ValueError(_MISSING_API_KEY_MSG)
+
+        if not self.trust_env_proxy and self.logger:
+            self.logger.info(
+                "Ignoring loopback HTTP(S) proxy environment variables for LLM API requests. "
+                "Set CHISELLMFV_TRUST_ENV_PROXY=true to force using them."
+            )
 
     @staticmethod
     def _logger_writes_to_console(logger: Optional[logging.Logger]) -> bool:
@@ -175,6 +187,53 @@ class LLMClient:
         if raw_value is not None:
             return raw_value.strip().lower() in {"1", "true", "yes", "on"}
         return urlparse(llm_url).netloc.endswith("api.openai.com")
+
+    @staticmethod
+    def _parse_bool_env(raw_value: Optional[str]) -> Optional[bool]:
+        if raw_value is None:
+            return None
+        value = raw_value.strip().lower()
+        if value in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if value in {"0", "false", "no", "off", "disabled"}:
+            return False
+        raise ValueError(
+            "CHISELLMFV_TRUST_ENV_PROXY must be one of true/false, yes/no, on/off, or 1/0"
+        )
+
+    @staticmethod
+    def _env_proxy_hosts() -> List[str]:
+        hosts: List[str] = []
+        for name in (
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "https_proxy",
+            "http_proxy",
+            "all_proxy",
+        ):
+            raw = os.environ.get(name)
+            if not raw:
+                continue
+            parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+            host = parsed.hostname
+            if host:
+                hosts.append(host.lower())
+        return hosts
+
+    @classmethod
+    def _has_loopback_env_proxy(cls) -> bool:
+        for host in cls._env_proxy_hosts():
+            if host == "localhost" or host == "::1" or host.startswith("127."):
+                return True
+        return False
+
+    @classmethod
+    def _should_trust_env_proxy(cls, raw_value: Optional[str]) -> bool:
+        explicit = cls._parse_bool_env(raw_value)
+        if explicit is not None:
+            return explicit
+        return not cls._has_loopback_env_proxy()
 
     def _is_deepseek_endpoint(self) -> bool:
         host = urlparse(self.llm_url).netloc.lower()
@@ -274,7 +333,7 @@ class LLMClient:
         Returns:
             API response as dictionary
         """
-        response = requests.post(url, headers=headers, json=payload)
+        response = self.session.post(url, headers=headers, json=payload)
         
         if response.status_code != 200:
             # Include payload in error message for debugging (truncate large content)

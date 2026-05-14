@@ -572,7 +572,11 @@ class Verilog2ChiselWorkflow:
         
         full_prompt = f"[System Prompt]\n{system_prompt}\n\n[User Prompt]\n{user_prompt}"
         log_msg = LLMLogger.format_request(
-            full_prompt, tool_schemas, stage="Verilog2Chisel", iteration=iteration
+            full_prompt,
+            tool_schemas,
+            stage="Verilog2Chisel",
+            iteration=iteration,
+            include_details=(iteration == 1),
         )
         self.logger.info(log_msg)
     

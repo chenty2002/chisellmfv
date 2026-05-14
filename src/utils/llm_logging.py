@@ -6,7 +6,28 @@ Reduces code duplication across workflow modules.
 import json
 from typing import Dict, List, Any, Optional
 
-from ..core.llm_client import count_tokens
+try:
+    import tiktoken
+except ImportError:  # pragma: no cover - exercised only in minimal envs
+    tiktoken = None
+
+
+_tokenizer_cache: Dict[str, Any] = {}
+
+
+def count_tokens(text: str, model: str = "cl100k_base") -> int:
+    """Estimate tokens for request logging without importing the full core package."""
+    if not text:
+        return 0
+    if tiktoken is None:
+        return max(1, len(text) // 4)
+
+    if model not in _tokenizer_cache:
+        try:
+            _tokenizer_cache[model] = tiktoken.get_encoding(model)
+        except Exception:
+            _tokenizer_cache[model] = tiktoken.get_encoding("cl100k_base")
+    return len(_tokenizer_cache[model].encode(text))
 
 
 class LLMLogger:
@@ -19,7 +40,8 @@ class LLMLogger:
         prompt: str,
         tool_schemas: List[Dict[str, Any]],
         stage: Optional[str] = None,
-        iteration: Optional[int] = None
+        iteration: Optional[int] = None,
+        include_details: bool = True,
     ) -> str:
         """
         Format LLM request for logging.
@@ -29,7 +51,7 @@ class LLMLogger:
             tool_schemas: Available tools
             stage: Optional workflow stage name
             iteration: Optional iteration number
-            filter_content: Whether to filter long content
+            include_details: Whether to include full tool schemas and prompt
             
         Returns:
             Formatted log message
@@ -49,6 +71,20 @@ class LLMLogger:
         prompt_tokens = count_tokens(prompt)
         tools_tokens = count_tokens(tools_json)
         
+        if include_details:
+            detail_block = f"""
+[Tool Schemas]
+{tools_json}
+
+[Full Prompt]
+{prompt}
+"""
+        else:
+            detail_block = (
+                "Detailed tool schemas and prompt omitted; see iteration 1 for "
+                "this stage.\n"
+            )
+
         log_msg = f"""
 {LLMLogger.SEPARATOR}
 {header}
@@ -56,11 +92,7 @@ Prompt Tokens: {prompt_tokens} ({len(prompt)} chars)
 Tools Tokens: {tools_tokens}
 Available Tools: {', '.join(tool_names)}
 
-[Tool Schemas]
-{tools_json}
-
-[Full Prompt]
-{prompt}
+{detail_block}
 {LLMLogger.SEPARATOR}
 """
         return log_msg

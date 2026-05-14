@@ -20,6 +20,7 @@ Endpoint / model overrides (optional — otherwise the defaults in
     CHISELLMFV_LLM_URL, CHISELLMFV_LLM_BASE_URL, CHISELLMFV_LLM_MODEL, ...
     CHISELLMFV_LLM_EXTRA_BODY (JSON object)
     CHISELLMFV_ENABLE_PROMPT_CACHE_KEY (true/false; OpenAI defaults to true)
+    CHISELLMFV_TRUST_ENV_PROXY (true/false; defaults to false for localhost proxies)
 """
 
 from __future__ import annotations
@@ -122,6 +123,7 @@ def get_endpoint_overrides() -> Dict[str, Optional[str]]:
         "llm_model": _env_first("CHISELLMFV_LLM_MODEL"),
         "llm_extra_body": _env_first("CHISELLMFV_LLM_EXTRA_BODY"),
         "enable_prompt_cache_key": _env_first("CHISELLMFV_ENABLE_PROMPT_CACHE_KEY"),
+        "trust_env_proxy": _env_first("CHISELLMFV_TRUST_ENV_PROXY"),
         "embedding_url": _env_first("CHISELLMFV_EMBEDDING_URL"),
         "embedding_model": _env_first("CHISELLMFV_EMBEDDING_MODEL"),
         "reranker_url": _env_first("CHISELLMFV_RERANKER_URL"),

@@ -770,7 +770,11 @@ class FormalWorkflow:
         full_prompt = "[Sytem Prompt]\n" + system_propmt + "\n\n[User Prompt]\n" + user_prompt
         filtered_prompt = LLMLogger.filter_scala_code_in_prompt(full_prompt)
         log_msg = LLMLogger.format_request(
-            filtered_prompt, tool_schemas, stage=stage, iteration=iteration
+            filtered_prompt,
+            tool_schemas,
+            stage=stage,
+            iteration=iteration,
+            include_details=(iteration == 1),
         )
         self.logger.info(log_msg)
     

@@ -66,11 +66,11 @@ class BuildOperations:
             for filename in ["build.sbt", "Makefile"]:
                 src_file = os.path.join(extra_bench_dir, filename)
                 dest_file = os.path.join(self.work_dir, filename)
-                if os.path.exists(src_file) and not os.path.exists(dest_file):
+                if os.path.exists(src_file):
                     shutil.copy2(src_file, dest_file)
-                    self.logger.info(f"Copied {filename} to {self.work_dir}")
+                    self.logger.info(f"Synced {filename} to {self.work_dir}")
                 else:
-                    self.logger.warning(f"Source file {src_file} not found or destination already exists {dest_file}")
+                    self.logger.warning(f"Source file {src_file} not found")
             return True, "Build files copied successfully"
         except Exception as e:
             return False, f"Error copying build files: {str(e)}"

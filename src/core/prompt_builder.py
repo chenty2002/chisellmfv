@@ -20,7 +20,7 @@ import os
 from ..utils.llm_properties import MAX_ITERATIONS, WAVEFORM_MAX_ITER
 
 
-PROMPT_VERSION = "formal-v3-inline-assertions"
+PROMPT_VERSION = "formal-v5-assertion-quality"
 
 
 CHISEL6_LTL_DOC = """
@@ -86,6 +86,9 @@ prop1.or(prop2)          // prop1 or prop2 in SVA
 // Simple boolean assertion
 AssertProperty(mySignal)
 AssertProperty(mySignal, "label_name")
+
+// Do NOT use Some(...) for Bool assertions; this does not compile:
+// AssertProperty(mySignal, Some("label_name"))
 
 // Using implicit clock from Module context
 AssertProperty(request |-> Sequence(grant).delay(1, 10))
@@ -652,8 +655,10 @@ def _build_generic_stage_prompt(stage: str) -> list:
             "- Use the source manifest to select files, then call `read_files` for exact design logic",
             "- When calling file tools, prefer the exact basename from the source manifest, such as `arbiter.scala`; do not prepend `chisel/extra_bench/<benchmark>/`",
             "- Identify critical properties to verify",
+            "- Target assertions at error-prone, architecturally important, and hard-to-find bugs that simulation is unlikely to expose; do not pad the design with low-value trivial assertions such as simple signal-connectivity checks, direct mirror checks, or step-by-step FSM restatements unless they guard a genuinely critical invariant.",
             "- Add assertions using Chisel's formal verification APIs",
             "- Consider using ChiselFV APIs or Chisel LTL assertions",
+            "- For suitable benchmarks, add reasonable bounded liveness/progress assertions to catch system-level failures from a macro perspective, such as deadlock, starvation, stuck FSMs, lost responses, or queues/pipelines that stop making forward progress. Suitable cases include request/response protocols, arbiters, FIFOs, pipelines, handshakes, and multi-state controllers; choose bounds from the expected latency or state-space diameter, and avoid forcing liveness onto purely combinational datapaths.",
             "- Do not use BoringUtils to access IO signals because they are not visible from outer modules. You can connect IOs to Wire signals and tap them if you must",
             "",
             CHISELFV_API_DOC,
