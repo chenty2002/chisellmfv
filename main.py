@@ -23,6 +23,8 @@ import os
 import sys
 import argparse
 import json
+import shutil
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 # 将 src 目录添加到路径
@@ -55,6 +57,9 @@ def main_formal(args):
     else:
         logger = get_logger(__name__, console_output=False, clear_log=True,
                             base_name=f"application-formal-{log_target}.log")
+
+    if not _ensure_formal_targets_available(args, targets, logger):
+        sys.exit(1)
 
     # 创建 LLM 客户端
     max_tokens = getattr(args, 'max_tokens', None)
@@ -160,6 +165,65 @@ def _parse_formal_targets(args) -> List[str]:
         if targets:
             return targets
     return [args.target]
+
+
+def _resolve_under_workspace(workspace_dir: str, path: str) -> Path:
+    """Resolve an absolute path or a path relative to the workspace root."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    return Path(workspace_dir).resolve() / candidate
+
+
+def _ensure_formal_targets_available(args, targets: List[str], logger) -> bool:
+    """
+    Ensure formal benchmark targets exist under chisel/extra_bench.
+
+    Existing extra_bench targets are left untouched. Missing targets are copied
+    from benchmark/vis-chisel/<target> when available.
+    """
+    workspace_root = Path(args.workspace_dir).resolve()
+    chisel_root = _resolve_under_workspace(str(workspace_root), args.chisel_dir)
+    extra_bench_root = chisel_root / "extra_bench"
+    vis_chisel_root = workspace_root / "benchmark" / "vis-chisel"
+
+    ok = True
+    for target in targets:
+        dst = extra_bench_root / target
+        if dst.is_dir():
+            logger.info(f"Using existing formal benchmark target: {dst}")
+            continue
+
+        src = vis_chisel_root / target
+        if not src.is_dir():
+            logger.error(
+                f"Formal benchmark target {target!r} was not found in "
+                f"{extra_bench_root} or {vis_chisel_root}"
+            )
+            print(
+                f"错误: 未找到 benchmark {target!r}。已查找 "
+                f"{extra_bench_root / target} 和 {src}"
+            )
+            ok = False
+            continue
+
+        try:
+            extra_bench_root.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                src,
+                dst,
+                ignore=shutil.ignore_patterns("generated", "target", ".bsp", ".metals"),
+            )
+        except OSError as exc:
+            logger.error(f"Failed to copy formal benchmark target {target!r}: {exc}")
+            print(f"错误: 复制 benchmark {target!r} 失败: {exc}")
+            ok = False
+            continue
+
+        logger.info(f"Copied formal benchmark target {target!r} from {src} to {dst}")
+        print(f"Copied benchmark {target!r} from {src} to {dst}")
+
+    return ok
 
 
 def _run_multi_target_stage(
