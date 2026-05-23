@@ -28,7 +28,8 @@ Verilog by first converting it to Chisel.
   automatically invoked during the `waveform_explanation` stage
 - **JasperGold quality evaluation** for generated verification artefacts:
   build/interface checks, assertion proof quality, assumption hygiene,
-  non-vacuity, mutation testing, SEC regression, and X-prop robustness
+  non-vacuity, mutation testing, stage5 repair regression, SEC regression,
+  and X-prop robustness
 
 ---
 
@@ -214,6 +215,11 @@ logs, CSV/native reports, mutation artefacts, and a combined JSON record under
 # Full quality smoke on counter. Keep --max-mutants small for quick checks.
 .venv/bin/python main.py quality --counter --all --max-mutants 1
 
+# Include stage5 repair regression as a metric for known failing properties.
+.venv/bin/python main.py quality --counter \
+    --stages repair_regression \
+    --repair-target-properties Counter.assert_out0_toggles
+
 # Evaluate a custom generated candidate.
 .venv/bin/python main.py quality \
     --case-id my_case \
@@ -228,7 +234,10 @@ logs, CSV/native reports, mutation artefacts, and a combined JSON record under
 ```
 
 Supported stages are `build`, `assertions`, `assumptions`, `non_vacuity`,
-`mutation`, `sec`, and `xprop`. The counter smoke baseline is expected to
+`mutation`, `repair_regression`, `sec`, and `xprop`. The
+`repair_regression` stage re-proves target assertions after a stage5 patch and
+records whether their counterexamples persist; it does not export new
+waveforms. The counter smoke baseline is expected to
 enumerate 27 assertions, with 9 `proven` and 18 `cex` results under a short
 proof budget; identical SEC proves the three counter outputs equivalent, and
 X-prop reports all three outputs as non-X-propagatable.

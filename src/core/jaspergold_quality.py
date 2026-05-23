@@ -75,6 +75,7 @@ class QualityConfig:
     assume_time_limit: str = "5s"
     nv_time_limit: str = "5s"
     mutation_time_limit: str = "5s"
+    repair_regression_time_limit: str = "5s"
     sec_time_limit: str = "5s"
     xprop_time_limit: str = "5s"
     jg_timeout: int = 900
@@ -267,6 +268,7 @@ class JasperGoldQualityRunner:
         stages: Sequence[str],
         non_vacuity_sidecars: Optional[Sequence[Dict[str, Any]]] = None,
         max_mutants: int = 5,
+        repair_target_properties: Optional[Sequence[str]] = None,
         sec_spec_sv: Optional[Sequence[str]] = None,
         sec_imp_sv: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
@@ -281,6 +283,10 @@ class JasperGoldQualityRunner:
                 self.record["non_vacuity"] = self.run_non_vacuity(non_vacuity_sidecars or [])
             elif stage == "mutation":
                 self.record["mutation"] = self.run_mutation(max_mutants=max_mutants)
+            elif stage == "repair_regression":
+                self.record["repair_regression"] = self.run_repair_regression(
+                    repair_target_properties or []
+                )
             elif stage == "sec":
                 self.record["sec"] = self.run_sec(spec_sv=sec_spec_sv, imp_sv=sec_imp_sv)
             elif stage == "xprop":
@@ -403,6 +409,38 @@ class JasperGoldQualityRunner:
             "results": results,
         }
         self._write_json(mutation_root / "mutation_metrics.json", metrics)
+        return metrics
+
+    def run_repair_regression(self, target_properties: Sequence[str]) -> Dict[str, Any]:
+        targets = [target for target in target_properties if target]
+        stage_dir = self.case_dir / "repair_regression"
+        if not targets:
+            metrics = {
+                "success": True,
+                "skipped": True,
+                "reason": "no repair target properties were provided",
+                "targets": [],
+                "proven": 0,
+                "cex": 0,
+                "missing": 0,
+                "repair_target_proven_rate": 0.0,
+                "repair_target_present": 1.0,
+                "repair_target_cex_count": 0,
+                "repair_cex_persisted": False,
+            }
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            self._write_json(stage_dir / "repair_regression_metrics.json", metrics)
+            return metrics
+
+        result = self._run_stage(
+            "repair_regression",
+            self._repair_regression_tcl(targets),
+            subdir="repair_regression",
+            env={"REPAIR_REGRESSION_TIME_LIMIT": self.config.repair_regression_time_limit},
+        )
+        metrics = self._repair_regression_metrics(result.parsed, result.ok, targets)
+        metrics.update(self._stage_artifacts(result))
+        self._write_json(stage_dir / "repair_regression_metrics.json", metrics)
         return metrics
 
     def run_sec(
@@ -675,6 +713,55 @@ report -csv -file mutation_results.csv -force
 exit
 """
 
+    def _repair_regression_tcl(self, target_properties: Sequence[str]) -> str:
+        targets = [str(target) for target in target_properties if str(target)]
+        return self._common_tcl() + f"""
+set targets [list {_tcl_list(targets)}]
+set existing_asserts [get_property_list -include {{type assert}} -no_task_prefix]
+set target_asserts {{}}
+
+foreach p $targets {{
+    set p [string trim $p]
+    if {{$p eq ""}} {{
+        continue
+    }}
+    if {{[lsearch -exact $existing_asserts $p] >= 0}} {{
+        lappend target_asserts $p
+    }} else {{
+        puts "CHISELLMFV_REPAIR_REGRESSION missing_property $p"
+    }}
+}}
+
+emit_kv repair_target_count [llength $target_asserts]
+emit_list repair_targets $target_asserts
+
+if {{[llength $target_asserts] > 0}} {{
+    set_trace_optimization standard
+    set_trace_optimization -irrelevant_value_computation true
+    prove -property $target_asserts -time_limit $env(REPAIR_REGRESSION_TIME_LIMIT)
+
+    foreach p $target_asserts {{
+        emit_prop repair_regression $p {{name type status engine time min_length max_length trace_id trace_length num_traces}}
+    }}
+
+    set cex_after_repair [get_property_list -include {{status cex}} -no_task_prefix]
+    set target_cex_after_repair {{}}
+    foreach p $target_asserts {{
+        if {{[lsearch -exact $cex_after_repair $p] >= 0}} {{
+            lappend target_cex_after_repair $p
+        }}
+    }}
+    emit_list repair_target_cex_after_repair $target_cex_after_repair
+    emit_kv repair_target_cex_count [llength $target_cex_after_repair]
+    emit_kv repair_cex_persisted [expr {{[llength $target_cex_after_repair] > 0}}]
+}}
+
+report -summary -file post_repair_summary.txt -force
+report -csv -file post_repair_assertion_results.csv -force
+save -jdb post_repair_assertion_session.jdb -capture_setup -capture_session_data
+exit
+"""
+
     def _sec_tcl(self, spec_sv: Sequence[str], imp_sv: Sequence[str]) -> str:
         spec_files = [self._resolve_workdir_path(path) for path in spec_sv]
         imp_files = [self._resolve_workdir_path(path) for path in imp_sv]
@@ -824,6 +911,45 @@ exit
                 count += 1
         return count
 
+    def _repair_regression_metrics(
+        self,
+        parsed: ParsedJGOutput,
+        success: bool,
+        requested_targets: Sequence[str],
+    ) -> Dict[str, Any]:
+        props = [p for p in parsed.properties if p.get("tag") == "repair_regression"]
+        proven = sum(1 for prop in props if _prop_field(prop, "status") == "proven")
+        cex = int(parsed.kv.get("repair_target_cex_count", "0") or 0)
+        if not cex:
+            cex = sum(1 for prop in props if _prop_field(prop, "status") == "cex")
+        unknown_statuses = {"undetermined", "unknown", "timeout"}
+        unknown = sum(1 for prop in props if (_prop_field(prop, "status") or "") in unknown_statuses)
+        missing = sum(
+            1
+            for line in parsed.raw_machine_lines
+            if line.startswith("CHISELLMFV_REPAIR_REGRESSION missing_property ")
+        )
+        found_targets = int(parsed.kv.get("repair_target_count", str(len(props))) or 0)
+        requested_count = len([target for target in requested_targets if target])
+        repair_cex_persisted = (
+            parsed.kv.get("repair_cex_persisted") in {"1", "true", "True"} or cex > 0
+        )
+        return {
+            "success": success,
+            "targets": list(requested_targets),
+            "proven": proven,
+            "cex": cex,
+            "unknown": unknown,
+            "missing": missing,
+            "repair_target_count": found_targets,
+            "repair_target_proven_rate": proven / found_targets if found_targets else 0.0,
+            "repair_target_present": found_targets / requested_count if requested_count else 1.0,
+            "repair_target_cex_count": cex,
+            "repair_cex_persisted": repair_cex_persisted,
+            "cex_after_repair": parsed.lists.get("repair_target_cex_after_repair", []),
+            "properties": props,
+        }
+
     def _stage_artifacts(self, result: JGRunResult) -> Dict[str, Any]:
         return {
             "success": result.ok,
@@ -849,6 +975,7 @@ exit
         build = record.get("build", {})
         assertions = record.get("assertions", {})
         mutation = record.get("mutation", {})
+        repair_regression = record.get("repair_regression", {})
         sec = record.get("sec", {})
         xprop = record.get("xprop", {})
 
@@ -867,8 +994,16 @@ exit
             * float(assertions.get("trace_availability", 0.0))
         )
         mutation_score = float(mutation.get("mutation_score", 0.0))
+        if repair_regression and not repair_regression.get("skipped"):
+            repair_regression_gate = (
+                float(repair_regression.get("repair_target_proven_rate", 0.0))
+                * float(repair_regression.get("repair_target_present", 0.0))
+            )
+        else:
+            repair_regression_gate = 1.0
         repair_score = (
-            float(sec.get("sec_proven_rate", 0.0))
+            repair_regression_gate
+            * float(sec.get("sec_proven_rate", 0.0))
             * float(xprop.get("non_xprop_rate", 0.0))
         )
         overall = (

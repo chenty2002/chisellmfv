@@ -413,6 +413,7 @@ def main_quality(args):
         assume_time_limit=args.assume_time_limit,
         nv_time_limit=args.nv_time_limit,
         mutation_time_limit=args.mutation_time_limit,
+        repair_regression_time_limit=args.repair_regression_time_limit,
         sec_time_limit=args.sec_time_limit,
         xprop_time_limit=args.xprop_time_limit,
         jg_timeout=args.jg_timeout,
@@ -424,6 +425,7 @@ def main_quality(args):
         stages,
         non_vacuity_sidecars=sidecars,
         max_mutants=args.max_mutants,
+        repair_target_properties=_split_csv(args.repair_target_properties),
         sec_spec_sv=_split_csv(args.sec_spec_sv) or None,
         sec_imp_sv=_split_csv(args.sec_imp_sv) or None,
     )
@@ -443,7 +445,16 @@ def _split_csv(value: Optional[str]) -> List[str]:
 
 def _parse_quality_stages(args) -> List[str]:
     if args.all:
-        return ["build", "assertions", "assumptions", "non_vacuity", "mutation", "sec", "xprop"]
+        return [
+            "build",
+            "assertions",
+            "assumptions",
+            "non_vacuity",
+            "mutation",
+            "repair_regression",
+            "sec",
+            "xprop",
+        ]
     stages = _split_csv(args.stages)
     return stages or ["build", "assertions"]
 
@@ -540,9 +551,9 @@ def parse_args():
     quality_parser.add_argument('--counter', action='store_true',
                                 help='使用 verilog/extra_bench/counter 的默认 smoke 配置')
     quality_parser.add_argument('--all', action='store_true',
-                                help='运行 build,assertions,assumptions,non_vacuity,mutation,sec,xprop')
+                                help='运行 build,assertions,assumptions,non_vacuity,mutation,repair_regression,sec,xprop')
     quality_parser.add_argument('--stages', type=str, default=None,
-                                help='逗号分隔阶段：build,assertions,assumptions,non_vacuity,mutation,sec,xprop')
+                                help='逗号分隔阶段：build,assertions,assumptions,non_vacuity,mutation,repair_regression,sec,xprop')
     quality_parser.add_argument('--case-id', type=str, default=None,
                                 help='评估 case ID')
     quality_parser.add_argument('--candidate-id', type=str, default='run_001',
@@ -568,6 +579,8 @@ def parse_args():
                                 help='non-vacuity assertion sidecar JSON')
     quality_parser.add_argument('--max-mutants', type=int, default=5,
                                 help='mutation 阶段最多生成并运行的 mutants')
+    quality_parser.add_argument('--repair-target-properties', type=str, default='',
+                                help='逗号分隔 stage5 修改要回归验证的目标 assertion/property 名称')
     quality_parser.add_argument('--sec-spec-sv', type=str, default='',
                                 help='SEC spec 文件列表；默认使用 --dut-sv')
     quality_parser.add_argument('--sec-imp-sv', type=str, default='',
@@ -576,6 +589,7 @@ def parse_args():
     quality_parser.add_argument('--assume-time-limit', type=str, default='5s')
     quality_parser.add_argument('--nv-time-limit', type=str, default='5s')
     quality_parser.add_argument('--mutation-time-limit', type=str, default='5s')
+    quality_parser.add_argument('--repair-regression-time-limit', type=str, default='5s')
     quality_parser.add_argument('--sec-time-limit', type=str, default='5s')
     quality_parser.add_argument('--xprop-time-limit', type=str, default='5s')
     quality_parser.add_argument('--jg-timeout', type=int, default=900,
