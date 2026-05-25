@@ -112,7 +112,7 @@ def main_formal(args):
 
                 workflow.current_stage = stage
                 result = workflow.process_task(
-                    user_query=get_default_query(stage=stage, target=target),
+                    user_query=_resolve_formal_query(args, stage=stage, target=target),
                 )
                 success = result.get("success", False)
 
@@ -139,7 +139,7 @@ def main_formal(args):
             logger.info(f"Running single stage: {args.stage}")
 
             result = workflow.process_task(
-                user_query=get_default_query(stage=args.stage, target=args.target),
+                user_query=_resolve_formal_query(args, stage=args.stage, target=target),
             )
             success = result.get("success", False)
 
@@ -165,6 +165,23 @@ def _parse_formal_targets(args) -> List[str]:
         if targets:
             return targets
     return [args.target]
+
+
+def _resolve_formal_query(args, stage: Optional[str], target: str) -> str:
+    """Resolve a custom formal query, falling back to the stage default."""
+    raw_query = getattr(args, "query", None)
+    if raw_query is not None:
+        query = str(raw_query)
+        if query.strip().lower() != "none":
+            return query
+
+    raw_query_file = getattr(args, "query_file", None)
+    if raw_query_file is not None:
+        query_file = str(raw_query_file)
+        if query_file.strip().lower() != "none":
+            return Path(query_file).read_text(encoding="utf-8").rstrip("\n")
+
+    return get_default_query(stage=stage, target=target)
 
 
 def _resolve_under_workspace(workspace_dir: str, path: str) -> Path:
@@ -249,7 +266,7 @@ def _run_multi_target_stage(
             stage=args.stage,
         )
         result = workflow.process_task(
-            user_query=get_default_query(stage=args.stage, target=target),
+            user_query=_resolve_formal_query(args, stage=args.stage, target=target),
         )
         if not result.get("success", False):
             logger.error(f"Stage {args.stage} failed for target {target}")
@@ -306,7 +323,7 @@ def _run_stage_batched_formal(
                 stage=stage,
             )
             result = workflow.process_task(
-                user_query=get_default_query(stage=stage, target=target),
+                user_query=_resolve_formal_query(args, stage=stage, target=target),
             )
 
             if not result.get("success", False):
@@ -532,6 +549,10 @@ def parse_args():
     formal_parser.add_argument('--targets', type=str, default=None,
                                help='逗号分隔的多个 benchmark 名称；--full 时按 stage 批处理以提高 prompt cache 命中率')
     formal_parser.add_argument('--waveform', type=str, help='波形文件路径（仅 waveform_explanation 阶段）')
+    formal_parser.add_argument('--query', type=str, default=None,
+                               help="自定义本阶段 query；为 none 或不提供时使用默认 query")
+    formal_parser.add_argument('--query-file', type=str, default=None,
+                               help="从文件读取自定义 query；为 none 或不提供时使用默认 query")
     formal_parser.add_argument('--max-tokens', type=int, default=None,
                                help='Token 总量限制（所有 API 调用累计，超出后停止）')
 
