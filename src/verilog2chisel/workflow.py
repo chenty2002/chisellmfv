@@ -561,22 +561,22 @@ class Verilog2ChiselWorkflow:
     
     def _log_llm_request(self, iteration: int, messages: List[Dict[str, Any]], tool_schemas: List[Dict[str, Any]]) -> None:
         """Log LLM API request details using LLMLogger utility."""
-        # Extract system and user prompts from messages for logging
-        system_prompt = ""
-        user_prompt = ""
-        for msg in messages:
-            if msg.get("role") == "system":
-                system_prompt = msg.get("content", "")
-            elif msg.get("role") == "user":
-                user_prompt = msg.get("content", "")
-        
+        system_prompt = messages[0].get("content", "") if messages else ""
+        user_prompt = messages[1].get("content", "") if len(messages) > 1 else ""
+        dynamic_messages = messages[2:]
         full_prompt = f"[System Prompt]\n{system_prompt}\n\n[User Prompt]\n{user_prompt}"
+        if dynamic_messages:
+            full_prompt += (
+                "\n\n[Dynamic Conversation Context]\n"
+                + LLMLogger._format_dynamic_messages(dynamic_messages)
+            )
         log_msg = LLMLogger.format_request(
             full_prompt,
             tool_schemas,
             stage="Verilog2Chisel",
             iteration=iteration,
             include_details=(iteration == 1),
+            dynamic_messages=dynamic_messages,
         )
         self.logger.info(log_msg)
     

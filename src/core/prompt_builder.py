@@ -287,8 +287,9 @@ def build_system_prompt(
     cache_note = [
         "## Benchmark Context",
         "Benchmark-specific target names, paths, source manifests, waveform paths,",
-        "and prior reports are provided in the user message. Prefer relative paths",
-        "when calling tools.",
+        "and prior reports are provided in the user message. File tools resolve",
+        "paths against the benchmark work directory, not the shell cwd. Prefer",
+        "source-manifest basenames; workspace-relative paths shown below also work.",
         "",
     ]
     
@@ -388,6 +389,7 @@ def build_user_prompt(
         f"- Generated Verilog: `chisel/extra_bench/{target}/generated/`",
         f"- Verilog Output: `verilog/extra_bench/{target}/`",
         "- Writable Directory: the benchmark work directory",
+        "- File Tool Path Rule: use source-manifest basenames such as `gigamax.scala` when possible; `chisel/extra_bench/<benchmark>/...` paths are also resolved to the same benchmark work directory regardless of process cwd",
         "",
     ])
 
@@ -653,7 +655,7 @@ def _build_generic_stage_prompt(stage: str) -> list:
             "",
             "## Guidelines",
             "- Use the source manifest to select files, then call `read_files` for exact design logic",
-            "- When calling file tools, prefer the exact basename from the source manifest, such as `arbiter.scala`; do not prepend `chisel/extra_bench/<benchmark>/`",
+            "- When calling file tools, prefer the exact basename from the source manifest, such as `arbiter.scala`; workspace-relative paths such as `chisel/extra_bench/<benchmark>/arbiter.scala` are accepted, but do not rely on the shell cwd",
             "- Identify critical properties to verify",
             "- Target assertions at error-prone, architecturally important, and hard-to-find bugs that simulation is unlikely to expose; do not pad the design with low-value trivial assertions such as simple signal-connectivity checks, direct mirror checks, or step-by-step FSM restatements unless they guard a genuinely critical invariant.",
             "- Add assertions using Chisel's formal verification APIs",

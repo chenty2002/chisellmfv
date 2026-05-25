@@ -10,18 +10,48 @@ from .waveform_actions import execute_waveform_action, WaveformActions
 from ..causal_analysis import CausalAnalysisActions
 
 
+def _coerce_file_paths(action: Dict[str, Any]) -> List[str]:
+    """Accept common read_files path shapes without depending on model exactness."""
+    file_paths = action.get("file_paths")
+    if file_paths is None:
+        file_paths = action.get("file_path")
+    if file_paths is None:
+        file_paths = action.get("paths")
+    if file_paths is None:
+        file_paths = action.get("path")
+    if file_paths is None:
+        file_paths = action.get("files", [])
+
+    if isinstance(file_paths, str):
+        return [file_paths]
+
+    if not isinstance(file_paths, list):
+        return []
+
+    paths: List[str] = []
+    for item in file_paths:
+        if isinstance(item, str):
+            paths.append(item)
+        elif isinstance(item, dict):
+            candidate = item.get("file_path") or item.get("path")
+            if isinstance(candidate, str):
+                paths.append(candidate)
+    return paths
+
+
 def _resolve_work_path(file_path: str, work_dir: str) -> str:
     """
     Resolve a tool-supplied path to the current benchmark work directory.
 
-    Prompts describe paths as relative to extra_bench, while the executor works
-    inside extra_bench/<target>. Models therefore sometimes return paths like
-    "<target>/foo.scala" or "chisel/extra_bench/<target>/foo.scala". Treat any
-    relative path containing the current target directory as rooted at that
-    target, not as a nested path below work_dir.
+    File tools should be independent of the process cwd. Basenames and generated
+    subpaths are rooted at extra_bench/<target>, while prompt-visible
+    workspace-relative paths such as chisel/extra_bench/<target>/foo.scala or
+    verilog/extra_bench/<target>/Main.sv are rooted at the workspace.
     """
     work_abs = os.path.abspath(work_dir)
     work_parent = os.path.dirname(work_abs)
+    chisel_dir = os.path.dirname(work_parent)
+    workspace_abs = os.path.dirname(chisel_dir)
     target = os.path.basename(work_abs)
 
     if os.path.isabs(file_path):
@@ -43,6 +73,13 @@ def _resolve_work_path(file_path: str, work_dir: str) -> str:
 
     normalized = os.path.normpath(file_path)
     parts = [part for part in normalized.split(os.sep) if part and part != "."]
+    if parts:
+        workspace_name = os.path.basename(workspace_abs)
+        if parts[0] == workspace_name:
+            return os.path.normpath(os.path.join(os.path.dirname(workspace_abs), *parts))
+        if parts[0] in {"chisel", "verilog", "benchmark", "log", "VerilogCausalAnalysis"}:
+            return os.path.normpath(os.path.join(workspace_abs, *parts))
+
     if target in parts:
         target_idx = len(parts) - 1 - parts[::-1].index(target)
         tail = parts[target_idx + 1:]
@@ -130,7 +167,7 @@ def execute_stage_actions(
 
 def _execute_read_files(action: Dict[str, Any], work_dir: str, read_file_func) -> Dict[str, Any]:
     """Execute read_files action."""
-    file_paths = action.get("file_paths", [])
+    file_paths = _coerce_file_paths(action)
     line_start = action.get("line_start")
     line_end = action.get("line_end")
     max_chars = action.get("max_chars")

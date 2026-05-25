@@ -42,6 +42,7 @@ class LLMLogger:
         stage: Optional[str] = None,
         iteration: Optional[int] = None,
         include_details: bool = True,
+        dynamic_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         Format LLM request for logging.
@@ -52,6 +53,8 @@ class LLMLogger:
             stage: Optional workflow stage name
             iteration: Optional iteration number
             include_details: Whether to include full tool schemas and prompt
+            dynamic_messages: Non-static messages added after the initial prompt,
+                such as tool results and retry/error feedback.
             
         Returns:
             Formatted log message
@@ -80,9 +83,12 @@ class LLMLogger:
 {prompt}
 """
         else:
+            dynamic_block = LLMLogger._format_dynamic_messages(dynamic_messages or [])
             detail_block = (
                 "Detailed tool schemas and prompt omitted; see iteration 1 for "
-                "this stage.\n"
+                "this stage.\n\n"
+                "[Dynamic Conversation Context]\n"
+                f"{dynamic_block}\n"
             )
 
         log_msg = f"""
@@ -96,6 +102,46 @@ Available Tools: {', '.join(tool_names)}
 {LLMLogger.SEPARATOR}
 """
         return log_msg
+
+    @staticmethod
+    def _format_dynamic_messages(messages: List[Dict[str, Any]]) -> str:
+        """Format non-static conversation messages for compact request logs."""
+        if not messages:
+            return "(none)"
+
+        blocks = []
+        for index, message in enumerate(messages, start=1):
+            role = message.get("role", "unknown")
+            header_bits = [f"[{index}] role={role}"]
+            if message.get("name"):
+                header_bits.append(f"name={message['name']}")
+            if message.get("tool_call_id"):
+                header_bits.append(f"tool_call_id={message['tool_call_id']}")
+            header = " ".join(header_bits)
+
+            content = message.get("content")
+            if content is None:
+                content_text = ""
+            elif isinstance(content, str):
+                content_text = content
+            else:
+                content_text = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                tool_calls_text = json.dumps(
+                    tool_calls,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                if content_text:
+                    blocks.append(f"{header}\n[Content]\n{content_text}\n[Tool Calls]\n{tool_calls_text}")
+                else:
+                    blocks.append(f"{header}\n[Tool Calls]\n{tool_calls_text}")
+            else:
+                blocks.append(f"{header}\n{content_text}")
+
+        return "\n\n".join(blocks)
     
     @staticmethod
     def format_response(

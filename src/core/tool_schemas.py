@@ -244,7 +244,7 @@ def create_read_files_tool(extra_description: str = "") -> Dict:
                 "file_paths": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of source file paths. Prefer the basename shown in the source manifest, e.g. 'arbiter.scala'."
+                    "description": "List of source file paths. Paths are resolved against the benchmark work directory, independent of the shell cwd. Prefer the basename shown in the source manifest, e.g. 'arbiter.scala'; workspace-relative paths like 'chisel/extra_bench/<benchmark>/arbiter.scala' are also accepted."
                 },
                 "line_start": {
                     "type": "integer",
@@ -298,7 +298,7 @@ BUILD_TOP_TOOL_SCHEMAS = [
             "properties": add_complete_params({
                 "harness_file": {
                     "type": "string",
-                    "description": "Existing harness source file. Prefer the basename shown in the source manifest, e.g. 'arbiter.scala'."
+                    "description": "Existing harness source file. Prefer the basename shown in the source manifest, e.g. 'arbiter.scala'; paths are resolved against the benchmark work directory."
                 },
                 "analysis": {
                     "type": "string",
@@ -316,7 +316,7 @@ BUILD_TOP_TOOL_SCHEMAS = [
             "properties": add_complete_params({
                 "file_path": {
                     "type": "string",
-                    "description": "Source file to write. Prefer a basename within the benchmark work directory, e.g. 'TestHarness.scala'."
+                    "description": "Source file to write. Prefer a basename within the benchmark work directory, e.g. 'TestHarness.scala'; paths are resolved independent of the shell cwd."
                 },
                 "content": {
                     "type": "string",
@@ -339,7 +339,7 @@ WRITE_ASSERTIONS_TOOL_SCHEMAS = [
             "properties": add_complete_params({
                 "file_path": {
                     "type": "string",
-                    "description": "Existing emitted DUT source file to modify. Prefer the basename shown in the source manifest, e.g. 'arbiter.scala'."
+                    "description": "Existing emitted DUT source file to modify. Prefer the basename shown in the source manifest, e.g. 'arbiter.scala'; paths are resolved against the benchmark work directory."
                 },
                 "content": {
                     "type": "string",
@@ -369,7 +369,7 @@ PROPOSE_BUGFIX_TOOL_SCHEMAS = [
             "properties": add_complete_params({
                 "file_path": {
                     "type": "string",
-                    "description": "Path relative to extra_bench directory"
+                    "description": "Source file to fix. Prefer the basename shown in the source manifest; paths are resolved against the benchmark work directory, independent of the shell cwd."
                 },
                 "content": {
                     "type": "string",

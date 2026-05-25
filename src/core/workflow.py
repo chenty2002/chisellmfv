@@ -765,9 +765,15 @@ class FormalWorkflow:
     
     def _log_llm_request(self, stage: str, iteration: int, prompt: List[Dict[str, Any]], tool_schemas: List[Dict[str, Any]]) -> None:
         """Log LLM API request details."""
-        system_propmt = prompt[0].get("content", "")
-        user_prompt = prompt[-1].get("content", "")
-        full_prompt = "[Sytem Prompt]\n" + system_propmt + "\n\n[User Prompt]\n" + user_prompt
+        system_prompt = prompt[0].get("content", "") if prompt else ""
+        user_prompt = prompt[1].get("content", "") if len(prompt) > 1 else ""
+        dynamic_messages = prompt[2:]
+        full_prompt = "[System Prompt]\n" + system_prompt + "\n\n[User Prompt]\n" + user_prompt
+        if dynamic_messages:
+            full_prompt += (
+                "\n\n[Dynamic Conversation Context]\n"
+                + LLMLogger._format_dynamic_messages(dynamic_messages)
+            )
         filtered_prompt = LLMLogger.filter_scala_code_in_prompt(full_prompt)
         log_msg = LLMLogger.format_request(
             filtered_prompt,
@@ -775,6 +781,7 @@ class FormalWorkflow:
             stage=stage,
             iteration=iteration,
             include_details=(iteration == 1),
+            dynamic_messages=dynamic_messages,
         )
         self.logger.info(log_msg)
     
