@@ -375,9 +375,23 @@ PROPOSE_BUGFIX_TOOL_SCHEMAS = [
                     "type": "string",
                     "description": "Complete fixed source code"
                 },
-                "bugfix_report": {
+                "round_summary": {
                     "type": "string",
-                    "description": "Markdown report describing the bug fix (required if stage_complete=true). Include: 1) What was the bug, 2) How it was fixed, 3) Why this fix is correct."
+                    "description": "Compact repair-round summary required when stage_complete=true. Include failing property handled, error category, root cause, files/lines changed, expected effect, and any assertion-label preservation or homologous-assertion work."
+                },
+                "error_type": {
+                    "type": "string",
+                    "enum": ["dut_bug", "assertion_error", "setup_error", "inconclusive"],
+                    "description": "Repair category for this round. Use assertion_error when fixing generated/source assertions rather than DUT behavior."
+                },
+                "target_assertion_label": {
+                    "type": "string",
+                    "description": "Original failing assertion/property label handled in this round. Preserve this exact label in the repaired source unless the issue is explicitly only a setup/name mapping bug."
+                },
+                "homologous_assertions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "For assertion_error repairs, list all structurally identical assertions found and repaired in the same way. Use an empty list only after inspecting the source and finding no homologous assertions."
                 }
             }),
             "required": ["file_path", "content"]

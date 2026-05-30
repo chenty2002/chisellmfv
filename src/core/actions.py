@@ -291,23 +291,23 @@ def _execute_write_fix(
     
     ok, err = write_file_func(file_path, content)
     
-    bugfix_report_path = None
-    # For benchmark targets: write bugfix_report.md if bugfix_report is provided
-    if action.get("bugfix_report"):
-        bugfix_report = action.get("bugfix_report", "")
-        report_path = os.path.join(work_dir, "bugfix_report.md")
+    round_summary_path = None
+
+    if action.get("round_summary"):
+        round_summary = action.get("round_summary", "")
+        summary_path = os.path.join(work_dir, "repair_round_summary.md")
         try:
-            with open(report_path, 'w') as f:
-                f.write(bugfix_report)
-            bugfix_report_path = report_path
-            logger.info(f"Bugfix report written to: {report_path}")
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                f.write(round_summary)
+            round_summary_path = summary_path
+            logger.info(f"Repair round summary written to: {summary_path}")
         except Exception as e:
-            logger.warning(f"Failed to write bugfix report: {e}")
+            logger.warning(f"Failed to write repair round summary: {e}")
     
     return {
         "type": "write_fix",
         "file_path": file_path,
-        "bugfix_report_path": bugfix_report_path,
+        "round_summary_path": round_summary_path,
         "success": ok,
         "error": err if not ok else None
     }

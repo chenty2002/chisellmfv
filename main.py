@@ -98,6 +98,7 @@ def main_formal(args):
             target=target,
             waveform_path=args.waveform,
             stage=args.stage if args.stage else FORMAL_STAGES[0],
+            max_repair_rounds=args.max_repair_rounds,
         )
 
         if args.full:
@@ -124,6 +125,7 @@ def main_formal(args):
                 # counterexample to analyse, so the workflow is done.
                 if stage == "invoke_verification":
                     stage_result_detail = result.get("stage_result", {})
+                    workflow.last_verification_result = stage_result_detail
                     if stage_result_detail.get("verification_passed", False):
                         logger.info(
                             "All assertions proven - formal verification passed. "
@@ -264,6 +266,7 @@ def _run_multi_target_stage(
             target=target,
             waveform_path=args.waveform if len(targets) == 1 else None,
             stage=args.stage,
+            max_repair_rounds=args.max_repair_rounds,
         )
         result = workflow.process_task(
             user_query=_resolve_formal_query(args, stage=args.stage, target=target),
@@ -321,6 +324,8 @@ def _run_stage_batched_formal(
                 target=target,
                 waveform_path=waveform_path,
                 stage=stage,
+                max_repair_rounds=args.max_repair_rounds,
+                initial_verification_result=state[target].get("stage3_result"),
             )
             result = workflow.process_task(
                 user_query=_resolve_formal_query(args, stage=stage, target=target),
@@ -334,6 +339,7 @@ def _run_stage_batched_formal(
 
             if stage == "invoke_verification":
                 detail = result.get("stage_result", {})
+                state[target]["stage3_result"] = detail
                 if detail.get("verification_passed", False):
                     active[target] = False
                     state[target]["verification_passed"] = True
@@ -555,6 +561,8 @@ def parse_args():
                                help="从文件读取自定义 query；为 none 或不提供时使用默认 query")
     formal_parser.add_argument('--max-tokens', type=int, default=None,
                                help='Token 总量限制（所有 API 调用累计，超出后停止）')
+    formal_parser.add_argument('--max-repair-rounds', type=int, default=3,
+                               help='stage 5 repair-regression loop 最大轮数（默认: 3）')
 
     # Verilog → Chisel 转换
     v2c_parser = subparsers.add_parser('v2c', help='Verilog 到 Chisel 转换')

@@ -20,6 +20,7 @@ This implementation uses standard agent loop with message history:
 import os
 import json
 import hashlib
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 import logging
 
@@ -40,6 +41,14 @@ from .waveform_actions import WaveformActions
 from .tool_schemas import get_tool_schemas, convert_tool_call_to_action
 from .actions import execute_stage_actions
 from .build_operations import BuildOperations
+from .repair_loop import (
+    DEFAULT_MAX_REPAIR_ROUNDS,
+    build_final_repair_result,
+    check_repair_target_presence,
+    extract_failing_properties,
+    select_next_counterexample,
+    write_repair_json,
+)
 from ..causal_analysis import (
     CausalAnalysisActions,
     run_causal_analysis_result_if_available,
@@ -67,6 +76,8 @@ class FormalWorkflow:
         stage: str = "build_top_module",
         target: str = "gigamax",
         ablation_modes: Optional[List[str]] = None,
+        max_repair_rounds: int = DEFAULT_MAX_REPAIR_ROUNDS,
+        initial_verification_result: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the formal verification workflow for a single stage.
@@ -90,6 +101,8 @@ class FormalWorkflow:
         self.current_stage = stage
         self.target = target
         self.ablation_modes = set(ablation_modes or [])
+        self.max_repair_rounds = max(0, int(max_repair_rounds))
+        self.last_verification_result = initial_verification_result
         self.causal_actions: Optional[CausalAnalysisActions] = None
         
         # Initialize paths based on target
@@ -232,9 +245,13 @@ class FormalWorkflow:
         self.logger.info(f"=== Running stage: {stage} ===")
         print(f"\n=== Running stage: {stage} ===")
         
-        # invoke_verification stage runs automatically without LLM
+        # invoke_verification stage runs automatically without LLM.
+        # propose_bugfix is now a bounded repair-regression loop.
         if stage == "invoke_verification":
             stage_result = self.build_ops.run_full_verification_flow()
+            self.last_verification_result = stage_result
+        elif stage == "propose_bugfix":
+            stage_result = self._run_repair_loop(user_query)
         else:
             stage_result = self._run_stage(context, stage)
         
@@ -249,6 +266,232 @@ class FormalWorkflow:
                 self._update_waveform_from_result(stage_result, context)
         
         return result
+
+    def _run_repair_loop(self, user_query: str) -> Dict[str, Any]:
+        """Run stage 5 as a bounded repair-regression loop."""
+        repair_root = Path(self.work_dir) / "repair_loop"
+        repair_root.mkdir(parents=True, exist_ok=True)
+
+        initial_stage3 = self.last_verification_result
+        if not initial_stage3:
+            self.logger.info("No prior stage-3 result available; running initial verification for repair loop.")
+            initial_stage3 = self.build_ops.run_full_verification_flow()
+            self.last_verification_result = initial_stage3
+
+        initial_properties = extract_failing_properties(initial_stage3)
+        if initial_stage3.get("verification_passed", False) or not initial_properties:
+            final = build_final_repair_result(
+                max_repair_rounds=self.max_repair_rounds,
+                rounds=[],
+                initial_stage3_result=initial_stage3,
+                final_stage3_result=initial_stage3,
+                repair_success=True,
+                target_presence=check_repair_target_presence(initial_properties, initial_stage3),
+            )
+            write_repair_json(repair_root / "final_repair_result.json", final)
+            return {
+                "success": True,
+                "summary": "No counterexample remains before repair.",
+                "verification_passed": True,
+                "repair_loop": final,
+            }
+
+        current_stage3 = initial_stage3
+        current_property: Optional[str] = None
+        rounds: List[Dict[str, Any]] = []
+        target_presence = check_repair_target_presence(initial_properties, current_stage3)
+
+        for round_idx in range(1, self.max_repair_rounds + 1):
+            selected = select_next_counterexample(
+                current_stage3,
+                previous_property=current_property,
+                original_failing_properties=initial_properties,
+            )
+            if not selected:
+                final = build_final_repair_result(
+                    max_repair_rounds=self.max_repair_rounds,
+                    rounds=rounds,
+                    initial_stage3_result=initial_stage3,
+                    final_stage3_result=current_stage3,
+                    repair_success=True,
+                    target_presence=target_presence,
+                )
+                write_repair_json(repair_root / "final_repair_result.json", final)
+                return {
+                    "success": True,
+                    "summary": "Repair loop completed; no counterexample remains.",
+                    "verification_passed": True,
+                    "repair_loop": final,
+                }
+
+            current_property = selected.get("name")
+            round_dir = repair_root / f"round_{round_idx:02d}"
+            write_repair_json(round_dir / "selected_cex.json", selected)
+
+            waveform_path = selected.get("fst_file") or current_stage3.get("counterexample_path")
+            if not self._analysis_report_available() or round_idx > 1:
+                analysis_result = self._run_repair_waveform_analysis(waveform_path)
+                if not analysis_result.get("success", False):
+                    final = build_final_repair_result(
+                        max_repair_rounds=self.max_repair_rounds,
+                        rounds=rounds,
+                        initial_stage3_result=initial_stage3,
+                        final_stage3_result=current_stage3,
+                        repair_success=False,
+                        target_presence=target_presence,
+                    )
+                    final["error"] = analysis_result.get("error", "waveform analysis failed")
+                    write_repair_json(repair_root / "final_repair_result.json", final)
+                    return {
+                        "success": False,
+                        "summary": "Repair loop failed while regenerating counterexample analysis.",
+                        "verification_passed": False,
+                        "repair_loop": final,
+                    }
+                self._copy_analysis_report(round_dir / "counterexample_analysis.md")
+            else:
+                self._copy_analysis_report(round_dir / "counterexample_analysis.md")
+
+            repair_context = self.create_initial_context(user_query)
+            repair_context.setdefault("environment", {}).update({
+                "repair_round": f"{round_idx}/{self.max_repair_rounds}",
+                "selected_counterexample": selected,
+                "stage3_summary": self._compact_stage3_summary(current_stage3),
+                "repair_history": rounds,
+            })
+
+            round_result = self._run_stage(repair_context, "propose_bugfix")
+            if not round_result.get("success", False):
+                final = build_final_repair_result(
+                    max_repair_rounds=self.max_repair_rounds,
+                    rounds=rounds,
+                    initial_stage3_result=initial_stage3,
+                    final_stage3_result=current_stage3,
+                    repair_success=False,
+                    target_presence=target_presence,
+                )
+                final["error"] = round_result.get("error", "repair round failed")
+                write_repair_json(repair_root / "final_repair_result.json", final)
+                return {
+                    "success": False,
+                    "summary": "Repair loop failed during a repair round.",
+                    "verification_passed": False,
+                    "repair_loop": final,
+                }
+
+            summary = str(round_result.get("summary", "")).strip()
+            if summary:
+                (round_dir / "repair_round_summary.md").write_text(summary, encoding="utf-8")
+
+            post_stage3 = self.build_ops.run_full_verification_flow()
+            self.last_verification_result = post_stage3
+            write_repair_json(round_dir / "stage3_result.json", post_stage3)
+
+            target_presence = check_repair_target_presence(initial_properties, post_stage3)
+            round_info = {
+                "round": round_idx,
+                "target_assertion_label": round_result.get("target_assertion_label") or current_property,
+                "selected_cex": selected,
+                "round_summary": summary,
+                "error_type": round_result.get("error_type"),
+                "homologous_assertions": round_result.get("homologous_assertions", []),
+                "post_cex_count": post_stage3.get("cex_count", 0),
+                "post_failing_properties": extract_failing_properties(post_stage3),
+                "target_presence": target_presence,
+            }
+            rounds.append(round_info)
+            write_repair_json(repair_root / "repair_history.json", {"rounds": rounds})
+
+            if target_presence.get("all_present") is False:
+                final = build_final_repair_result(
+                    max_repair_rounds=self.max_repair_rounds,
+                    rounds=rounds,
+                    initial_stage3_result=initial_stage3,
+                    final_stage3_result=post_stage3,
+                    repair_success=False,
+                    target_presence=target_presence,
+                )
+                final["error"] = "repair removed or renamed original failing assertion labels"
+                write_repair_json(repair_root / "final_repair_result.json", final)
+                return {
+                    "success": False,
+                    "summary": "Repair loop failed because an original failing assertion label is missing.",
+                    "verification_passed": False,
+                    "repair_loop": final,
+                }
+
+            current_stage3 = post_stage3
+            if post_stage3.get("verification_passed", False) or not extract_failing_properties(post_stage3):
+                final = build_final_repair_result(
+                    max_repair_rounds=self.max_repair_rounds,
+                    rounds=rounds,
+                    initial_stage3_result=initial_stage3,
+                    final_stage3_result=post_stage3,
+                    repair_success=True,
+                    target_presence=target_presence,
+                )
+                write_repair_json(repair_root / "final_repair_result.json", final)
+                return {
+                    "success": True,
+                    "summary": "Repair loop completed; no counterexample remains.",
+                    "verification_passed": True,
+                    "repair_loop": final,
+                }
+
+        final = build_final_repair_result(
+            max_repair_rounds=self.max_repair_rounds,
+            rounds=rounds,
+            initial_stage3_result=initial_stage3,
+            final_stage3_result=current_stage3,
+            repair_success=False,
+            target_presence=target_presence,
+        )
+        write_repair_json(repair_root / "final_repair_result.json", final)
+        return {
+            "success": False,
+            "summary": "Repair loop reached the maximum number of rounds with remaining counterexamples.",
+            "verification_passed": False,
+            "repair_loop": final,
+        }
+
+    def _analysis_report_available(self) -> bool:
+        return os.path.exists(os.path.join(self.work_dir, "counterexample_analysis.md"))
+
+    def _copy_analysis_report(self, dst: Path) -> None:
+        src = Path(self.work_dir) / "counterexample_analysis.md"
+        if src.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+    def _run_repair_waveform_analysis(self, waveform_path: Optional[str]) -> Dict[str, Any]:
+        if not waveform_path:
+            return {"success": False, "error": "no waveform path for selected counterexample"}
+        workflow = FormalWorkflow(
+            llm_client=self.llm,
+            chisel_dir=os.path.relpath(self.chisel_dir, self.workspace_dir),
+            workspace_dir=self.workspace_dir,
+            logger=self.logger,
+            waveform_path=waveform_path,
+            stage="waveform_explanation",
+            target=self.target,
+            ablation_modes=sorted(self.ablation_modes),
+            max_repair_rounds=self.max_repair_rounds,
+            initial_verification_result=self.last_verification_result,
+        )
+        result = workflow.process_task(
+            "Analyze the selected post-repair counterexample for the next repair round."
+        )
+        return result.get("stage_result", result)
+
+    def _compact_stage3_summary(self, stage3_result: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "success": stage3_result.get("success"),
+            "verification_passed": stage3_result.get("verification_passed"),
+            "summary": stage3_result.get("summary"),
+            "cex_count": stage3_result.get("cex_count"),
+            "proven_count": stage3_result.get("proven_count"),
+            "failing_properties": extract_failing_properties(stage3_result),
+        }
     
     def _update_waveform_from_result(self, stage_result: Dict[str, Any], context: Dict[str, Any]) -> None:
         """Update waveform actions from verification result."""
@@ -649,7 +892,7 @@ class FormalWorkflow:
         For stages requiring compilation, verifies the code compiles.
         If compilation fails, adds error message to history for retry.
         """
-        summary = args.get("summary", args.get("bugfix_report", ""))
+        summary = args.get("summary", args.get("round_summary", ""))
         error_type = args.get("error_type")  # Extract error_type if present
         
         self.logger.info(f"Stage {stage} marked complete by LLM: {summary if summary else ''}")
@@ -657,6 +900,22 @@ class FormalWorkflow:
             self.logger.info(f"Error type identified: {error_type}")
             print(f"  Error type: {error_type}")
             context["error_type"] = error_type
+
+        if (
+            stage == "propose_bugfix"
+            and args.get("stage_complete", False)
+            and error_type == "assertion_error"
+            and "homologous_assertions" not in args
+        ):
+            messages.append({
+                "role": "user",
+                "content": (
+                    "For an `assertion_error` repair you must inspect and report homologous assertions. "
+                    "Call `write_fix` again with `homologous_assertions` listing every structurally identical "
+                    "assertion repaired, or an empty list only if none exist."
+                ),
+            })
+            return None
         
         # Stages that require compilation verification
         if stage in ["build_top_module", "write_assertions", "propose_bugfix"]:
@@ -679,6 +938,9 @@ class FormalWorkflow:
                 # Include error_type if present (for RL reward calculation)
                 if error_type:
                     result["error_type"] = error_type
+                if stage == "propose_bugfix":
+                    result["target_assertion_label"] = args.get("target_assertion_label")
+                    result["homologous_assertions"] = args.get("homologous_assertions", [])
                 context["stage_results"][stage] = result
                 if stage == "propose_bugfix" and result.get("success"):
                     context["workflow_complete"] = True

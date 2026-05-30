@@ -20,7 +20,7 @@ import os
 from ..utils.llm_properties import MAX_ITERATIONS, WAVEFORM_MAX_ITER
 
 
-PROMPT_VERSION = "formal-v5-assertion-quality"
+PROMPT_VERSION = "formal-v6-repair-loop"
 
 
 CHISEL6_LTL_DOC = """
@@ -486,6 +486,38 @@ def build_user_prompt(
             "---",
             "",
         ])
+
+    if stage == "propose_bugfix":
+        repair_round = env.get("repair_round")
+        selected_cex = env.get("selected_counterexample")
+        stage3_summary = env.get("stage3_summary")
+        repair_history = env.get("repair_history")
+        if repair_round or selected_cex or stage3_summary or repair_history:
+            sections.extend(["## Repair Loop Context", ""])
+            if repair_round:
+                sections.append(f"- Repair round: `{repair_round}`")
+            if selected_cex:
+                sections.extend([
+                    "- Selected counterexample:",
+                    "```json",
+                    json.dumps(selected_cex, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    "```",
+                ])
+            if stage3_summary:
+                sections.extend([
+                    "- Latest stage-3 verification summary:",
+                    "```json",
+                    json.dumps(stage3_summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    "```",
+                ])
+            if repair_history:
+                sections.extend([
+                    "- Accumulated repair history:",
+                    "```json",
+                    json.dumps(repair_history, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    "```",
+                ])
+            sections.extend(["", "---", ""])
     
     return "\n".join(sections)
 
@@ -762,7 +794,8 @@ def _build_generic_stage_prompt(stage: str) -> list:
         ],
         "propose_bugfix": [
             "## Objective",
-            "Based on the waveform analysis report, fix the identified issue.",
+            "Perform one bounded repair round based on the latest waveform analysis report and repair history.",
+            "The system will compile the patch and then rerun formal verification; compilation alone is not success.",
             "",
             "## Determine What to Fix",
             "Based on the analysis report, identify which component needs fixing:",
@@ -782,13 +815,17 @@ def _build_generic_stage_prompt(stage: str) -> list:
             "3. **Low performance impact**: Avoid introducing unnecessary overhead",
             "4. **Low side effects**: Minimize impact on other parts of the codebase",
             "5. **Preserve functionality**: Do not break existing features",
+            "6. **Assertion label preservation**: preserve the original failing assertion label exactly; never delete, disable, rename, or weaken a failing assertion to make regression pass.",
+            "7. **Homologous assertion repair**: for an `assertion_error`, inspect the source for all structurally identical assertions and repair all structurally identical assertions in the same way.",
+            "8. **Temporal sampling**: for assertion timing mistakes, snapshot antecedent-cycle combinational values explicitly, for example with `RegNext`.",
+            "9. **DUT causality**: for DUT fixes, state why the source change addresses the causal path rather than only the observed waveform value.",
             "",
             "## Actions",
-            "Use `write_fix` to apply the fix with `stage_complete=true` and `bugfix_report`",
-            "The `bugfix_report` should describe what was fixed (DUT/assertion/setup) and why",
+            "Use `write_fix` to apply exactly one focused repair round with `stage_complete=true`.",
+            "Provide `round_summary`, `error_type`, and `target_assertion_label`.",
+            "If `error_type` is `assertion_error`, provide `homologous_assertions` listing all structurally identical assertions repaired, or an empty list only if none exist after inspection.",
             "",
-            "**Note**: After you write the fix, the system will automatically verify compilation.",
-            "If compilation fails, you will be asked to fix the errors.",
+            "**Note**: After you write the fix, the system will automatically verify compilation and then rerun formal verification. If a CEX remains, another waveform analysis and repair round may follow.",
             "",
         ],
     }
