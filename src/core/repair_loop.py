@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -158,6 +159,87 @@ def build_final_repair_result(
         if not target_presence.get("all_present", True):
             result["repair_success"] = False
     return result
+
+
+def _append_path(paths: List[Path], value: Any) -> None:
+    if isinstance(value, str) and value:
+        paths.append(Path(value))
+
+
+def _collect_waveform_paths(data: Optional[Dict[str, Any]]) -> List[Path]:
+    """Collect waveform paths referenced by a CEX or stage-3 result."""
+    if not data:
+        return []
+
+    paths: List[Path] = []
+    _append_path(paths, data.get("fst_file"))
+    _append_path(paths, data.get("counterexample_path"))
+
+    for value in data.get("fst_files", []) if isinstance(data.get("fst_files"), list) else []:
+        _append_path(paths, value)
+
+    for item in extract_cex_assertions(data):
+        _append_path(paths, item.get("fst_file"))
+
+    jg_result = data.get("jaspergold_result")
+    if isinstance(jg_result, dict):
+        for value in jg_result.get("fst_files", []) if isinstance(jg_result.get("fst_files"), list) else []:
+            _append_path(paths, value)
+        for item in extract_cex_assertions({"jaspergold_result": jg_result}):
+            _append_path(paths, item.get("fst_file"))
+
+    expanded: List[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        candidates = [path]
+        if path.suffix.lower() == ".fst":
+            candidates.append(path.with_suffix(".vcd"))
+        elif path.suffix.lower() == ".vcd":
+            candidates.append(path.with_suffix(".fst"))
+        for candidate in candidates:
+            key = str(candidate)
+            if key not in seen:
+                expanded.append(candidate)
+                seen.add(key)
+    return expanded
+
+
+def snapshot_waveform_artifacts(data: Optional[Dict[str, Any]], artifact_dir: Path) -> List[Dict[str, str]]:
+    """
+    Copy referenced VCD/FST artifacts into a stable round-specific directory.
+
+    JasperGold emits traces into the shared Verilog directory using property
+    names, so later repair rounds can overwrite earlier files. This snapshot
+    preserves the files that existed at the moment the round used or produced
+    them.
+    """
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    snapshots: List[Dict[str, str]] = []
+    used_names: set[str] = set()
+
+    for source in _collect_waveform_paths(data):
+        if not source.exists() or not source.is_file():
+            continue
+
+        name = source.name
+        if name in used_names:
+            stem = source.stem
+            suffix = source.suffix
+            index = 2
+            while f"{stem}_{index}{suffix}" in used_names:
+                index += 1
+            name = f"{stem}_{index}{suffix}"
+        used_names.add(name)
+
+        dst = artifact_dir / name
+        shutil.copy2(source, dst)
+        snapshots.append({
+            "kind": source.suffix.lower().lstrip("."),
+            "source_path": str(source),
+            "artifact_path": str(dst),
+        })
+
+    return snapshots
 
 
 def write_repair_json(path: Path, data: Dict[str, Any]) -> None:

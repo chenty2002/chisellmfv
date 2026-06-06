@@ -47,6 +47,7 @@ from .repair_loop import (
     check_repair_target_presence,
     extract_failing_properties,
     select_next_counterexample,
+    snapshot_waveform_artifacts,
     write_repair_json,
 )
 from ..causal_analysis import (
@@ -324,11 +325,20 @@ class FormalWorkflow:
                     "repair_loop": final,
                 }
 
-            current_property = selected.get("name")
             round_dir = repair_root / f"round_{round_idx:02d}"
+            current_property = selected.get("name")
+            waveform_path = selected.get("fst_file") or current_stage3.get("counterexample_path")
+            selected_for_snapshot = dict(selected)
+            if waveform_path and not selected_for_snapshot.get("fst_file"):
+                selected_for_snapshot["counterexample_path"] = waveform_path
+            selected_waveform_artifacts = snapshot_waveform_artifacts(
+                selected_for_snapshot,
+                round_dir / "waveforms" / "selected_cex",
+            )
+            selected = dict(selected)
+            selected["waveform_artifacts"] = selected_waveform_artifacts
             write_repair_json(round_dir / "selected_cex.json", selected)
 
-            waveform_path = selected.get("fst_file") or current_stage3.get("counterexample_path")
             if not self._analysis_report_available() or round_idx > 1:
                 analysis_result = self._run_repair_waveform_analysis(waveform_path)
                 if not analysis_result.get("success", False):
@@ -385,7 +395,13 @@ class FormalWorkflow:
 
             post_stage3 = self.build_ops.run_full_verification_flow()
             self.last_verification_result = post_stage3
-            write_repair_json(round_dir / "stage3_result.json", post_stage3)
+            post_stage3_waveform_artifacts = snapshot_waveform_artifacts(
+                post_stage3,
+                round_dir / "waveforms" / "post_stage3",
+            )
+            post_stage3_artifact_record = dict(post_stage3)
+            post_stage3_artifact_record["waveform_artifacts"] = post_stage3_waveform_artifacts
+            write_repair_json(round_dir / "stage3_result.json", post_stage3_artifact_record)
 
             target_presence = check_repair_target_presence(initial_properties, post_stage3)
             round_info = {
@@ -397,6 +413,8 @@ class FormalWorkflow:
                 "homologous_assertions": round_result.get("homologous_assertions", []),
                 "post_cex_count": post_stage3.get("cex_count", 0),
                 "post_failing_properties": extract_failing_properties(post_stage3),
+                "selected_waveform_artifacts": selected_waveform_artifacts,
+                "post_stage3_waveform_artifacts": post_stage3_waveform_artifacts,
                 "target_presence": target_presence,
             }
             rounds.append(round_info)
