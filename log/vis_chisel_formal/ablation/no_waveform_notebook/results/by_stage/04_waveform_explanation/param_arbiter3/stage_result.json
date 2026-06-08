@@ -1,0 +1,4752 @@
+{
+  "ablation_modes": [
+    "no_waveform_notebook"
+  ],
+  "original_query": "Analyze the counterexample waveform to identify the bug. Trace signal values and identify the root cause. Use the causal analysis report as prior evidence when available.",
+  "stage": "waveform_explanation",
+  "stage_result": {
+    "counterexample_path": null,
+    "error_type": "dut_bug",
+    "files_modified": [],
+    "iterations": [
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\n// Define enums using ChiselEnum\nobject Selection extends ChiselEnum {\n  val A, B, C, X = Value\n}\n\nobject ControllerState extends ChiselEnum {\n  val IDLE, READY, BUSY = Value\n}\n\nobject ClientState extends ChiselEnum {\n  val NO_REQ, REQ, HAVE_TOKEN = Value\n}\n\n// Controller module\nclass Controller extends Module {\n  val io = IO(new Bundle {\n    val req = Input(Bool())\n    val sel = Input(Selection())\n    val id = Input(Selection())\n    val ack = Output(Bool())\n    val pass_token = Output(Bool())\n  })\n  \n  val state = RegInit(ControllerState.IDLE)\n  val ackReg = RegInit(false.B)\n  val passTokenReg = RegInit(true.B)\n  \n  val isSelected = (io.sel === io.id)\n  \n  io.ack := ackReg\n  io.pass_token := passTokenReg\n  \n  switch(state) {\n    is(ControllerState.IDLE) {\n      when(isSelected) {\n        when(io.req) {\n          state := ControllerState.READY\n          passTokenReg := false.B\n        }.otherwise {\n          passTokenReg := true.B\n        }\n      }.otherwise {\n        passTokenReg := false.B\n      }\n    }\n    is(ControllerState.READY) {\n      state := ControllerState.BUSY\n      ackReg := true.B\n    }\n    is(ControllerState.BUSY) {\n      when(!io.req) {\n        state := ControllerState.IDLE\n        ackReg := false.B\n        passTokenReg := true.B\n      }\n    }\n  }\n}\n\n// Arbiter module\nclass Arbiter extends Module {\n  val io = IO(new Bundle {\n    val active = Input(Bool())\n    val sel = Output(Selection())\n  })\n  \n  val state = RegInit(Selection.A)\n  \n  io.sel := Mux(io.active, state, Selection.X)\n  \n  when(io.active) {\n    switch(state) {\n      is(Selection.A) {\n        state := Selection.B\n      }\n      is(Selection.B) {\n        state := Selection.C\n      }\n      is(Selection.C) {\n        state := Selection.A\n      }\n    }\n  }\n}\n\n// Client module\nclass Client extends Module {\n  val io = IO(new Bundle {\n    val ack = Input(Bool())\n    val req = Output(Bool())\n  })\n  \n  val state = RegInit(ClientState.NO_REQ)\n  val reqReg = RegInit(false.B)\n  \n  // Simple pseudo-random choice using LFSR\n  val lfsr = RegInit(1.U(8.W))\n  val randChoice = lfsr(0)\n  lfsr := Cat(lfsr(6), lfsr(5), lfsr(4), lfsr(3), lfsr(2), lfsr(1), lfsr(0), lfsr(6) ^ lfsr(5))\n  \n  io.req := reqReg\n  \n  switch(state) {\n    is(ClientState.NO_REQ) {\n      when(randChoice) {\n        reqReg := true.B\n        state := ClientState.REQ\n      }\n    }\n    is(ClientState.REQ) {\n      when(io.ack) {\n        state := ClientState.HAVE_TOKEN\n      }\n    }\n    is(ClientState.HAVE_TOKEN) {\n      when(randChoice) {\n        reqReg := false.B\n        state := ClientState.NO_REQ\n      }\n    }\n  }\n}\n\n// Main module with formal assertions\nclass Main extends Module with Formal {\n  val io = IO(new Bundle {\n    val ackA = Output(Bool())\n    val ackB = Output(Bool())\n    val ackC = Output(Bool())\n    // Additional outputs to preserve internal signals\n    val sel = Output(Selection())\n    val active = Output(Bool())\n    val reqA = Output(Bool())\n    val reqB = Output(Bool())\n    val reqC = Output(Bool())\n    val pass_tokenA = Output(Bool())\n    val pass_tokenB = Output(Bool())\n    val pass_tokenC = Output(Bool())\n  })\n  \n  // Instantiate controllers\n  val controllerA = Module(new Controller)\n  val controllerB = Module(new Controller)\n  val controllerC = Module(new Controller)\n  \n  // Instantiate arbiter\n  val arbiter = Module(new Arbiter)\n  \n  // Instantiate clients\n  val clientA = Module(new Client)\n  val clientB = Module(new Client)\n  val clientC = Module(new Client)\n  \n  // Connect controllers\n  controllerA.io.req := clientA.io.req\n  controllerA.io.sel := arbiter.io.sel\n  controllerA.io.id := Selection.A\n  \n  controllerB.io.req := clientB.io.req\n  controllerB.io.sel := arbiter.io.sel\n  controllerB.io.id := Selection.B\n  \n  controllerC.io.req := clientC.io.req\n  controllerC.io.sel := arbiter.io.sel\n  controllerC.io.id := Selection.C\n  \n  // Connect clients\n  clientA.io.ack := controllerA.io.ack\n  clientB.io.ack := controllerB.io.ack\n  clientC.io.ack := controllerC.io.ack\n  \n  // Connect arbiter\n  val active = controllerA.io.pass_token || controllerB.io.pass_token || controllerC.io.pass_token\n  arbiter.io.active := active\n  \n  // Connect outputs\n  io.ackA := controllerA.io.ack\n  io.ackB := controllerB.io.ack\n  io.ackC := controllerC.io.ack\n  io.sel := arbiter.io.sel\n  io.active := active\n  io.reqA := clientA.io.req\n  io.reqB := clientB.io.req\n  io.reqC := clientC.io.req\n  io.pass_tokenA := controllerA.io.pass_token\n  io.pass_tokenB := controllerB.io.pass_token\n  io.pass_tokenC := controllerC.io.pass_token\n\n  // =============================================\n  // FORMAL ASSERTIONS\n  // =============================================\n\n  // Safety: Mutual exclusion on ack - at most one client gets ack at a time\n  assertMutex(Seq(io.ackA, io.ackB, io.ackC), \"mutex_ack\")\n\n  // Safety: When arbiter is active, sel must be a valid client state (A, B, or C), not X\n  fvAssert(!io.active || (io.sel === Selection.A || io.sel === Selection.B || io.sel === Selection.C), \"sel_valid_when_active\")\n\n  // Safety: ack for a client implies the arbiter selected that client\n  assertImplies(io.ackA, io.sel === Selection.A, \"ackA_implies_sel_A\")\n  assertImplies(io.ackB, io.sel === Selection.B, \"ackB_implies_sel_B\")\n  assertImplies(io.ackC, io.sel === Selection.C, \"ackC_implies_sel_C\")\n\n  // Liveness: When a client has a pending request and is selected, it gets an ack within bounded cycles.\n  // The controller pipeline is 2 cycles from selected+req to ack (IDLE->READY->BUSY).\n  // Using bound 10 to account for arbiter cycling back to this client.\n  astRelaxedLiveness(io.reqA && io.sel === Selection.A, io.ackA, 10, \"liveness_reqA_ackA\")\n  astRelaxedLiveness(io.reqB && io.sel === Selection.B, io.ackB, 10, \"liveness_reqB_ackB\")\n  astRelaxedLiveness(io.reqC && io.sel === Selection.C, io.ackC, 10, \"liveness_reqC_ackC\")\n\n  // Liveness: If active remains true, the arbiter keeps cycling through selections.\n  // When active is true, one of the selection states must be active each cycle (fairness).\n  // Arbiter cycles A->B->C->A when active, so over any 3 consecutive active cycles,\n  // all three selections should be seen.\n}\n\n// Verilog generator\nobject VerilogGenerator extends App {\n  emitVerilog(new Main(), args)\n}\n",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/param_arbiter3/arbiter3.scala",
+                "original_chars": 6306,
+                "original_lines": 226,
+                "returned_chars": 6306,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "arbiter3.scala"
+              ],
+              "reason": "Read the source file to find assertion and understand design"
+            },
+            "id": "call_00_81G3CyUO9HKNjSrXcF0l6399",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 1
+      },
+      {
+        "action_results": [
+          {
+            "error": "Causal analysis JSON is not available for this waveform",
+            "success": false,
+            "type": "causal_get_roots"
+          },
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "limit": 10
+            },
+            "id": "call_00_2Wz0b7WjRNF8gQQ8CAQ64137",
+            "name": "causal_get_roots"
+          },
+          {
+            "arguments": {
+              "max_results": 100,
+              "pattern": "*"
+            },
+            "id": "call_01_fTlOnMLFzfguWDhb5q5V3463",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 2
+      },
+      {
+        "action_results": [
+          {
+            "count": 1,
+            "signals": [
+              {
+                "handle": 84,
+                "length": 1,
+                "name": "Main.io_ackA"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 2,
+            "signals": [
+              {
+                "handle": 84,
+                "length": 1,
+                "name": "Main.io_ackA"
+              },
+              {
+                "handle": 128,
+                "length": 1,
+                "name": "Main.ackA_implies_sel_A"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 130,
+            "signals": [
+              {
+                "handle": 1,
+                "length": 1,
+                "name": "Main.resetCounter.reset"
+              },
+              {
+                "handle": 2,
+                "length": 32,
+                "name": "Main.resetCounter.timeSinceReset [31:0]"
+              },
+              {
+                "handle": 3,
+                "length": 1,
+                "name": "Main.resetCounter.notChaos"
+              },
+              {
+                "handle": 4,
+                "length": 32,
+                "name": "Main.resetCounter.count [31:0]"
+              },
+              {
+                "handle": 5,
+                "length": 1,
+                "name": "Main.resetCounter.flag"
+              },
+              {
+                "handle": 6,
+                "length": 1,
+                "name": "Main.resetCounter.clk"
+              },
+              {
+                "handle": 7,
+                "length": 1,
+                "name": "Main.controllerA.reset"
+              },
+              {
+                "handle": 8,
+                "length": 1,
+                "name": "Main.controllerA.io_req"
+              },
+              {
+                "handle": 9,
+                "length": 2,
+                "name": "Main.controllerA.io_sel [1:0]"
+              },
+              {
+                "handle": 10,
+                "length": 2,
+                "name": "Main.controllerA.io_id [1:0]"
+              },
+              {
+                "handle": 11,
+                "length": 1,
+                "name": "Main.controllerA.io_ack"
+              },
+              {
+                "handle": 12,
+                "length": 1,
+                "name": "Main.controllerA.io_pass_token"
+              },
+              {
+                "handle": 13,
+                "length": 2,
+                "name": "Main.controllerA.state [1:0]"
+              },
+              {
+                "handle": 14,
+                "length": 1,
+                "name": "Main.controllerA.ackReg"
+              },
+              {
+                "handle": 15,
+                "length": 1,
+                "name": "Main.controllerA.passTokenReg"
+              },
+              {
+                "handle": 16,
+                "length": 1,
+                "name": "Main.controllerA.isSelected"
+              },
+              {
+                "handle": 17,
+                "length": 1,
+                "name": "Main.controllerA._GEN"
+              },
+              {
+                "handle": 18,
+                "length": 1,
+                "name": "Main.controllerA._GEN_0"
+              },
+              {
+                "handle": 19,
+                "length": 1,
+                "name": "Main.controllerA.clock"
+              },
+              {
+                "handle": 20,
+                "length": 1,
+                "name": "Main.controllerB.reset"
+              },
+              {
+                "handle": 21,
+                "length": 1,
+                "name": "Main.controllerB.io_req"
+              },
+              {
+                "handle": 22,
+                "length": 2,
+                "name": "Main.controllerB.io_sel [1:0]"
+              },
+              {
+                "handle": 23,
+                "length": 2,
+                "name": "Main.controllerB.io_id [1:0]"
+              },
+              {
+                "handle": 24,
+                "length": 1,
+                "name": "Main.controllerB.io_ack"
+              },
+              {
+                "handle": 25,
+                "length": 1,
+                "name": "Main.controllerB.io_pass_token"
+              },
+              {
+                "handle": 26,
+                "length": 2,
+                "name": "Main.controllerB.state [1:0]"
+              },
+              {
+                "handle": 27,
+                "length": 1,
+                "name": "Main.controllerB.ackReg"
+              },
+              {
+                "handle": 28,
+                "length": 1,
+                "name": "Main.controllerB.passTokenReg"
+              },
+              {
+                "handle": 29,
+                "length": 1,
+                "name": "Main.controllerB.isSelected"
+              },
+              {
+                "handle": 30,
+                "length": 1,
+                "name": "Main.controllerB._GEN"
+              },
+              {
+                "handle": 31,
+                "length": 1,
+                "name": "Main.controllerB._GEN_0"
+              },
+              {
+                "handle": 32,
+                "length": 1,
+                "name": "Main.controllerB.clock"
+              },
+              {
+                "handle": 33,
+                "length": 1,
+                "name": "Main.controllerC.reset"
+              },
+              {
+                "handle": 34,
+                "length": 1,
+                "name": "Main.controllerC.io_req"
+              },
+              {
+                "handle": 35,
+                "length": 2,
+                "name": "Main.controllerC.io_sel [1:0]"
+              },
+              {
+                "handle": 36,
+                "length": 2,
+                "name": "Main.controllerC.io_id [1:0]"
+              },
+              {
+                "handle": 37,
+                "length": 1,
+                "name": "Main.controllerC.io_ack"
+              },
+              {
+                "handle": 38,
+                "length": 1,
+                "name": "Main.controllerC.io_pass_token"
+              },
+              {
+                "handle": 39,
+                "length": 2,
+                "name": "Main.controllerC.state [1:0]"
+              },
+              {
+                "handle": 40,
+                "length": 1,
+                "name": "Main.controllerC.ackReg"
+              },
+              {
+                "handle": 41,
+                "length": 1,
+                "name": "Main.controllerC.passTokenReg"
+              },
+              {
+                "handle": 42,
+                "length": 1,
+                "name": "Main.controllerC.isSelected"
+              },
+              {
+                "handle": 43,
+                "length": 1,
+                "name": "Main.controllerC._GEN"
+              },
+              {
+                "handle": 44,
+                "length": 1,
+                "name": "Main.controllerC._GEN_0"
+              },
+              {
+                "handle": 45,
+                "length": 1,
+                "name": "Main.controllerC.clock"
+              },
+              {
+                "handle": 46,
+                "length": 1,
+                "name": "Main.arbiter.reset"
+              },
+              {
+                "handle": 47,
+                "length": 1,
+                "name": "Main.arbiter.io_active"
+              },
+              {
+                "handle": 48,
+                "length": 2,
+                "name": "Main.arbiter.io_sel [1:0]"
+              },
+              {
+                "handle": 49,
+                "length": 2,
+                "name": "Main.arbiter.state [1:0]"
+              },
+              {
+                "handle": 50,
+                "length": 2,
+                "name": "Main.arbiter._GEN[3] [1:0]"
+              }
+            ],
+            "success": true,
+            "truncated": true,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "pattern": "io_ackA"
+            },
+            "id": "call_00_mFjvTyIkfSjNjQ3qkUSY5329",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "pattern": "ackA"
+            },
+            "id": "call_01_DCCp9EXHnEc8YNsDGvCi5748",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "pattern": "Main"
+            },
+            "id": "call_02_twKvWdiFoxgO1DLXiofq4876",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 3
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 160,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.ackA_implies_sel_A",
+            "signal_name": "Main.ackA_implies_sel_A",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 160,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.io_ackA",
+            "signal_name": "Main.io_ackA",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 10,
+                "value": "01"
+              },
+              {
+                "time": 20,
+                "value": "11"
+              },
+              {
+                "time": 80,
+                "value": "10"
+              },
+              {
+                "time": 90,
+                "value": "11"
+              },
+              {
+                "time": 140,
+                "value": "00"
+              },
+              {
+                "time": 150,
+                "value": "11"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "Main.arbiter.io_sel [1:0]",
+            "signal_name": "Main.arbiter.io_sel [1:0]",
+            "success": true,
+            "total_changes": 7,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.ackA_implies_sel_A"
+            },
+            "id": "call_00_9e1U2qWk4QdLSasV2RAc1090",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.io_ackA"
+            },
+            "id": "call_01_wg2Dg8CHohnvJSZBuxPH6321",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.arbiter.io_sel [1:0]"
+            },
+            "id": "call_02_FK4Nz35jkUyXfyfa3Hvh8637",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 4
+      },
+      {
+        "action_results": [
+          {
+            "count": 10,
+            "failed_count": 0,
+            "resolved_count": 10,
+            "results": [
+              {
+                "signal_name": "Main.io_ackA",
+                "time": 160,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.arbiter.io_sel [1:0]",
+                "time": 160,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.ackA_implies_sel_A",
+                "time": 160,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 160,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.io_req",
+                "time": 160,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 160,
+                "value": "10"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 160,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.io_pass_token",
+                "time": 160,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 160,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 160,
+                "value": "11"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.io_ackA",
+                "Main.arbiter.io_sel [1:0]",
+                "Main.ackA_implies_sel_A",
+                "Main.active",
+                "Main.controllerA.io_req",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.io_pass_token",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_sel [1:0]"
+              ],
+              "times": [
+                160,
+                160,
+                160,
+                160,
+                160,
+                160,
+                160,
+                160,
+                160,
+                160
+              ]
+            },
+            "id": "call_00_Db0x9PupRDylqTxWXKr07803",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 5
+      },
+      {
+        "action_results": [
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 160,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.arbiter.io_active",
+                "time": 160,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.arbiter.state [1:0]",
+                "time": 160,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 160,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_id [1:0]",
+                "Main.arbiter.io_active",
+                "Main.arbiter.state [1:0]",
+                "Main.active"
+              ],
+              "times": [
+                160,
+                160,
+                160,
+                160
+              ]
+            },
+            "id": "call_00_Y0FimF7MQIBbDfHAH6KC4514",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 6
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "time": 150,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerA.isSelected",
+            "signal_name": "Main.controllerA.isSelected",
+            "success": true,
+            "total_changes": 4,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 150,
+                "value": "01"
+              },
+              {
+                "time": 160,
+                "value": "10"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "Main.controllerA.state [1:0]",
+            "signal_name": "Main.controllerA.state [1:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 160,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerA.ackReg",
+            "signal_name": "Main.controllerA.ackReg",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerA.io_req",
+            "signal_name": "Main.controllerA.io_req",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.controllerA.isSelected"
+            },
+            "id": "call_00_N2MbcJweIzAzDCtT7ObP1877",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.controllerA.state [1:0]"
+            },
+            "id": "call_01_rFgnzqcDeY0q2Rods9gw7935",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.controllerA.ackReg"
+            },
+            "id": "call_02_AgdALe5CE61ZjzTOWAob4523",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.controllerA.io_req"
+            },
+            "id": "call_03_i1PxkGKHKQTitIptEoYz4013",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 7
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 5,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "time": 15,
+                "value": "0"
+              },
+              {
+                "time": 20,
+                "value": "1"
+              },
+              {
+                "time": 25,
+                "value": "0"
+              },
+              {
+                "time": 30,
+                "value": "1"
+              },
+              {
+                "time": 35,
+                "value": "0"
+              },
+              {
+                "time": 40,
+                "value": "1"
+              },
+              {
+                "time": 45,
+                "value": "0"
+              },
+              {
+                "time": 50,
+                "value": "1"
+              },
+              {
+                "time": 55,
+                "value": "0"
+              },
+              {
+                "time": 60,
+                "value": "1"
+              },
+              {
+                "time": 65,
+                "value": "0"
+              },
+              {
+                "time": 70,
+                "value": "1"
+              },
+              {
+                "time": 75,
+                "value": "0"
+              },
+              {
+                "time": 80,
+                "value": "1"
+              },
+              {
+                "time": 85,
+                "value": "0"
+              },
+              {
+                "time": 90,
+                "value": "1"
+              },
+              {
+                "time": 95,
+                "value": "0"
+              },
+              {
+                "time": 100,
+                "value": "1"
+              },
+              {
+                "time": 105,
+                "value": "0"
+              },
+              {
+                "time": 110,
+                "value": "1"
+              },
+              {
+                "time": 115,
+                "value": "0"
+              },
+              {
+                "time": 120,
+                "value": "1"
+              },
+              {
+                "time": 125,
+                "value": "0"
+              },
+              {
+                "time": 130,
+                "value": "1"
+              },
+              {
+                "time": 135,
+                "value": "0"
+              },
+              {
+                "time": 140,
+                "value": "1"
+              },
+              {
+                "time": 145,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerA.clock",
+            "signal_name": "Main.controllerA.clock",
+            "success": true,
+            "total_changes": 34,
+            "truncated": true,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 10,
+                "value": "01"
+              },
+              {
+                "time": 20,
+                "value": "11"
+              },
+              {
+                "time": 80,
+                "value": "10"
+              },
+              {
+                "time": 90,
+                "value": "11"
+              },
+              {
+                "time": 140,
+                "value": "00"
+              },
+              {
+                "time": 150,
+                "value": "11"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "Main.arbiter.io_sel [1:0]",
+            "signal_name": "Main.arbiter.io_sel [1:0]",
+            "success": true,
+            "total_changes": 7,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 10,
+                "value": "01"
+              },
+              {
+                "time": 20,
+                "value": "10"
+              },
+              {
+                "time": 90,
+                "value": "00"
+              },
+              {
+                "time": 150,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "Main.arbiter.state [1:0]",
+            "signal_name": "Main.arbiter.state [1:0]",
+            "success": true,
+            "total_changes": 5,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "time": 80,
+                "value": "1"
+              },
+              {
+                "time": 90,
+                "value": "0"
+              },
+              {
+                "time": 140,
+                "value": "1"
+              },
+              {
+                "time": 150,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.arbiter.io_active",
+            "signal_name": "Main.arbiter.io_active",
+            "success": true,
+            "total_changes": 6,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 30,
+              "signal_name": "Main.controllerA.clock"
+            },
+            "id": "call_00_PSfTpk4w8XcmPHtSkWVE1994",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 30,
+              "signal_name": "Main.arbiter.io_sel [1:0]"
+            },
+            "id": "call_01_Ys6ElZfj3VZZ7EVo7Ikn8104",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 30,
+              "signal_name": "Main.arbiter.state [1:0]"
+            },
+            "id": "call_02_4SAXkdZPyYlzVi7Wk5q65334",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 30,
+              "signal_name": "Main.arbiter.io_active"
+            },
+            "id": "call_03_KAdRGrIQqhrEWGB1Wjrp6360",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 8
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 10,
+                "value": "01"
+              },
+              {
+                "time": 20,
+                "value": "11"
+              },
+              {
+                "time": 80,
+                "value": "10"
+              },
+              {
+                "time": 90,
+                "value": "11"
+              },
+              {
+                "time": 140,
+                "value": "00"
+              },
+              {
+                "time": 150,
+                "value": "11"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "Main.controllerA.io_sel [1:0]",
+            "signal_name": "Main.controllerA.io_sel [1:0]",
+            "success": true,
+            "total_changes": 7,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "Main.controllerA.io_id [1:0]",
+            "signal_name": "Main.controllerA.io_id [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 20,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerA.passTokenReg",
+            "signal_name": "Main.controllerA.passTokenReg",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.controllerA.io_sel [1:0]"
+            },
+            "id": "call_00_avfUqa0ptA0ukaFtHkW81909",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "Main.controllerA.io_id [1:0]"
+            },
+            "id": "call_01_4IbEfROU4g9XffkHdvEB2190",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.controllerA.passTokenReg"
+            },
+            "id": "call_02_J3S8V29ZBAZFIjU4cmwq2775",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 9
+      },
+      {
+        "action_results": [
+          {
+            "count": 6,
+            "failed_count": 0,
+            "resolved_count": 6,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.passTokenReg",
+                "time": 0,
+                "value": "1"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 6,
+            "failed_count": 0,
+            "resolved_count": 6,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 10,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 10,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 10,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 10,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.passTokenReg",
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.passTokenReg"
+              ],
+              "times": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            "id": "call_00_OJQc1bKk1QNEzewy15287662",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.passTokenReg"
+              ],
+              "times": [
+                10,
+                10,
+                10,
+                10,
+                10,
+                10
+              ]
+            },
+            "id": "call_01_bDi5khKovQ2sYi1nIMAc6936",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 10
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": null,
+                "error": "Error reading file: File does not exist: log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/param_arbiter3/generated/Main.v",
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/param_arbiter3/generated/Main.v",
+                "success": false
+              }
+            ],
+            "success": false,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "generated/Main.v"
+              ],
+              "reason": "Read generated Verilog to understand signal naming and encoding"
+            },
+            "id": "call_00_PazPwR9lpv5S9DVSoo4O1027",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 11
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": null,
+                "error": "Error reading file: File does not exist: log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/verilog/extra_bench/param_arbiter3/Main.v",
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/verilog/extra_bench/param_arbiter3/Main.v",
+                "success": false
+              }
+            ],
+            "success": false,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "verilog/extra_bench/param_arbiter3/Main.v"
+              ],
+              "reason": "Read generated Verilog from verilog output directory"
+            },
+            "id": "call_00_MRJTN4qxyEUb9wuTVecc6664",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 12
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "1: package llmverify\n2: import chisel3._\n3: import chisel3.util._\n4: import chiselFv._\n5: \n6: // Define enums using ChiselEnum\n7: object Selection extends ChiselEnum {\n8:   val A, B, C, X = Value\n9: }\n10: \n11: object ControllerState extends ChiselEnum {\n12:   val IDLE, READY, BUSY = Value\n13: }\n14: \n15: object ClientState extends ChiselEnum {\n16:   val NO_REQ, REQ, HAVE_TOKEN = Value\n17: }\n18: \n19: // Controller module\n20: class Controller extends Module {\n21:   val io = IO(new Bundle {\n22:     val req = Input(Bool())\n23:     val sel = Input(Selection())\n24:     val id = Input(Selection())\n25:     val ack = Output(Bool())\n26:     val pass_token = Output(Bool())\n27:   })\n28:   \n29:   val state = RegInit(ControllerState.IDLE)\n30:   val ackReg = RegInit(false.B)\n31:   val passTokenReg = RegInit(true.B)\n32:   \n33:   val isSelected = (io.sel === io.id)\n34:   \n35:   io.ack := ackReg\n36:   io.pass_token := passTokenReg\n37:   \n38:   switch(state) {\n39:     is(ControllerState.IDLE) {\n40:       when(isSelected) {\n41:         when(io.req) {\n42:           state := ControllerState.READY\n43:           passTokenReg := false.B\n44:         }.otherwise {\n45:           passTokenReg := true.B\n46:         }\n47:       }.otherwise {\n48:         passTokenReg := false.B\n49:       }\n50:     }",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/param_arbiter3/arbiter3.scala",
+                "line_end": 50,
+                "line_start": 1,
+                "original_chars": 6306,
+                "original_lines": 226,
+                "returned_chars": 1287,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "arbiter3.scala"
+              ],
+              "line_end": 50,
+              "line_start": 1,
+              "reason": "Let me look at more of the file to understand Client and Main better"
+            },
+            "id": "call_00_acOj7iDgdHQTD8FaLL8b8014",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 13
+      },
+      {
+        "action_results": [
+          {
+            "count": 9,
+            "failed_count": 0,
+            "resolved_count": 9,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 20,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 20,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_req",
+                "time": 20,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.passTokenReg",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerB.passTokenReg",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerC.passTokenReg",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 20,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 9,
+            "failed_count": 0,
+            "resolved_count": 9,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 30,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 30,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 30,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_req",
+                "time": 30,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 30,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.passTokenReg",
+                "time": 30,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerB.passTokenReg",
+                "time": 30,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerC.passTokenReg",
+                "time": 30,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 30,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.io_req",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.passTokenReg",
+                "Main.controllerB.passTokenReg",
+                "Main.controllerC.passTokenReg",
+                "Main.active"
+              ],
+              "times": [
+                20,
+                20,
+                20,
+                20,
+                20,
+                20,
+                20,
+                20,
+                20
+              ]
+            },
+            "id": "call_00_GXZVzJXq8ggiaaI4q2449634",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.io_req",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.passTokenReg",
+                "Main.controllerB.passTokenReg",
+                "Main.controllerC.passTokenReg",
+                "Main.active"
+              ],
+              "times": [
+                30,
+                30,
+                30,
+                30,
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "id": "call_01_itOyaeh8j2oo5kUCV0DP3343",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 14
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerA.reset",
+            "signal_name": "Main.controllerA.reset",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "count": 9,
+            "failed_count": 0,
+            "resolved_count": 9,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 5,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 5,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 5,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.io_req",
+                "time": 5,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 5,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 5,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.passTokenReg",
+                "time": 5,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.clock",
+                "time": 5,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.reset",
+                "time": 5,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "Main.controllerA.reset"
+            },
+            "id": "call_00_mCiIdFieDWndpGM1VW8d6320",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_req",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.passTokenReg",
+                "Main.controllerA.clock",
+                "Main.controllerA.reset"
+              ],
+              "times": [
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5,
+                5
+              ]
+            },
+            "id": "call_01_eJI6OaL9avsX5SA0JfAq4692",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 15
+      },
+      {
+        "action_results": [
+          {
+            "count": 7,
+            "failed_count": 0,
+            "resolved_count": 7,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 9,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 9,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 9,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.io_req",
+                "time": 9,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 9,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.arbiter.io_sel [1:0]",
+                "time": 9,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.arbiter.state [1:0]",
+                "time": 9,
+                "value": "00"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 5,
+            "failed_count": 0,
+            "resolved_count": 5,
+            "results": [
+              {
+                "signal_name": "Main.arbiter.io_sel [1:0]",
+                "time": 9,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.arbiter.state [1:0]",
+                "time": 9,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.arbiter.io_active",
+                "time": 9,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.arbiter._GEN[3] [1:0]",
+                "time": 9,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 9,
+                "value": "1"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_req",
+                "Main.controllerA.state [1:0]",
+                "Main.arbiter.io_sel [1:0]",
+                "Main.arbiter.state [1:0]"
+              ],
+              "times": [
+                9,
+                9,
+                9,
+                9,
+                9,
+                9,
+                9
+              ]
+            },
+            "id": "call_00_YMdcB29FOD4GPOfVdB4M5207",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.arbiter.io_sel [1:0]",
+                "Main.arbiter.state [1:0]",
+                "Main.arbiter.io_active",
+                "Main.arbiter._GEN[3] [1:0]",
+                "Main.active"
+              ],
+              "times": [
+                9,
+                9,
+                9,
+                9,
+                9
+              ]
+            },
+            "id": "call_01_AFSj2WqvVPDOlznO4ga52047",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 16
+      },
+      {
+        "action_results": [
+          {
+            "count": 1,
+            "signals": [
+              {
+                "handle": 87,
+                "length": 2,
+                "name": "Main.io_sel [1:0]"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 1,
+            "signals": [
+              {
+                "handle": 88,
+                "length": 1,
+                "name": "Main.io_active"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 3,
+            "signals": [
+              {
+                "handle": 92,
+                "length": 1,
+                "name": "Main.io_pass_tokenA"
+              },
+              {
+                "handle": 93,
+                "length": 1,
+                "name": "Main.io_pass_tokenB"
+              },
+              {
+                "handle": 94,
+                "length": 1,
+                "name": "Main.io_pass_tokenC"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 3,
+            "signals": [
+              {
+                "handle": 89,
+                "length": 1,
+                "name": "Main.io_reqA"
+              },
+              {
+                "handle": 90,
+                "length": 1,
+                "name": "Main.io_reqB"
+              },
+              {
+                "handle": 91,
+                "length": 1,
+                "name": "Main.io_reqC"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "pattern": "Main.io_sel"
+            },
+            "id": "call_00_NSo62PkB1ydIuL0UlfSX7100",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "pattern": "Main.io_active"
+            },
+            "id": "call_01_ayUp2F10fhaA1QSvny5D5379",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "pattern": "Main.io_pass_token"
+            },
+            "id": "call_02_WRN1PGisRUCZXtrLGScZ3836",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "pattern": "Main.io_req"
+            },
+            "id": "call_03_E0gtp87ggaGzXHbIUXmv4467",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 17
+      },
+      {
+        "action_results": [
+          {
+            "count": 8,
+            "failed_count": 0,
+            "resolved_count": 8,
+            "results": [
+              {
+                "signal_name": "Main.io_sel [1:0]",
+                "time": 11,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 11,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 11,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 11,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_req",
+                "time": 11,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 11,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.passTokenReg",
+                "time": 11,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 11,
+                "value": "00"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.io_sel [1:0]",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.io_req",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.passTokenReg",
+                "Main.controllerA.io_id [1:0]"
+              ],
+              "times": [
+                11,
+                11,
+                11,
+                11,
+                11,
+                11,
+                11,
+                11
+              ]
+            },
+            "id": "call_00_2JukPvywu1t9m11Wm2fH1206",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 18
+      },
+      {
+        "action_results": [
+          {
+            "count": 3,
+            "failed_count": 0,
+            "resolved_count": 3,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 10,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 10,
+                "value": "00"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 3,
+            "failed_count": 0,
+            "resolved_count": 3,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 15,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 15,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 15,
+                "value": "00"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]"
+              ],
+              "times": [
+                10,
+                10,
+                10
+              ]
+            },
+            "id": "call_00_s0jp7GEc2iwFp7bXvM0C1186",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]"
+              ],
+              "times": [
+                15,
+                15,
+                15
+              ]
+            },
+            "id": "call_01_zndENOHBJIRStSXRgABU0525",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 19
+      },
+      {
+        "action_results": [
+          {
+            "count": 2,
+            "signals": [
+              {
+                "handle": 17,
+                "length": 1,
+                "name": "Main.controllerA._GEN"
+              },
+              {
+                "handle": 18,
+                "length": 1,
+                "name": "Main.controllerA._GEN_0"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 160,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerA._GEN",
+            "signal_name": "Main.controllerA._GEN",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerA._GEN_0",
+            "signal_name": "Main.controllerA._GEN_0",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "pattern": "controllerA._GEN"
+            },
+            "id": "call_00_l2V31CqJQhMVURsONXIU3642",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "Main.controllerA._GEN"
+            },
+            "id": "call_01_tBPrCyOSeWQp3sjj4PqE7953",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "Main.controllerA._GEN_0"
+            },
+            "id": "call_02_fysjrq8UYWahUtB3aOje9936",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 20
+      },
+      {
+        "action_results": [
+          {
+            "count": 1,
+            "signals": [
+              {
+                "handle": 58,
+                "length": 2,
+                "name": "Main.clientA.state [1:0]"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 10,
+            "signals": [
+              {
+                "handle": 55,
+                "length": 1,
+                "name": "Main.clientA.reset"
+              },
+              {
+                "handle": 56,
+                "length": 1,
+                "name": "Main.clientA.io_ack"
+              },
+              {
+                "handle": 57,
+                "length": 1,
+                "name": "Main.clientA.io_req"
+              },
+              {
+                "handle": 58,
+                "length": 2,
+                "name": "Main.clientA.state [1:0]"
+              },
+              {
+                "handle": 59,
+                "length": 1,
+                "name": "Main.clientA.reqReg"
+              },
+              {
+                "handle": 60,
+                "length": 8,
+                "name": "Main.clientA.lfsr [7:0]"
+              },
+              {
+                "handle": 61,
+                "length": 1,
+                "name": "Main.clientA._GEN"
+              },
+              {
+                "handle": 62,
+                "length": 1,
+                "name": "Main.clientA._GEN_0"
+              },
+              {
+                "handle": 63,
+                "length": 1,
+                "name": "Main.clientA.clock"
+              },
+              {
+                "handle": 97,
+                "length": 1,
+                "name": "Main._clientA_io_req"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "pattern": "clientA.state"
+            },
+            "id": "call_00_7aJmRJRHn6BsYhDGc67E1857",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "pattern": "clientA"
+            },
+            "id": "call_01_AMOdEcYCO8oYABUHqRLr4919",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 21
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 10,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "Main.clientA.state [1:0]",
+            "signal_name": "Main.clientA.state [1:0]",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.clientA.reqReg",
+            "signal_name": "Main.clientA.reqReg",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00000001"
+              },
+              {
+                "time": 10,
+                "value": "00000010"
+              },
+              {
+                "time": 20,
+                "value": "00000100"
+              },
+              {
+                "time": 30,
+                "value": "00001000"
+              },
+              {
+                "time": 40,
+                "value": "00010000"
+              },
+              {
+                "time": 50,
+                "value": "00100000"
+              },
+              {
+                "time": 60,
+                "value": "01000001"
+              },
+              {
+                "time": 70,
+                "value": "10000011"
+              },
+              {
+                "time": 80,
+                "value": "00000110"
+              },
+              {
+                "time": 90,
+                "value": "00001100"
+              },
+              {
+                "time": 100,
+                "value": "00011000"
+              },
+              {
+                "time": 110,
+                "value": "00110000"
+              },
+              {
+                "time": 120,
+                "value": "01100001"
+              },
+              {
+                "time": 130,
+                "value": "11000010"
+              },
+              {
+                "time": 140,
+                "value": "10000101"
+              },
+              {
+                "time": 150,
+                "value": "00001010"
+              },
+              {
+                "time": 160,
+                "value": "00010100"
+              }
+            ],
+            "length": 8,
+            "resolved_name": "Main.clientA.lfsr [7:0]",
+            "signal_name": "Main.clientA.lfsr [7:0]",
+            "success": true,
+            "total_changes": 17,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.clientA.state [1:0]"
+            },
+            "id": "call_00_g5geF6BJNQtcWCHk2lvG4997",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.clientA.reqReg"
+            },
+            "id": "call_01_qGtPhKdBglGDIrdYy6mh9792",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.clientA.lfsr [7:0]"
+            },
+            "id": "call_02_dJj2CXhmKvErxivPFRdF8786",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 22
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 10,
+                "value": "01"
+              },
+              {
+                "time": 20,
+                "value": "11"
+              },
+              {
+                "time": 80,
+                "value": "10"
+              },
+              {
+                "time": 90,
+                "value": "11"
+              },
+              {
+                "time": 140,
+                "value": "00"
+              },
+              {
+                "time": 150,
+                "value": "11"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "Main.io_sel [1:0]",
+            "signal_name": "Main.io_sel [1:0]",
+            "success": true,
+            "total_changes": 7,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "time": 80,
+                "value": "1"
+              },
+              {
+                "time": 90,
+                "value": "0"
+              },
+              {
+                "time": 140,
+                "value": "1"
+              },
+              {
+                "time": 150,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.io_active",
+            "signal_name": "Main.io_active",
+            "success": true,
+            "total_changes": 6,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 20,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.io_pass_tokenA",
+            "signal_name": "Main.io_pass_tokenA",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 10,
+                "value": "0"
+              },
+              {
+                "time": 80,
+                "value": "1"
+              },
+              {
+                "time": 90,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.io_pass_tokenB",
+            "signal_name": "Main.io_pass_tokenB",
+            "success": true,
+            "total_changes": 4,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 10,
+                "value": "0"
+              },
+              {
+                "time": 140,
+                "value": "1"
+              },
+              {
+                "time": 150,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.io_pass_tokenC",
+            "signal_name": "Main.io_pass_tokenC",
+            "success": true,
+            "total_changes": 4,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.io_sel [1:0]"
+            },
+            "id": "call_00_HII6Yz7SaR7JgF2pUOZq4821",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.io_active"
+            },
+            "id": "call_01_nppqMqwdxu2oY5VzyPMH4647",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.io_pass_tokenA"
+            },
+            "id": "call_02_7OTd7V4cPePUNWSABdoz5045",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.io_pass_tokenB"
+            },
+            "id": "call_03_cyFowELz2aW4SO8zH5rn9521",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.io_pass_tokenC"
+            },
+            "id": "call_04_gLxIhaxPDGg1ZG2Bhg9i6809",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 23
+      },
+      {
+        "action_results": [
+          {
+            "count": 9,
+            "failed_count": 0,
+            "resolved_count": 9,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 19,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 19,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 19,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_req",
+                "time": 19,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 19,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.passTokenReg",
+                "time": 19,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 19,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.clock",
+                "time": 19,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.reset",
+                "time": 19,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 9,
+            "failed_count": 0,
+            "resolved_count": 9,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 20,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 20,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_req",
+                "time": 20,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 20,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.passTokenReg",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.clock",
+                "time": 20,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.reset",
+                "time": 20,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.controllerA.io_req",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.passTokenReg",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.clock",
+                "Main.controllerA.reset"
+              ],
+              "times": [
+                19,
+                19,
+                19,
+                19,
+                19,
+                19,
+                19,
+                19,
+                19
+              ]
+            },
+            "id": "call_00_cRB6AlwHx5BKODTjeKiq6640",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.controllerA.io_req",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.passTokenReg",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.clock",
+                "Main.controllerA.reset"
+              ],
+              "times": [
+                20,
+                20,
+                20,
+                20,
+                20,
+                20,
+                20,
+                20,
+                20
+              ]
+            },
+            "id": "call_01_l2F83g73P435irxGCmGs9260",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 24
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 160,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerA._GEN",
+            "signal_name": "Main.controllerA._GEN",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerA._GEN_0",
+            "signal_name": "Main.controllerA._GEN_0",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.controllerA._GEN"
+            },
+            "id": "call_00_JvjuJuVlUYuSY2uvhq3V3310",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.controllerA._GEN_0"
+            },
+            "id": "call_01_0DVuusZBDhjGlhEda0K36711",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 25
+      },
+      {
+        "action_results": [
+          {
+            "count": 8,
+            "failed_count": 0,
+            "resolved_count": 8,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 139,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 139,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 139,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_req",
+                "time": 139,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 139,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.passTokenReg",
+                "time": 139,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 139,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.clock",
+                "time": 139,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 8,
+            "failed_count": 0,
+            "resolved_count": 8,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 149,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 149,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 149,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_req",
+                "time": 149,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 149,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.passTokenReg",
+                "time": 149,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 149,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.clock",
+                "time": 149,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 8,
+            "failed_count": 0,
+            "resolved_count": 8,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 150,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 150,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 150,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_req",
+                "time": 150,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 150,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.controllerA.passTokenReg",
+                "time": 150,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 150,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.clock",
+                "time": 150,
+                "value": "1"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.controllerA.io_req",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.passTokenReg",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.clock"
+              ],
+              "times": [
+                139,
+                139,
+                139,
+                139,
+                139,
+                139,
+                139,
+                139
+              ]
+            },
+            "id": "call_00_nP7tXE1npNFqtB1oFbf96935",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.controllerA.io_req",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.passTokenReg",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.clock"
+              ],
+              "times": [
+                149,
+                149,
+                149,
+                149,
+                149,
+                149,
+                149,
+                149
+              ]
+            },
+            "id": "call_01_3L1Z6Lcqvg61IATeqkZi5745",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.controllerA.io_req",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.passTokenReg",
+                "Main.controllerA.ackReg",
+                "Main.controllerA.clock"
+              ],
+              "times": [
+                150,
+                150,
+                150,
+                150,
+                150,
+                150,
+                150,
+                150
+              ]
+            },
+            "id": "call_02_HDv9vREXvVEFyPPm6PLf6690",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 26
+      },
+      {
+        "action_results": [
+          {
+            "count": 3,
+            "failed_count": 0,
+            "resolved_count": 3,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 85,
+                "value": "10"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 85,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 85,
+                "value": "00"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 3,
+            "failed_count": 0,
+            "resolved_count": 3,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 95,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 95,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 95,
+                "value": "00"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 3,
+            "failed_count": 0,
+            "resolved_count": 3,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 140,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 140,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 140,
+                "value": "00"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 3,
+            "failed_count": 0,
+            "resolved_count": 3,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 145,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 145,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 145,
+                "value": "00"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_id [1:0]"
+              ],
+              "times": [
+                85,
+                85,
+                85
+              ]
+            },
+            "id": "call_00_OVhWRHPM2Lv5kfG87zFc6922",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_id [1:0]"
+              ],
+              "times": [
+                95,
+                95,
+                95
+              ]
+            },
+            "id": "call_01_ODc5jKEF6GNqn3onDtzM6194",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_id [1:0]"
+              ],
+              "times": [
+                140,
+                140,
+                140
+              ]
+            },
+            "id": "call_02_6hte6wArePsvPoiODDU27172",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.isSelected",
+                "Main.controllerA.io_id [1:0]"
+              ],
+              "times": [
+                145,
+                145,
+                145
+              ]
+            },
+            "id": "call_03_U8NXzTwQT8kXvccM6f942600",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 27
+      },
+      {
+        "action_results": [
+          {
+            "count": 7,
+            "failed_count": 0,
+            "resolved_count": 7,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.io_pass_token",
+                "time": 160,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerB.io_pass_token",
+                "time": 160,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerC.io_pass_token",
+                "time": 160,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 160,
+                "value": "10"
+              },
+              {
+                "signal_name": "Main.controllerB.state [1:0]",
+                "time": 160,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerC.state [1:0]",
+                "time": 160,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 160,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.io_pass_token",
+                "Main.controllerB.io_pass_token",
+                "Main.controllerC.io_pass_token",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerB.state [1:0]",
+                "Main.controllerC.state [1:0]",
+                "Main.active"
+              ],
+              "times": [
+                160,
+                160,
+                160,
+                160,
+                160,
+                160,
+                160
+              ]
+            },
+            "id": "call_00_Uf2oMvIBwtiRsmJHhgZ77994",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 28
+      },
+      {
+        "action_results": [
+          {
+            "count": 7,
+            "failed_count": 0,
+            "resolved_count": 7,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 140,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.io_sel [1:0]",
+                "time": 140,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 140,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.io_ackA",
+                "time": 140,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 140,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 140,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 140,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 7,
+            "failed_count": 0,
+            "resolved_count": 7,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 150,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.io_sel [1:0]",
+                "time": 150,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 150,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.io_ackA",
+                "time": 150,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 150,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 150,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 150,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 7,
+            "failed_count": 0,
+            "resolved_count": 7,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 160,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.io_sel [1:0]",
+                "time": 160,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 160,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.io_ackA",
+                "time": 160,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 160,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 160,
+                "value": "10"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 160,
+                "value": "1"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.io_sel [1:0]",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.io_ackA",
+                "Main.active",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.ackReg"
+              ],
+              "times": [
+                140,
+                140,
+                140,
+                140,
+                140,
+                140,
+                140
+              ]
+            },
+            "id": "call_00_CyuxXqdyYwHJtfqqei0K9764",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.io_sel [1:0]",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.io_ackA",
+                "Main.active",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.ackReg"
+              ],
+              "times": [
+                150,
+                150,
+                150,
+                150,
+                150,
+                150,
+                150
+              ]
+            },
+            "id": "call_01_ebp7Y9VEftdCJFd4PQKv4701",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.io_sel [1:0]",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.io_ackA",
+                "Main.active",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.ackReg"
+              ],
+              "times": [
+                160,
+                160,
+                160,
+                160,
+                160,
+                160,
+                160
+              ]
+            },
+            "id": "call_02_LJzHffKU3uKayYKsHCOI0379",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 29
+      },
+      {
+        "action_results": [
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "Main.clientA.state [1:0]",
+                "time": 150,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.clientA.io_ack",
+                "time": 150,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.clientA.reqReg",
+                "time": 150,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.clientA.lfsr [7:0]",
+                "time": 150,
+                "value": "00001010"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "Main.clientA.state [1:0]",
+                "time": 160,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.clientA.io_ack",
+                "time": 160,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.clientA.reqReg",
+                "time": 160,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.clientA.lfsr [7:0]",
+                "time": 160,
+                "value": "00010100"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "Main.clientA.state [1:0]",
+                "time": 170,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.clientA.io_ack",
+                "time": 170,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.clientA.reqReg",
+                "time": 170,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.clientA.lfsr [7:0]",
+                "time": 170,
+                "value": "00010100"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.clientA.state [1:0]",
+                "Main.clientA.io_ack",
+                "Main.clientA.reqReg",
+                "Main.clientA.lfsr [7:0]"
+              ],
+              "times": [
+                150,
+                150,
+                150,
+                150
+              ]
+            },
+            "id": "call_00_v4LKxpSd8dcx0DdLtZR15293",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.clientA.state [1:0]",
+                "Main.clientA.io_ack",
+                "Main.clientA.reqReg",
+                "Main.clientA.lfsr [7:0]"
+              ],
+              "times": [
+                160,
+                160,
+                160,
+                160
+              ]
+            },
+            "id": "call_01_4wwMUkJnJIVFpkCVEh3c7677",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.clientA.state [1:0]",
+                "Main.clientA.io_ack",
+                "Main.clientA.reqReg",
+                "Main.clientA.lfsr [7:0]"
+              ],
+              "times": [
+                170,
+                170,
+                170,
+                170
+              ]
+            },
+            "id": "call_02_nS1Z8RfYPyFXWZe4hll61523",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 30
+      },
+      {
+        "action_results": [
+          {
+            "count": 10,
+            "failed_count": 0,
+            "resolved_count": 10,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.io_sel [1:0]",
+                "time": 10,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 10,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 10,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.io_ackA",
+                "time": 10,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 10,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 10,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.arbiter.io_active",
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.arbiter.state [1:0]",
+                "time": 10,
+                "value": "01"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 10,
+            "failed_count": 0,
+            "resolved_count": 10,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.io_sel [1:0]",
+                "time": 20,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 20,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 20,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.io_ackA",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 20,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.arbiter.io_active",
+                "time": 20,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.arbiter.state [1:0]",
+                "time": 20,
+                "value": "10"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 10,
+            "failed_count": 0,
+            "resolved_count": 10,
+            "results": [
+              {
+                "signal_name": "Main.controllerA.isSelected",
+                "time": 30,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.io_sel [1:0]",
+                "time": 30,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.io_sel [1:0]",
+                "time": 30,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.controllerA.io_id [1:0]",
+                "time": 30,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.io_ackA",
+                "time": 30,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 30,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.controllerA.state [1:0]",
+                "time": 30,
+                "value": "00"
+              },
+              {
+                "signal_name": "Main.controllerA.ackReg",
+                "time": 30,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.arbiter.io_active",
+                "time": 30,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.arbiter.state [1:0]",
+                "time": 30,
+                "value": "10"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.io_sel [1:0]",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.io_ackA",
+                "Main.active",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.ackReg",
+                "Main.arbiter.io_active",
+                "Main.arbiter.state [1:0]"
+              ],
+              "times": [
+                10,
+                10,
+                10,
+                10,
+                10,
+                10,
+                10,
+                10,
+                10,
+                10
+              ]
+            },
+            "id": "call_00_HsRvaXgxJ2OKirpTixmI1253",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.io_sel [1:0]",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.io_ackA",
+                "Main.active",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.ackReg",
+                "Main.arbiter.io_active",
+                "Main.arbiter.state [1:0]"
+              ],
+              "times": [
+                20,
+                20,
+                20,
+                20,
+                20,
+                20,
+                20,
+                20,
+                20,
+                20
+              ]
+            },
+            "id": "call_01_YPuYYgYF1flNoKkK7Tep6355",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main.controllerA.isSelected",
+                "Main.io_sel [1:0]",
+                "Main.controllerA.io_sel [1:0]",
+                "Main.controllerA.io_id [1:0]",
+                "Main.io_ackA",
+                "Main.active",
+                "Main.controllerA.state [1:0]",
+                "Main.controllerA.ackReg",
+                "Main.arbiter.io_active",
+                "Main.arbiter.state [1:0]"
+              ],
+              "times": [
+                30,
+                30,
+                30,
+                30,
+                30,
+                30,
+                30,
+                30,
+                30,
+                30
+              ]
+            },
+            "id": "call_02_3ISXO3plvzXsCJO2GEYd6890",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 31
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 20,
+                "value": "1"
+              },
+              {
+                "time": 90,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerB.isSelected",
+            "signal_name": "Main.controllerB.isSelected",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 90,
+                "value": "1"
+              },
+              {
+                "time": 150,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main.controllerC.isSelected",
+            "signal_name": "Main.controllerC.isSelected",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.controllerB.isSelected"
+            },
+            "id": "call_00_M7gwvYGeIX8wqXzQylG85757",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 20,
+              "signal_name": "Main.controllerC.isSelected"
+            },
+            "id": "call_01_WtLnZonD8gBANGXzbgwV2753",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 32
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": null,
+                "error": "Error reading file: Path is not a file: log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/param_arbiter3",
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/param_arbiter3",
+                "success": false
+              }
+            ],
+            "success": false,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/param_arbiter3"
+              ],
+              "reason": "Look for verilog files in the work directory"
+            },
+            "id": "call_00_0PAaKmyMPc2O3GF0JGzi0859",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 33
+      },
+      {
+        "action_results": [
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 9,
+            "signals": [
+              {
+                "handle": 19,
+                "length": 1,
+                "name": "Main.controllerA.clock"
+              },
+              {
+                "handle": 32,
+                "length": 1,
+                "name": "Main.controllerB.clock"
+              },
+              {
+                "handle": 45,
+                "length": 1,
+                "name": "Main.controllerC.clock"
+              },
+              {
+                "handle": 54,
+                "length": 1,
+                "name": "Main.arbiter.clock"
+              },
+              {
+                "handle": 63,
+                "length": 1,
+                "name": "Main.clientA.clock"
+              },
+              {
+                "handle": 72,
+                "length": 1,
+                "name": "Main.clientB.clock"
+              },
+              {
+                "handle": 81,
+                "length": 1,
+                "name": "Main.clientC.clock"
+              },
+              {
+                "handle": 129,
+                "length": 1,
+                "name": "Main.:jasper_formal_clock"
+              },
+              {
+                "handle": 130,
+                "length": 1,
+                "name": "Main.clock"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "pattern": "main.*clock"
+            },
+            "id": "call_00_Uuj3SndooH6fK79dVg236682",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "max_results": 50,
+              "pattern": "clock"
+            },
+            "id": "call_01_OjT08k2WJVWOk51wHdXK6617",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 34
+      },
+      {
+        "action_results": [
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 50,
+              "pattern": "Main.controllerA.*"
+            },
+            "id": "call_00_JAMOZHbFz7AxBKFm8NfZ5730",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 35
+      },
+      {
+        "action_results": [
+          {
+            "active_signals": [
+              {
+                "length": 1,
+                "name": "Main.controllerA.io_req",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "Main.controllerA.io_sel [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerA.io_pass_token",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerA.passTokenReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerA.isSelected",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerA.clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main._controllerA_io_pass_token",
+                "value": "1"
+              }
+            ],
+            "count": 7,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 50,
+              "scope_pattern": "controllerA",
+              "time": 10
+            },
+            "id": "call_00_Zuy8gAeRELoAObrlTO0p1186",
+            "name": "waveform_get_active_signals"
+          }
+        ],
+        "iteration": 36
+      },
+      {
+        "action_results": [
+          {
+            "active_signals": [
+              {
+                "length": 32,
+                "name": "Main.resetCounter.timeSinceReset [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "Main.resetCounter.notChaos",
+                "value": "1"
+              },
+              {
+                "length": 32,
+                "name": "Main.resetCounter.count [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "Main.resetCounter.flag",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.resetCounter.clk",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerA.io_req",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "Main.controllerA.io_sel [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerA.io_pass_token",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerA.passTokenReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerA.isSelected",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerA.clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerB.io_req",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "Main.controllerB.io_sel [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "Main.controllerB.io_id [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerB.clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerC.io_req",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "Main.controllerC.io_sel [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "Main.controllerC.io_id [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "Main.controllerC.clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.arbiter.io_active",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "Main.arbiter.io_sel [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "Main.arbiter.state [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "Main.arbiter._GEN[1] [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "Main.arbiter._GEN[0] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "Main.arbiter.clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.clientA.io_req",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "Main.clientA.state [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "Main.clientA.reqReg",
+                "value": "1"
+              },
+              {
+                "length": 8,
+                "name": "Main.clientA.lfsr [7:0]",
+                "value": "00000010"
+              },
+              {
+                "length": 1,
+                "name": "Main.clientA.clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.clientB.io_req",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "Main.clientB.state [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "Main.clientB.reqReg",
+                "value": "1"
+              },
+              {
+                "length": 8,
+                "name": "Main.clientB.lfsr [7:0]",
+                "value": "00000010"
+              },
+              {
+                "length": 1,
+                "name": "Main.clientB.clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.clientC.io_req",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "Main.clientC.state [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "Main.clientC.reqReg",
+                "value": "1"
+              },
+              {
+                "length": 8,
+                "name": "Main.clientC.lfsr [7:0]",
+                "value": "00000010"
+              },
+              {
+                "length": 1,
+                "name": "Main.clientC.clock",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "Main.io_sel [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "Main.io_active",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.io_reqA",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.io_reqB",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.io_reqC",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.io_pass_tokenA",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main._clientC_io_req",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main._clientB_io_req",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main._clientA_io_req",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "Main._arbiter_io_sel [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "Main._controllerA_io_pass_token",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main._resetCounter_notChaos",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.active",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.hasBeenResetReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.hasBeenReset",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main._GEN_0",
+                "value": "1"
+              },
+              {
+                "length": 4,
+                "name": "Main._nextTimer_T_2 [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 1,
+                "name": "Main.nextPending_1",
+                "value": "1"
+              },
+              {
+                "length": 4,
+                "name": "Main._nextTimer_T_6 [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 4,
+                "name": "Main._nextTimer_T_10 [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 1,
+                "name": "Main.ackA_implies_sel_A",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.:jasper_formal_clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "Main.clock",
+                "value": "1"
+              }
+            ],
+            "count": 63,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 200,
+              "time": 10
+            },
+            "id": "call_00_LElwCOSMTRpN9b5vtvYt1757",
+            "name": "waveform_get_active_signals"
+          }
+        ],
+        "iteration": 37
+      },
+      {
+        "action_results": [
+          {
+            "error": "signal_names length (1) != times length (4)",
+            "success": false,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 20,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "Main._controllerA_io_pass_token",
+            "signal_name": "Main._controllerA_io_pass_token",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main._controllerA_io_pass_token"
+              ],
+              "times": [
+                10,
+                20,
+                150,
+                160
+              ]
+            },
+            "id": "call_00_0FI9n8j0JpIzeb4v6SVm7014",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "Main._controllerA_io_pass_token"
+            },
+            "id": "call_01_6uS4ELXQJN3Gth8IgXr84039",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 38
+      },
+      {
+        "action_results": [
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "Main._controllerA_io_pass_token",
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main._arbiter_io_sel [1:0]",
+                "time": 10,
+                "value": "01"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "signal_name": "Main.io_ackA",
+                "time": 10,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "Main._controllerA_io_pass_token",
+                "time": 150,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main._arbiter_io_sel [1:0]",
+                "time": 150,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 150,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.io_ackA",
+                "time": 150,
+                "value": "0"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "Main._controllerA_io_pass_token",
+                "time": 160,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main._arbiter_io_sel [1:0]",
+                "time": 160,
+                "value": "11"
+              },
+              {
+                "signal_name": "Main.active",
+                "time": 160,
+                "value": "0"
+              },
+              {
+                "signal_name": "Main.io_ackA",
+                "time": 160,
+                "value": "1"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "Main._controllerA_io_pass_token",
+                "Main._arbiter_io_sel [1:0]",
+                "Main.active",
+                "Main.io_ackA"
+              ],
+              "times": [
+                10,
+                10,
+                10,
+                10
+              ]
+            },
+            "id": "call_00_vERe0k0BEkBOsvpDJ8pR1866",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main._controllerA_io_pass_token",
+                "Main._arbiter_io_sel [1:0]",
+                "Main.active",
+                "Main.io_ackA"
+              ],
+              "times": [
+                150,
+                150,
+                150,
+                150
+              ]
+            },
+            "id": "call_01_xwA9e9y1trCZCAAggsPQ5064",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "Main._controllerA_io_pass_token",
+                "Main._arbiter_io_sel [1:0]",
+                "Main.active",
+                "Main.io_ackA"
+              ],
+              "times": [
+                160,
+                160,
+                160,
+                160
+              ]
+            },
+            "id": "call_02_byVAQr2Tklb4n3CcsfkD1374",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 39
+      },
+      {
+        "action_results": [
+          {
+            "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/param_arbiter3/counterexample_analysis.md",
+            "success": true,
+            "type": "write_report"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "content": "# Counterexample Analysis Report: `ackA_implies_sel_A`\n\n## 1. Verification Environment\n\n### Top Module: `Main`\nThe `Main` module (defined in `arbiter3.scala`) instantiates:\n- **3 Controller modules** (`Controller`): One for each client (A, B, C)\n- **1 Arbiter module** (`Arbiter`): Round-robin arbiter cycling A→B→C→A\n- **3 Client modules** (`Client`): Stochastic request generators using LFSR\n\n### Key Connections\n- `arbiter.io.sel` → `controller*.io.sel` → `Main.io.sel`\n- `client*.io.req` → `controller*.io.req` → `Main.io.req*`\n- `controller*.io.ack` → `Main.io.ack*`\n- `controller*.io.pass_token` → OR'd together → `arbiter.io.active`\n- `controller*.io.id` set to `Selection.A`, `Selection.B`, `Selection.C` respectively\n\n### Design Under Test\nThe system is a round-robin arbiter with three clients. Each `Controller` manages a client's access to a shared resource via a 3-state FSM (IDLE→READY→BUSY), and the `Arbiter` cycles through selections when `active` is true.\n\n## 2. Violated Assertion\n\n### Assertion Name (from waveform filename)\n`ackA_implies_sel_A`\n\n### Code Snippet\n```scala\n// File: arbiter3.scala, line ~198\nassertImplies(io.ackA, io.sel === Selection.A, \"ackA_implies_sel_A\")\n```\n\n### Property Description\nWhen `io.ackA` (acknowledge for client A) is asserted high, the arbiter's selection (`io.sel`) must equal `Selection.A`. In other words, the arbiter should only grant the ack signal to client A when client A is currently selected.\n\n### File Location\n`arbiter3.scala`, approximately line 198 (in the `Main` class)\n\n## 3. Waveform Information\n\n### Waveform File\n`verilog/extra_bench/param_arbiter3/Main.ackA_implies_sel_A.fst`\n\n### Time Range and Key Time Points\n| Time (ns) | Event |\n|-----------|-------|\n| 0 | System reset, arbiter state = A (00), active = 1 |\n| 10 | Client A asserts req; io_sel transitions from A (00) to B (01) |\n| 20 | pass_tokenA goes low (controllerA detects sel≠A); active → 0; io_sel → X (11) |\n| 80 | pass_tokenB goes high; active → 1; io_sel → C (10) |\n| 90 | pass_tokenB → 0; active → 0; io_sel → X (11) |\n| 140 | pass_tokenC → 1; active → 1; io_sel → A (00) |\n| **150** | **ControllerA: IDLE→READY** (isSelected goes high, sampled from cycle 140-149); active → 0; io_sel → X (11) |\n| **160** | **ControllerA: READY→BUSY, ackReg → 1, io_ackA → 1; io_sel = X (11) — ASSERTION FAILS** |\n\n### Critical Signal Values at Failure Point (t=160ns)\n| Signal | Value | Meaning |\n|--------|-------|---------|\n| `Main.io_ackA` | 1 | Client A's ack is asserted |\n| `Main.io_sel [1:0]` | 11 (X) | Arbiter outputs invalid state (not A, B, or C) |\n| `Main.active` | 0 | No client has pass_token active |\n| `Main.controllerA.state [1:0]` | 10 (BUSY) | ControllerA is in BUSY state |\n| `Main.controllerA.ackReg` | 1 | ControllerA's ack register is set |\n| `Main.controllerA.isSelected` | 1 | ControllerA thinks it's selected |\n| `Main.controllerA.io_sel [1:0]` | 11 (X) | ControllerA sees sel = X |\n\n## 4. Root Cause Analysis\n\n### Buggy Code Location\n**File**: `arbiter3.scala`\n**Module**: `Controller` (lines 20-90)\n**Bug Type**: Design bug (DUT bug) — the controller's ack pipeline is not synchronized with the arbiter's selection\n\n### Description of the Bug\n\nThe `Controller` module has a 3-state FSM (IDLE → READY → BUSY) that generates the acknowledge signal:\n\n```\nIDLE:  when selected AND client has req → go to READY (set passTokenReg=0)\nREADY: unconditionally → go to BUSY (set ackReg=1)\nBUSY:  when client drops req → go to IDLE (clear ackReg, set passTokenReg=1)\n```\n\nThe controller **commits** to granting the ack when it transitions from IDLE to READY (one cycle after detecting it's selected). However, the ack is actually asserted one cycle later, when the state transitions from READY to BUSY. Between the commitment cycle (IDLE→READY) and the ack assertion cycle (READY→BUSY), the arbiter's selection can change.\n\n### Evidence from Waveform\n\nThe failure follows this exact sequence:\n\n1. **Cycle 140-149** (t=140ns to t=149ns): `io_sel = A (00)`, `io_id = A (00)` → equality holds → `isSelected` will go high at next posedge.\n\n2. **Posedge at t=150ns**: `isSelected` goes high (registered from previous cycle). In IDLE state: `isSelected & io_req → state := READY, passTokenReg := false`. State transitions from IDLE(00) to READY(01). Also, `passTokenReg` was already 0 since time 20, so `active = pass_tokenA | pass_tokenB | pass_tokenC = 0 | 0 | 0 = 0`. With `active=0`, `arbiter.io_sel = Selection.X = 11`.\n\n3. **Cycle 150-159**: ControllerA is in READY state, but `io_sel = X (11)`, NOT A.\n\n4. **Posedge at t=160ns**: In READY state (unconditional): `state := BUSY, ackReg := true`. `io_ackA` goes high. But `io_sel` is still `X (11)`.\n\n5. **Assertion violation**: `io_ackA = 1` but `io_sel = X ≠ A (00)`.\n\nThe root cause is a **2-cycle pipeline mismatch**: the controller uses the selection value from 2 cycles ago to assert ack, but the arbiter may have changed its selection in the meantime.\n\n### Why This Is a DUT Bug\n\nThe property `ackA_implies_sel_A` is a reasonable safety invariant: it should never be possible to receive a grant for client A when client A is not currently selected. The design flaw is in the `Controller` module's FSM: it fails to re-verify that the selection is still valid when it transitions from READY to BUSY (where ack is actually asserted). \n\nA correct design would either:\n- **(Option 1)** Check `isSelected` again when transitioning READY→BUSY (only assert ack if still selected)\n- **(Option 2)** Hold the arbiter's selection stable while a grant is pending (the arbiter should not change sel while a controller is in the READY→BUSY pipeline)\n- **(Option 3)** Assert ack directly in the READY state (one cycle earlier), before the arbiter has a chance to change its selection\n",
+              "error_type": "dut_bug",
+              "stage_complete": true
+            },
+            "id": "call_00_iOnZGnHtzVkpR75VH7nJ8945",
+            "name": "write_report"
+          }
+        ],
+        "iteration": 40
+      }
+    ],
+    "root_cause": null,
+    "success": true,
+    "summary": "",
+    "verification_passed": true
+  },
+  "success": true
+}

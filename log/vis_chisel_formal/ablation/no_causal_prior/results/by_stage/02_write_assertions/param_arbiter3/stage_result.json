@@ -1,0 +1,146 @@
+{
+  "ablation_modes": [
+    "no_causal_prior"
+  ],
+  "original_query": "Add formal verification assertions to the design using ChiselFV or Chisel LTL. Place assertions directly inside the original DUT module/class emitted by VerilogGenerator, not in a separate *Formal wrapper or sibling module. Focus on key properties like safety and liveness.",
+  "stage": "write_assertions",
+  "stage_result": {
+    "counterexample_path": null,
+    "iterations": [
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\nimport chisel3._\nimport chisel3.util._\n\n// Define enums using ChiselEnum\nobject Selection extends ChiselEnum {\n  val A, B, C, X = Value\n}\n\nobject ControllerState extends ChiselEnum {\n  val IDLE, READY, BUSY = Value\n}\n\nobject ClientState extends ChiselEnum {\n  val NO_REQ, REQ, HAVE_TOKEN = Value\n}\n\n// Controller module\nclass Controller extends Module {\n  val io = IO(new Bundle {\n    val req = Input(Bool())\n    val sel = Input(Selection())\n    val id = Input(Selection())\n    val ack = Output(Bool())\n    val pass_token = Output(Bool())\n  })\n  \n  val state = RegInit(ControllerState.IDLE)\n  val ackReg = RegInit(false.B)\n  val passTokenReg = RegInit(true.B)\n  \n  val isSelected = (io.sel === io.id)\n  \n  io.ack := ackReg\n  io.pass_token := passTokenReg\n  \n  switch(state) {\n    is(ControllerState.IDLE) {\n      when(isSelected) {\n        when(io.req) {\n          state := ControllerState.READY\n          passTokenReg := false.B\n        }.otherwise {\n          passTokenReg := true.B\n        }\n      }.otherwise {\n        passTokenReg := false.B\n      }\n    }\n    is(ControllerState.READY) {\n      state := ControllerState.BUSY\n      ackReg := true.B\n    }\n    is(ControllerState.BUSY) {\n      when(!io.req) {\n        state := ControllerState.IDLE\n        ackReg := false.B\n        passTokenReg := true.B\n      }\n    }\n  }\n}\n\n// Arbiter module\nclass Arbiter extends Module {\n  val io = IO(new Bundle {\n    val active = Input(Bool())\n    val sel = Output(Selection())\n  })\n  \n  val state = RegInit(Selection.A)\n  \n  io.sel := Mux(io.active, state, Selection.X)\n  \n  when(io.active) {\n    switch(state) {\n      is(Selection.A) {\n        state := Selection.B\n      }\n      is(Selection.B) {\n        state := Selection.C\n      }\n      is(Selection.C) {\n        state := Selection.A\n      }\n    }\n  }\n}\n\n// Client module\nclass Client extends Module {\n  val io = IO(new Bundle {\n    val ack = Input(Bool())\n    val req = Output(Bool())\n  })\n  \n  val state = RegInit(ClientState.NO_REQ)\n  val reqReg = RegInit(false.B)\n  \n  // Simple pseudo-random choice using LFSR\n  val lfsr = RegInit(1.U(8.W))\n  val randChoice = lfsr(0)\n  lfsr := Cat(lfsr(6), lfsr(5), lfsr(4), lfsr(3), lfsr(2), lfsr(1), lfsr(0), lfsr(6) ^ lfsr(5))\n  \n  io.req := reqReg\n  \n  switch(state) {\n    is(ClientState.NO_REQ) {\n      when(randChoice) {\n        reqReg := true.B\n        state := ClientState.REQ\n      }\n    }\n    is(ClientState.REQ) {\n      when(io.ack) {\n        state := ClientState.HAVE_TOKEN\n      }\n    }\n    is(ClientState.HAVE_TOKEN) {\n      when(randChoice) {\n        reqReg := false.B\n        state := ClientState.NO_REQ\n      }\n    }\n  }\n}\n\n// Main module\nclass Main extends Module {\n  val io = IO(new Bundle {\n    val ackA = Output(Bool())\n    val ackB = Output(Bool())\n    val ackC = Output(Bool())\n    // Additional outputs to preserve internal signals\n    val sel = Output(Selection())\n    val active = Output(Bool())\n    val reqA = Output(Bool())\n    val reqB = Output(Bool())\n    val reqC = Output(Bool())\n    val pass_tokenA = Output(Bool())\n    val pass_tokenB = Output(Bool())\n    val pass_tokenC = Output(Bool())\n  })\n  \n  // Instantiate controllers\n  val controllerA = Module(new Controller)\n  val controllerB = Module(new Controller)\n  val controllerC = Module(new Controller)\n  \n  // Instantiate arbiter\n  val arbiter = Module(new Arbiter)\n  \n  // Instantiate clients\n  val clientA = Module(new Client)\n  val clientB = Module(new Client)\n  val clientC = Module(new Client)\n  \n  // Connect controllers\n  controllerA.io.req := clientA.io.req\n  controllerA.io.sel := arbiter.io.sel\n  controllerA.io.id := Selection.A\n  \n  controllerB.io.req := clientB.io.req\n  controllerB.io.sel := arbiter.io.sel\n  controllerB.io.id := Selection.B\n  \n  controllerC.io.req := clientC.io.req\n  controllerC.io.sel := arbiter.io.sel\n  controllerC.io.id := Selection.C\n  \n  // Connect clients\n  clientA.io.ack := controllerA.io.ack\n  clientB.io.ack := controllerB.io.ack\n  clientC.io.ack := controllerC.io.ack\n  \n  // Connect arbiter\n  val active = controllerA.io.pass_token || controllerB.io.pass_token || controllerC.io.pass_token\n  arbiter.io.active := active\n  \n  // Connect outputs\n  io.ackA := controllerA.io.ack\n  io.ackB := controllerB.io.ack\n  io.ackC := controllerC.io.ack\n  io.sel := arbiter.io.sel\n  io.active := active\n  io.reqA := clientA.io.req\n  io.reqB := clientB.io.req\n  io.reqC := clientC.io.req\n  io.pass_tokenA := controllerA.io.pass_token\n  io.pass_tokenB := controllerB.io.pass_token\n  io.pass_tokenC := controllerC.io.pass_token\n}\n\n// Verilog generator\nobject VerilogGenerator extends App {\n  emitVerilog(new Main(), args)\n}",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/param_arbiter3/arbiter3.scala",
+                "original_chars": 4641,
+                "original_lines": 197,
+                "returned_chars": 4641,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "arbiter3.scala"
+              ],
+              "reason": "Read the full design to understand the arbiter structure, signals, and state machines before adding formal assertions."
+            },
+            "id": "call_00_Q11agw2r5Lidg1tFFjn19208",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 1
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "1: package llmverify\n2: import chisel3._\n3: import chisel3.util._\n4: \n5: // Define enums using ChiselEnum\n6: object Selection extends ChiselEnum {\n7:   val A, B, C, X = Value\n8: }\n9: \n10: object ControllerState extends ChiselEnum {\n11:   val IDLE, READY, BUSY = Value\n12: }\n13: \n14: object ClientState extends ChiselEnum {\n15:   val NO_REQ, REQ, HAVE_TOKEN = Value\n16: }\n17: \n18: // Controller module\n19: class Controller extends Module {\n20:   val io = IO(new Bundle {\n21:     val req = Input(Bool())\n22:     val sel = Input(Selection())\n23:     val id = Input(Selection())\n24:     val ack = Output(Bool())\n25:     val pass_token = Output(Bool())\n26:   })\n27:   \n28:   val state = RegInit(ControllerState.IDLE)\n29:   val ackReg = RegInit(false.B)\n30:   val passTokenReg = RegInit(true.B)\n31:   \n32:   val isSelected = (io.sel === io.id)\n33:   \n34:   io.ack := ackReg\n35:   io.pass_token := passTokenReg\n36:   \n37:   switch(state) {\n38:     is(ControllerState.IDLE) {\n39:       when(isSelected) {\n40:         when(io.req) {\n41:           state := ControllerState.READY\n42:           passTokenReg := false.B\n43:         }.otherwise {\n44:           passTokenReg := true.B\n45:         }\n46:       }.otherwise {\n47:         passTokenReg := false.B\n48:       }\n49:     }\n50:     is(ControllerState.READY) {",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/param_arbiter3/arbiter3.scala",
+                "line_end": 50,
+                "line_start": 1,
+                "original_chars": 4641,
+                "original_lines": 197,
+                "returned_chars": 1301,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "arbiter3.scala"
+              ],
+              "line_end": 50,
+              "line_start": 1,
+              "reason": "Review the Controller state machine logic to understand token-passing protocol timing."
+            },
+            "id": "call_00_z6eRMOO3E1vRz9iHbXZM0502",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 2
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "50:     is(ControllerState.READY) {\n51:       state := ControllerState.BUSY\n52:       ackReg := true.B\n53:     }\n54:     is(ControllerState.BUSY) {\n55:       when(!io.req) {\n56:         state := ControllerState.IDLE\n57:         ackReg := false.B\n58:         passTokenReg := true.B\n59:       }\n60:     }\n61:   }\n62: }\n63: \n64: // Arbiter module\n65: class Arbiter extends Module {\n66:   val io = IO(new Bundle {\n67:     val active = Input(Bool())\n68:     val sel = Output(Selection())\n69:   })\n70:   \n71:   val state = RegInit(Selection.A)\n72:   \n73:   io.sel := Mux(io.active, state, Selection.X)\n74:   \n75:   when(io.active) {\n76:     switch(state) {\n77:       is(Selection.A) {\n78:         state := Selection.B\n79:       }\n80:       is(Selection.B) {\n81:         state := Selection.C\n82:       }\n83:       is(Selection.C) {\n84:         state := Selection.A\n85:       }\n86:     }\n87:   }\n88: }\n89: \n90: // Client module\n91: class Client extends Module {\n92:   val io = IO(new Bundle {\n93:     val ack = Input(Bool())\n94:     val req = Output(Bool())\n95:   })\n96:   \n97:   val state = RegInit(ClientState.NO_REQ)\n98:   val reqReg = RegInit(false.B)\n99:   \n100:   // Simple pseudo-random choice using LFSR\n101:   val lfsr = RegInit(1.U(8.W))\n102:   val randChoice = lfsr(0)\n103:   lfsr := Cat(lfsr(6), lfsr(5), lfsr(4), lfsr(3), lfsr(2), lfsr(1), lfsr(0), lfsr(6) ^ lfsr(5))\n104:   \n105:   io.req := reqReg\n106:   \n107:   switch(state) {\n108:     is(ClientState.NO_REQ) {\n109:       when(randChoice) {\n110:         reqReg := true.B\n111:         state := ClientState.REQ\n112:       }\n113:     }\n114:     is(ClientState.REQ) {\n115:       when(io.ack) {\n116:         state := ClientState.HAVE_TOKEN\n117:       }\n118:     }\n119:     is(ClientState.HAVE_TOKEN) {\n120:       when(randChoice) {\n121:         reqReg := false.B\n122:         state := ClientState.NO_REQ\n123:       }\n124:     }\n125:   }\n126: }\n127: \n128: // Main module\n129: class Main extends Module {\n130:   val io = IO(new Bundle {\n131:     val ackA = Output(Bool())\n132:     val ackB = Output(Bool())\n133:     val ackC = Output(Bool())\n134:     // Additional outputs to preserve internal signals\n135:     val sel = Output(Selection())\n136:     val active = Output(Bool())\n137:     val reqA = Output(Bool())\n138:     val reqB = Output(Bool())\n139:     val reqC = Output(Bool())\n140:     val pass_tokenA = Output(Bool())\n141:     val pass_tokenB = Output(Bool())\n142:     val pass_tokenC = Output(Bool())\n143:   })\n144:   \n145:   // Instantiate controllers\n146:   val controllerA = Module(new Controller)\n147:   val controllerB = Module(new Controller)\n148:   val controllerC = Module(new Controller)\n149:   \n150:   // Instantiate arbiter\n151:   val arbiter = Module(new Arbiter)\n152:   \n153:   // Instantiate clients\n154:   val clientA = Module(new Client)\n155:   val clientB = Module(new Client)\n156:   val clientC = Module(new Client)\n157:   \n158:   // Connect controllers\n159:   controllerA.io.req := clientA.io.req\n160:   controllerA.io.sel := arbiter.io.sel\n161:   controllerA.io.id := Selection.A\n162:   \n163:   controllerB.io.req := clientB.io.req\n164:   controllerB.io.sel := arbiter.io.sel\n165:   controllerB.io.id := Selection.B\n166:   \n167:   controllerC.io.req := clientC.io.req\n168:   controllerC.io.sel := arbiter.io.sel\n169:   controllerC.io.id := Selection.C\n170:   \n171:   // Connect clients\n172:   clientA.io.ack := controllerA.io.ack\n173:   clientB.io.ack := controllerB.io.ack\n174:   clientC.io.ack := controllerC.io.ack\n175:   \n176:   // Connect arbiter\n177:   val active = controllerA.io.pass_token || controllerB.io.pass_token || controllerC.io.pass_token\n178:   arbiter.io.active := active\n179:   \n180:   // Connect outputs\n181:   io.ackA := controllerA.io.ack\n182:   io.ackB := controllerB.io.ack\n183:   io.ackC := controllerC.io.ack\n184:   io.sel := arbiter.io.sel\n185:   io.active := active\n186:   io.reqA := clientA.io.req\n187:   io.reqB := clientB.io.req\n188:   io.reqC := clientC.io.req\n189:   io.pass_tokenA := controllerA.io.pass_token\n190:   io.pass_tokenB := controllerB.io.pass_token\n191:   io.pass_tokenC := controllerC.io.pass_token\n192: }\n193: \n194: // Verilog generator\n195: object VerilogGenerator extends App {\n196:   emitVerilog(new Main(), args)\n197: }",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/param_arbiter3/arbiter3.scala",
+                "line_end": 197,
+                "line_start": 50,
+                "original_chars": 4641,
+                "original_lines": 197,
+                "returned_chars": 4252,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "arbiter3.scala"
+              ],
+              "line_end": 197,
+              "line_start": 50,
+              "reason": "Read the rest of the design to understand full protocol."
+            },
+            "id": "call_00_nauPMoUGB8yNxkTYexpw2748",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 3
+      },
+      {
+        "action_results": [
+          {
+            "error": null,
+            "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/param_arbiter3/arbiter3.scala",
+            "success": true,
+            "type": "write_assertions"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "content": "package llmverify\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\n// Define enums using ChiselEnum\nobject Selection extends ChiselEnum {\n  val A, B, C, X = Value\n}\n\nobject ControllerState extends ChiselEnum {\n  val IDLE, READY, BUSY = Value\n}\n\nobject ClientState extends ChiselEnum {\n  val NO_REQ, REQ, HAVE_TOKEN = Value\n}\n\n// Controller module\nclass Controller extends Module {\n  val io = IO(new Bundle {\n    val req = Input(Bool())\n    val sel = Input(Selection())\n    val id = Input(Selection())\n    val ack = Output(Bool())\n    val pass_token = Output(Bool())\n  })\n  \n  val state = RegInit(ControllerState.IDLE)\n  val ackReg = RegInit(false.B)\n  val passTokenReg = RegInit(true.B)\n  \n  val isSelected = (io.sel === io.id)\n  \n  io.ack := ackReg\n  io.pass_token := passTokenReg\n  \n  switch(state) {\n    is(ControllerState.IDLE) {\n      when(isSelected) {\n        when(io.req) {\n          state := ControllerState.READY\n          passTokenReg := false.B\n        }.otherwise {\n          passTokenReg := true.B\n        }\n      }.otherwise {\n        passTokenReg := false.B\n      }\n    }\n    is(ControllerState.READY) {\n      state := ControllerState.BUSY\n      ackReg := true.B\n    }\n    is(ControllerState.BUSY) {\n      when(!io.req) {\n        state := ControllerState.IDLE\n        ackReg := false.B\n        passTokenReg := true.B\n      }\n    }\n  }\n}\n\n// Arbiter module\nclass Arbiter extends Module {\n  val io = IO(new Bundle {\n    val active = Input(Bool())\n    val sel = Output(Selection())\n  })\n  \n  val state = RegInit(Selection.A)\n  \n  io.sel := Mux(io.active, state, Selection.X)\n  \n  when(io.active) {\n    switch(state) {\n      is(Selection.A) {\n        state := Selection.B\n      }\n      is(Selection.B) {\n        state := Selection.C\n      }\n      is(Selection.C) {\n        state := Selection.A\n      }\n    }\n  }\n}\n\n// Client module\nclass Client extends Module {\n  val io = IO(new Bundle {\n    val ack = Input(Bool())\n    val req = Output(Bool())\n  })\n  \n  val state = RegInit(ClientState.NO_REQ)\n  val reqReg = RegInit(false.B)\n  \n  // Simple pseudo-random choice using LFSR\n  val lfsr = RegInit(1.U(8.W))\n  val randChoice = lfsr(0)\n  lfsr := Cat(lfsr(6), lfsr(5), lfsr(4), lfsr(3), lfsr(2), lfsr(1), lfsr(0), lfsr(6) ^ lfsr(5))\n  \n  io.req := reqReg\n  \n  switch(state) {\n    is(ClientState.NO_REQ) {\n      when(randChoice) {\n        reqReg := true.B\n        state := ClientState.REQ\n      }\n    }\n    is(ClientState.REQ) {\n      when(io.ack) {\n        state := ClientState.HAVE_TOKEN\n      }\n    }\n    is(ClientState.HAVE_TOKEN) {\n      when(randChoice) {\n        reqReg := false.B\n        state := ClientState.NO_REQ\n      }\n    }\n  }\n}\n\n// Main module\nclass Main extends Module with Formal {\n  val io = IO(new Bundle {\n    val ackA = Output(Bool())\n    val ackB = Output(Bool())\n    val ackC = Output(Bool())\n    // Additional outputs to preserve internal signals\n    val sel = Output(Selection())\n    val active = Output(Bool())\n    val reqA = Output(Bool())\n    val reqB = Output(Bool())\n    val reqC = Output(Bool())\n    val pass_tokenA = Output(Bool())\n    val pass_tokenB = Output(Bool())\n    val pass_tokenC = Output(Bool())\n  })\n  \n  // Instantiate controllers\n  val controllerA = Module(new Controller)\n  val controllerB = Module(new Controller)\n  val controllerC = Module(new Controller)\n  \n  // Instantiate arbiter\n  val arbiter = Module(new Arbiter)\n  \n  // Instantiate clients\n  val clientA = Module(new Client)\n  val clientB = Module(new Client)\n  val clientC = Module(new Client)\n  \n  // Connect controllers\n  controllerA.io.req := clientA.io.req\n  controllerA.io.sel := arbiter.io.sel\n  controllerA.io.id := Selection.A\n  \n  controllerB.io.req := clientB.io.req\n  controllerB.io.sel := arbiter.io.sel\n  controllerB.io.id := Selection.B\n  \n  controllerC.io.req := clientC.io.req\n  controllerC.io.sel := arbiter.io.sel\n  controllerC.io.id := Selection.C\n  \n  // Connect clients\n  clientA.io.ack := controllerA.io.ack\n  clientB.io.ack := controllerB.io.ack\n  clientC.io.ack := controllerC.io.ack\n  \n  // Connect arbiter\n  val active = controllerA.io.pass_token || controllerB.io.pass_token || controllerC.io.pass_token\n  arbiter.io.active := active\n  \n  // Connect outputs\n  io.ackA := controllerA.io.ack\n  io.ackB := controllerB.io.ack\n  io.ackC := controllerC.io.ack\n  io.sel := arbiter.io.sel\n  io.active := active\n  io.reqA := clientA.io.req\n  io.reqB := clientB.io.req\n  io.reqC := clientC.io.req\n  io.pass_tokenA := controllerA.io.pass_token\n  io.pass_tokenB := controllerB.io.pass_token\n  io.pass_tokenC := controllerC.io.pass_token\n\n  // ===== Formal Verification Assertions =====\n\n  // --- Safety: Mutual Exclusion ---\n  // At most one ack can be high at any time (only one client holds the token)\n  fvAssert(PopCount(Seq(io.ackA, io.ackB, io.ackC)) <= 1.U, \"ack_mutex\")\n  \n  // At most one pass_token can be high at any time (token passes atomically)\n  fvAssert(PopCount(Seq(io.pass_tokenA, io.pass_tokenB, io.pass_tokenC)) <= 1.U, \"pass_token_mutex\")\n\n  // --- Safety: Ack-Request Consistency ---\n  // A client must be requesting to receive an acknowledgement\n  fvAssert(!io.ackA || io.reqA, \"ackA_implies_reqA\")\n  fvAssert(!io.ackB || io.reqB, \"ackB_implies_reqB\")\n  fvAssert(!io.ackC || io.reqC, \"ackC_implies_reqC\")\n\n  // --- Safety: Ack-Selection Consistency ---\n  // A client can only be acknowledged when the arbiter selects it\n  fvAssert(!io.ackA || io.sel === Selection.A, \"ackA_implies_selA\")\n  fvAssert(!io.ackB || io.sel === Selection.B, \"ackB_implies_selB\")\n  fvAssert(!io.ackC || io.sel === Selection.C, \"ackC_implies_selC\")\n\n  // --- Safety: Pass-Token implies Request Inactive ---\n  // A controller passes the token only when its client is not requesting\n  // (pass_token is set when selected in IDLE with no req, or transitioning from BUSY to IDLE with no req)\n  fvAssert(!io.pass_tokenA || !io.reqA, \"pass_tokenA_implies_no_reqA\")\n  fvAssert(!io.pass_tokenB || !io.reqB, \"pass_tokenB_implies_no_reqB\")\n  fvAssert(!io.pass_tokenC || !io.reqC, \"pass_tokenC_implies_no_reqC\")\n\n  // --- Safety: Pass-Token implies Arbiter Selects Passing Client ---\n  // When a controller passes the token, it must currently be selected by the arbiter\n  fvAssert(!io.pass_tokenA || io.sel === Selection.A, \"pass_tokenA_implies_selA\")\n  fvAssert(!io.pass_tokenB || io.sel === Selection.B, \"pass_tokenB_implies_selB\")\n  fvAssert(!io.pass_tokenC || io.sel === Selection.C, \"pass_tokenC_implies_selC\")\n\n  // --- Liveness: Bounded Progress ---\n  // If a client is selected by the arbiter and has a pending request,\n  // the client must receive an acknowledgement within a bounded number of cycles.\n  // The pipeline is: IDLE → READY (1 cycle) → BUSY with ack (1 cycle).\n  // Bound of 8 allows for worst-case when controller is mid-transition.\n  astRelaxedLiveness(io.sel === Selection.A && io.reqA, io.ackA, 8, \"reqA_eventually_ackA\")\n  astRelaxedLiveness(io.sel === Selection.B && io.reqB, io.ackB, 8, \"reqB_eventually_ackB\")\n  astRelaxedLiveness(io.sel === Selection.C && io.reqC, io.ackC, 8, \"reqC_eventually_ackC\")\n\n  // --- Liveness: Arbiter Progress ---\n  // When the token is being actively passed (active is true), the round-robin\n  // arbiter should advance. This ensures the arbiter doesn't stall.\n  // The arbiter advances every cycle when active is true.\n  // Verify: when active is true, the sel output should change within 1 cycle\n  // (arbiter state updates combinatorially through io.sel).\n  // Actually, we verify a stronger property: active implies sel !== X (not idle).\n  fvAssert(!io.active || io.sel =/= Selection.X, \"active_implies_sel_valid\")\n}\n\n// Verilog generator\nobject VerilogGenerator extends App {\n  emitVerilog(new Main(), args)\n}\n",
+              "file_path": "arbiter3.scala",
+              "stage_complete": true
+            },
+            "id": "call_00_SCll2PqpjfwLQIT93G8Z2774",
+            "name": "write_assertions"
+          }
+        ],
+        "iteration": 4
+      }
+    ],
+    "root_cause": null,
+    "success": true,
+    "summary": "",
+    "verification_passed": true
+  },
+  "success": true
+}

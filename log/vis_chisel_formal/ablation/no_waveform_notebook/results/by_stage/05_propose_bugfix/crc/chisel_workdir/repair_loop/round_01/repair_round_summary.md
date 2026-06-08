@@ -1,0 +1,1 @@
+Round 1 (fix 2): Replaced unavailable `assumeMutex()` call with `assume(!(io.load && io.compute), "assume_load_compute_mutex")` which uses the basic `assume` primitive from chiselFv. This constrains the input protocol so load and compute are never simultaneously high, eliminating the spurious counterexample on `load_compute_mutex` and cascading failures on the other 4 assertions.

@@ -1,0 +1,109 @@
+{
+  "ablation_modes": [
+    "no_assertion_presence_gate"
+  ],
+  "original_query": "Add formal verification assertions to the design using ChiselFV or Chisel LTL. Place assertions directly inside the original DUT module/class emitted by VerilogGenerator, not in a separate *Formal wrapper or sibling module. Focus on key properties like safety and liveness.",
+  "stage": "write_assertions",
+  "stage_result": {
+    "counterexample_path": null,
+    "iterations": [
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\n\nclass usb_phy extends Module {\n  val io = IO(new Bundle {\n    val rst = Input(Bool())\n    val phy_tx_mode = Input(Bool())\n    val usb_rst = Output(Bool())\n    \n    // Transceiver Interface\n    val txdp = Output(Bool())\n    val txdn = Output(Bool())\n    val txoe = Output(Bool())\n    val rxd = Input(Bool())\n    val rxdp = Input(Bool())\n    val rxdn = Input(Bool())\n    \n    // UTMI Interface\n    val DataOut_i = Input(UInt(8.W))\n    val TxValid_i = Input(Bool())\n    val TxReady_o = Output(Bool())\n    val DataIn_o = Output(UInt(8.W))\n    val RxValid_o = Output(Bool())\n    val RxActive_o = Output(Bool())\n    val RxError_o = Output(Bool())\n    val LineState_o = Output(UInt(2.W))\n  })\n  \n  // Local Wires and Registers\n  val rst_cnt = RegInit(0.U(5.W))\n  val usb_rst_reg = RegInit(false.B)\n  \n  // Misc Logic - renamed 'reset' to 'reset_wire' to avoid conflict with Chisel's built-in reset\n  val reset_wire = io.rst & ~usb_rst_reg\n  \n  // Generate fs_ce (clock enable) - this would typically come from a clock divider\n  // For now, assuming it's always enabled for simplicity\n  val fs_ce = true.B\n  \n  // TX Phy instantiation\n  val i_tx_phy = Module(new usb_tx_phy())\n  i_tx_phy.io.clk := clock\n  i_tx_phy.io.rst := reset_wire\n  i_tx_phy.io.fs_ce := fs_ce\n  i_tx_phy.io.phy_mode := io.phy_tx_mode\n  i_tx_phy.io.DataOut_i := io.DataOut_i\n  i_tx_phy.io.TxValid_i := io.TxValid_i\n  io.TxReady_o := i_tx_phy.io.TxReady_o\n  \n  // Connect TX Phy outputs to main module outputs\n  io.txdp := i_tx_phy.io.txdp\n  io.txdn := i_tx_phy.io.txdn\n  io.txoe := i_tx_phy.io.txoe\n  \n  // RX Phy instantiation\n  val i_rx_phy = Module(new usb_rx_phy())\n  i_rx_phy.io.clk := clock\n  i_rx_phy.io.rst := reset_wire\n  i_rx_phy.io.fs_ce := fs_ce\n  i_rx_phy.io.rxd := io.rxd\n  i_rx_phy.io.rxdp := io.rxdp\n  i_rx_phy.io.rxdn := io.rxdn\n  i_rx_phy.io.RxEn_i := io.txoe\n  io.DataIn_o := i_rx_phy.io.DataIn_o\n  io.RxValid_o := i_rx_phy.io.RxValid_o\n  io.RxActive_o := i_rx_phy.io.RxActive_o\n  io.RxError_o := i_rx_phy.io.RxError_o\n  io.LineState_o := i_rx_phy.io.LineState\n  \n  // USB Reset generation logic\n  when(!io.rst) {\n    rst_cnt := 0.U\n  }.elsewhen(io.LineState_o =/= 0.U) {\n    rst_cnt := 0.U\n  }.elsewhen(!usb_rst_reg && fs_ce) {\n    rst_cnt := rst_cnt + 1.U\n  }\n  \n  usb_rst_reg := (rst_cnt === 31.U)\n  io.usb_rst := usb_rst_reg\n}\n\n// Placeholder for usb_tx_phy module\nclass usb_tx_phy extends Module {\n  val io = IO(new Bundle {\n    val clk = Input(Clock())\n    val rst = Input(Bool())\n    val fs_ce = Input(Bool())\n    val phy_mode = Input(Bool())\n    \n    // Transceiver Interface\n    val txdp = Output(Bool())\n    val txdn = Output(Bool())\n    val txoe = Output(Bool())\n    \n    // UTMI Interface\n    val DataOut_i = Input(UInt(8.W))\n    val TxValid_i = Input(Bool())\n    val TxReady_o = Output(Bool())\n  })\n  \n  // Placeholder implementation\n  io.txdp := false.B\n  io.txdn := false.B\n  io.txoe := false.B\n  io.TxReady_o := true.B\n}\n\n// Placeholder for usb_rx_phy module\nclass usb_rx_phy extends Module {\n  val io = IO(new Bundle {\n    val clk = Input(Clock())\n    val rst = Input(Bool())\n    val fs_ce = Input(Bool())\n    \n    // Transceiver Interface\n    val rxd = Input(Bool())\n    val rxdp = Input(Bool())\n    val rxdn = Input(Bool())\n    \n    // UTMI Interface\n    val DataIn_o = Output(UInt(8.W))\n    val RxValid_o = Output(Bool())\n    val RxActive_o = Output(Bool())\n    val RxError_o = Output(Bool())\n    val RxEn_i = Input(Bool())\n    val LineState = Output(UInt(2.W))\n  })\n  \n  // Placeholder implementation\n  io.DataIn_o := 0.U\n  io.RxValid_o := false.B\n  io.RxActive_o := false.B\n  io.RxError_o := false.B\n  io.LineState := 0.U\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new usb_phy(), args)\n}",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_assertion_presence_gate/workspace/chisel/extra_bench/usbphy/usb_phy.scala",
+                "original_chars": 3762,
+                "original_lines": 142,
+                "returned_chars": 3762,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "chisel/extra_bench/usbphy/usb_phy.scala"
+              ],
+              "reason": "Read the full source file to understand the USB PHY design and identify where to add assertions"
+            },
+            "id": "call_00_9jt1U1JDIOLqhLiWCbF92839",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 1
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "1: package llmverify\n2: \n3: import chisel3._\n4: import chisel3.util._\n5: \n6: class usb_phy extends Module {\n7:   val io = IO(new Bundle {\n8:     val rst = Input(Bool())\n9:     val phy_tx_mode = Input(Bool())\n10:     val usb_rst = Output(Bool())\n11:     \n12:     // Transceiver Interface\n13:     val txdp = Output(Bool())\n14:     val txdn = Output(Bool())\n15:     val txoe = Output(Bool())\n16:     val rxd = Input(Bool())\n17:     val rxdp = Input(Bool())\n18:     val rxdn = Input(Bool())\n19:     \n20:     // UTMI Interface\n21:     val DataOut_i = Input(UInt(8.W))\n22:     val TxValid_i = Input(Bool())\n23:     val TxReady_o = Output(Bool())\n24:     val DataIn_o = Output(UInt(8.W))\n25:     val RxValid_o = Output(Bool())\n26:     val RxActive_o = Output(Bool())\n27:     val RxError_o = Output(Bool())\n28:     val LineState_o = Output(UInt(2.W))\n29:   })\n30:   \n31:   // Local Wires and Registers\n32:   val rst_cnt = RegInit(0.U(5.W))\n33:   val usb_rst_reg = RegInit(false.B)\n34:   \n35:   // Misc Logic - renamed 'reset' to 'reset_wire' to avoid conflict with Chisel's built-in reset\n36:   val reset_wire = io.rst & ~usb_rst_reg\n37:   \n38:   // Generate fs_ce (clock enable) - this would typically come from a clock divider\n39:   // For now, assuming it's always enabled for simplicity\n40:   val fs_ce = true.B\n41:   \n42:   // TX Phy instantiation\n43:   val i_tx_phy = Module(new usb_tx_phy())\n44:   i_tx_phy.io.clk := clock\n45:   i_tx_phy.io.rst := reset_wire\n46:   i_tx_phy.io.fs_ce := fs_ce\n47:   i_tx_phy.io.phy_mode := io.phy_tx_mode\n48:   i_tx_phy.io.DataOut_i := io.DataOut_i\n49:   i_tx_phy.io.TxValid_i := io.TxValid_i\n50:   io.TxReady_o := i_tx_phy.io.TxReady_o\n51:   \n52:   // Connect TX Phy outputs to main module outputs\n53:   io.txdp := i_tx_phy.io.txdp\n54:   io.txdn := i_tx_phy.io.txdn\n55:   io.txoe := i_tx_phy.io.txoe\n56:   \n57:   // RX Phy instantiation\n58:   val i_rx_phy = Module(new usb_rx_phy())\n59:   i_rx_phy.io.clk := clock\n60:   i_rx_phy.io.rst := reset_wire\n61:   i_rx_phy.io.fs_ce := fs_ce\n62:   i_rx_phy.io.rxd := io.rxd\n63:   i_rx_phy.io.rxdp := io.rxdp\n64:   i_rx_phy.io.rxdn := io.rxdn\n65:   i_rx_phy.io.RxEn_i := io.txoe\n66:   io.DataIn_o := i_rx_phy.io.DataIn_o\n67:   io.RxValid_o := i_rx_phy.io.RxValid_o\n68:   io.RxActive_o := i_rx_phy.io.RxActive_o\n69:   io.RxError_o := i_rx_phy.io.RxError_o\n70:   io.LineState_o := i_rx_phy.io.LineState\n71:   \n72:   // USB Reset generation logic\n73:   when(!io.rst) {\n74:     rst_cnt := 0.U\n75:   }.elsewhen(io.LineState_o =/= 0.U) {\n76:     rst_cnt := 0.U\n77:   }.elsewhen(!usb_rst_reg && fs_ce) {\n78:     rst_cnt := rst_cnt + 1.U\n79:   }\n80:   \n81:   usb_rst_reg := (rst_cnt === 31.U)\n82:   io.usb_rst := usb_rst_reg\n83: }\n84: \n85: // Placeholder for usb_tx_phy module\n86: class usb_tx_phy extends Module {\n87:   val io = IO(new Bundle {\n88:     val clk = Input(Clock())\n89:     val rst = Input(Bool())\n90:     val fs_ce = Input(Bool())\n91:     val phy_mode = Input(Bool())\n92:     \n93:     // Transceiver Interface\n94:     val txdp = Output(Bool())\n95:     val txdn = Output(Bool())\n96:     val txoe = Output(Bool())\n97:     \n98:     // UTMI Interface\n99:     val DataOut_i = Input(UInt(8.W))\n100:     val TxValid_i = Input(Bool())\n101:     val TxReady_o = Output(Bool())\n102:   })\n103:   \n104:   // Placeholder implementation\n105:   io.txdp := false.B\n106:   io.txdn := false.B\n107:   io.txoe := false.B\n108:   io.TxReady_o := true.B\n109: }\n110: \n111: // Placeholder for usb_rx_phy module\n112: class usb_rx_phy extends Module {\n113:   val io = IO(new Bundle {\n114:     val clk = Input(Clock())\n115:     val rst = Input(Bool())\n116:     val fs_ce = Input(Bool())\n117:     \n118:     // Transceiver Interface\n119:     val rxd = Input(Bool())\n120:     val rxdp = Input(Bool())\n121:     val rxdn = Input(Bool())\n122:     \n123:     // UTMI Interface\n124:     val DataIn_o = Output(UInt(8.W))\n125:     val RxValid_o = Output(Bool())\n126:     val RxActive_o = Output(Bool())\n127:     val RxError_o = Output(Bool())\n128:     val RxEn_i = Input(Bool())\n129:     val LineState = Output(UInt(2.W))\n130:   })\n131:   \n132:   // Placeholder implementation\n133:   io.DataIn_o := 0.U\n134:   io.RxValid_o := false.B\n135:   io.RxActive_o := false.B\n136:   io.RxError_o := false.B\n137:   io.LineState := 0.U\n138: }\n139: \n140: object VerilogGenerator extends App {\n141:   emitVerilog(new usb_phy(), args)\n142: }",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_assertion_presence_gate/workspace/chisel/extra_bench/usbphy/usb_phy.scala",
+                "line_end": 142,
+                "line_start": 1,
+                "original_chars": 3762,
+                "original_lines": 142,
+                "returned_chars": 4364,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "chisel/extra_bench/usbphy/usb_phy.scala"
+              ],
+              "line_end": 142,
+              "line_start": 1,
+              "reason": "Read the full source to understand all signals before writing assertions"
+            },
+            "id": "call_00_HopR0xlbR5wP78kb3XkN0839",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 2
+      },
+      {
+        "action_results": [
+          {
+            "error": null,
+            "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_assertion_presence_gate/workspace/chisel/extra_bench/usbphy/usb_phy.scala",
+            "success": true,
+            "type": "write_assertions"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\nclass usb_phy extends Module with Formal {\n  val io = IO(new Bundle {\n    val rst = Input(Bool())\n    val phy_tx_mode = Input(Bool())\n    val usb_rst = Output(Bool())\n    \n    // Transceiver Interface\n    val txdp = Output(Bool())\n    val txdn = Output(Bool())\n    val txoe = Output(Bool())\n    val rxd = Input(Bool())\n    val rxdp = Input(Bool())\n    val rxdn = Input(Bool())\n    \n    // UTMI Interface\n    val DataOut_i = Input(UInt(8.W))\n    val TxValid_i = Input(Bool())\n    val TxReady_o = Output(Bool())\n    val DataIn_o = Output(UInt(8.W))\n    val RxValid_o = Output(Bool())\n    val RxActive_o = Output(Bool())\n    val RxError_o = Output(Bool())\n    val LineState_o = Output(UInt(2.W))\n  })\n  \n  // Local Wires and Registers\n  val rst_cnt = RegInit(0.U(5.W))\n  val usb_rst_reg = RegInit(false.B)\n  \n  // Misc Logic - renamed 'reset' to 'reset_wire' to avoid conflict with Chisel's built-in reset\n  val reset_wire = io.rst & ~usb_rst_reg\n  \n  // Generate fs_ce (clock enable) - this would typically come from a clock divider\n  // For now, assuming it's always enabled for simplicity\n  val fs_ce = true.B\n  \n  // TX Phy instantiation\n  val i_tx_phy = Module(new usb_tx_phy())\n  i_tx_phy.io.clk := clock\n  i_tx_phy.io.rst := reset_wire\n  i_tx_phy.io.fs_ce := fs_ce\n  i_tx_phy.io.phy_mode := io.phy_tx_mode\n  i_tx_phy.io.DataOut_i := io.DataOut_i\n  i_tx_phy.io.TxValid_i := io.TxValid_i\n  io.TxReady_o := i_tx_phy.io.TxReady_o\n  \n  // Connect TX Phy outputs to main module outputs\n  io.txdp := i_tx_phy.io.txdp\n  io.txdn := i_tx_phy.io.txdn\n  io.txoe := i_tx_phy.io.txoe\n  \n  // RX Phy instantiation\n  val i_rx_phy = Module(new usb_rx_phy())\n  i_rx_phy.io.clk := clock\n  i_rx_phy.io.rst := reset_wire\n  i_rx_phy.io.fs_ce := fs_ce\n  i_rx_phy.io.rxd := io.rxd\n  i_rx_phy.io.rxdp := io.rxdp\n  i_rx_phy.io.rxdn := io.rxdn\n  i_rx_phy.io.RxEn_i := io.txoe\n  io.DataIn_o := i_rx_phy.io.DataIn_o\n  io.RxValid_o := i_rx_phy.io.RxValid_o\n  io.RxActive_o := i_rx_phy.io.RxActive_o\n  io.RxError_o := i_rx_phy.io.RxError_o\n  io.LineState_o := i_rx_phy.io.LineState\n  \n  // USB Reset generation logic\n  when(!io.rst) {\n    rst_cnt := 0.U\n  }.elsewhen(io.LineState_o =/= 0.U) {\n    rst_cnt := 0.U\n  }.elsewhen(!usb_rst_reg && fs_ce) {\n    rst_cnt := rst_cnt + 1.U\n  }\n  \n  usb_rst_reg := (rst_cnt === 31.U)\n  io.usb_rst := usb_rst_reg\n\n  // ========== Formal Verification Assertions ==========\n\n  // Safety: rst_cnt is a 5-bit counter whose terminal value is 31; it must never exceed 31\n  fvAssert(rst_cnt <= 31.U, \"rst_cnt_valid_range\")\n\n  // Safety: usb_rst_reg must correctly reflect the terminal-count comparison\n  fvAssert(usb_rst_reg === (rst_cnt === 31.U), \"usb_rst_reg_definition\")\n\n  // Safety: USB D+ (txdp) and D- (txdn) differential signals must never both be high\n  fvAssert(!(io.txdp && io.txdn), \"txdp_txdn_exclusive\")\n\n  // Safety: The 2-bit line state encoding must never be 0b11 (reserved/invalid in USB)\n  fvAssert(io.LineState_o =/= 3.U, \"line_state_valid_encoding\")\n\n  // Safety: Once usb_rst_reg is asserted and the reset conditions remain (rst high,\n  // line idle), the register must hold its value on the next cycle (avoids glitches\n  // or unintended deassertion)\n  assertImpliesDelay(\n    usb_rst_reg && io.rst && io.LineState_o === 0.U,\n    usb_rst_reg,\n    1,\n    \"usb_rst_reg_persistence\"\n  )\n\n  // Liveness/Progress: When the main reset is active and the USB line stays in SE0\n  // state (LineState_o === 0), the USB reset signal should assert within 40 cycles.\n  // Bounded by the 5-bit counter's max range (31) plus margin.\n  astRelaxedLiveness(\n    io.rst && io.LineState_o === 0.U && !usb_rst_reg,\n    usb_rst_reg,\n    40,\n    \"usb_rst_eventually_asserted\"\n  )\n}\n\n// Placeholder for usb_tx_phy module\nclass usb_tx_phy extends Module {\n  val io = IO(new Bundle {\n    val clk = Input(Clock())\n    val rst = Input(Bool())\n    val fs_ce = Input(Bool())\n    val phy_mode = Input(Bool())\n    \n    // Transceiver Interface\n    val txdp = Output(Bool())\n    val txdn = Output(Bool())\n    val txoe = Output(Bool())\n    \n    // UTMI Interface\n    val DataOut_i = Input(UInt(8.W))\n    val TxValid_i = Input(Bool())\n    val TxReady_o = Output(Bool())\n  })\n  \n  // Placeholder implementation\n  io.txdp := false.B\n  io.txdn := false.B\n  io.txoe := false.B\n  io.TxReady_o := true.B\n}\n\n// Placeholder for usb_rx_phy module\nclass usb_rx_phy extends Module {\n  val io = IO(new Bundle {\n    val clk = Input(Clock())\n    val rst = Input(Bool())\n    val fs_ce = Input(Bool())\n    \n    // Transceiver Interface\n    val rxd = Input(Bool())\n    val rxdp = Input(Bool())\n    val rxdn = Input(Bool())\n    \n    // UTMI Interface\n    val DataIn_o = Output(UInt(8.W))\n    val RxValid_o = Output(Bool())\n    val RxActive_o = Output(Bool())\n    val RxError_o = Output(Bool())\n    val RxEn_i = Input(Bool())\n    val LineState = Output(UInt(2.W))\n  })\n  \n  // Placeholder implementation\n  io.DataIn_o := 0.U\n  io.RxValid_o := false.B\n  io.RxActive_o := false.B\n  io.RxError_o := false.B\n  io.LineState := 0.U\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new usb_phy(), args)\n}\n",
+              "file_path": "chisel/extra_bench/usbphy/usb_phy.scala",
+              "stage_complete": true
+            },
+            "id": "call_00_Uq4jiboj1wlgJvdiqRCO6365",
+            "name": "write_assertions"
+          }
+        ],
+        "iteration": 3
+      }
+    ],
+    "root_cause": null,
+    "success": true,
+    "summary": "",
+    "verification_passed": true
+  },
+  "success": true
+}

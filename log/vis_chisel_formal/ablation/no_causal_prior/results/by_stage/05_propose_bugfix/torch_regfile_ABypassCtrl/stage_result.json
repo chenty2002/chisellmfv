@@ -1,0 +1,412 @@
+{
+  "ablation_modes": [
+    "no_causal_prior"
+  ],
+  "original_query": "Based on the waveform analysis, implement a minimal fix for the identified bug.",
+  "stage": "propose_bugfix",
+  "stage_result": {
+    "repair_loop": {
+      "final_cex_count": 4,
+      "final_failing_properties": [
+        "ABypassCtrl.A_pipeline_completes_within_8",
+        "ABypassCtrl.A_s2e_to_s1m_propagation",
+        "ABypassCtrl.B_pipeline_completes_within_8",
+        "ABypassCtrl.B_s2e_to_s1m_propagation"
+      ],
+      "history_summaries": [
+        "Round 1/3: DUT bugfix for A_pipeline_completes_within_8 (and B_pipeline_completes_within_8). Removed & ~io.Except_s1w gating from both AValid_s2m (line 121) and BValid_s2m (line 139) assignments in the when(io.Phi1 & ~io.Stall_s1) blocks. Root cause: late-arriving io.Except_s1w was killing in-flight instructions at the s1m→s2m transition, even though those instructions entered the pipeline when no exception was present. The entry logic (AValid_s2e := ~(AKill|ANoDest|Except)) already prevents new entries during exceptions. Removing the gating allows cleanly-entered instructions to propagate through regardless of late exceptions, matching the assertion's natural language semantics. Also fixed homologous B-side assignment.",
+        "Round 2/3: DUT bugfix for A_pipeline_completes_within_8, A_s2e_to_s1m_propagation, B_pipeline_completes_within_8, B_s2e_to_s1m_propagation. Root cause: Phi2 blocks unconditionally overwrite AValid_s1m (line 118) and BValid_s1m (line 140) from s2e during stall transitions. When Stall_s1 is released at a Phi2 edge, the Phi2 update runs and can retroactively kill an instruction in s1m if AValid_s2e/AIgnore_s2e have changed during the stall. Fix: wrap both assignments in Mux(AValid_s1m && !AValid_s2m, AValid_s1m, ...) / Mux(BValid_s1m && !BValid_s2m, BValid_s1m, ...) to preserve s1m when it holds a valid instruction not yet captured by s2m (stuck during stall). The causal link: the Phi2 write path (s2e→s1m) should not destroy an instruction already in s1m that couldn't advance to s2m because the Phi1 path (s1m→s2m) was stalled; the Mux guard breaks that destructive path. All 4 failing assertions are addressed (2 A-side, 2 B-side, homologous structural repair). All assertion labels preserved unchanged.",
+        "Round 3/3: DUT bugfix targeting 4 failing assertions (A_pipeline_completes_within_8, A_s2e_to_s1m_propagation, B_pipeline_completes_within_8, B_s2e_to_s1m_propagation). Root cause: io.AIgnore_s2e and io.BIgnore_s2e are combinational inputs used in the Phi2 update block (AValid_s1m := AValid_s2e & ~io.AIgnore_s2e). Between the Phi1 posedge (where AValid_s2e is registered and the antecedent conditions are checked) and the Phi2 half-cycle (where AValid_s1m is updated), these signals can transition from 0→1, blocking the s2e→s1m pipeline propagation. The fix adds registered samplers AIgnoreReg_s2e and BIgnoreReg_s2e (latched at the same Phi1 posedge where AValid_s2e is updated), and uses them in the Phi2 assignments instead of the raw inputs. This ensures the ignore decision is sampled consistently with the pipeline stage entry time. Causal link: the assertions sample antecedent at Phi1 (where AIgnore_s2e=0), but the DUT uses the combinational value at Phi2 (where AIgnore_s2e may have changed); registering the Phi1 value breaks this causal mismatch. All assertion labels preserved unchanged. Homologous repair on B-side for the same structural issue."
+      ],
+      "initial_cex_count": 3,
+      "initial_failing_properties": [
+        "ABypassCtrl.A_pipeline_completes_within_8",
+        "ABypassCtrl.A_s2e_to_s1m_propagation",
+        "ABypassCtrl.B_s2e_to_s1m_propagation"
+      ],
+      "max_repair_rounds": 3,
+      "new_failing_properties": [
+        "ABypassCtrl.B_pipeline_completes_within_8"
+      ],
+      "persistent_properties": [
+        "ABypassCtrl.A_pipeline_completes_within_8",
+        "ABypassCtrl.A_s2e_to_s1m_propagation",
+        "ABypassCtrl.B_s2e_to_s1m_propagation"
+      ],
+      "repair_success": false,
+      "resolved_properties": [],
+      "rounds": [
+        {
+          "error_type": "dut_bug",
+          "homologous_assertions": [
+            "B_pipeline_completes_within_8"
+          ],
+          "post_cex_count": 4,
+          "post_failing_properties": [
+            "ABypassCtrl.A_pipeline_completes_within_8",
+            "ABypassCtrl.A_s2e_to_s1m_propagation",
+            "ABypassCtrl.B_pipeline_completes_within_8",
+            "ABypassCtrl.B_s2e_to_s1m_propagation"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/post_stage3/ABypassCtrl.A_pipeline_completes_within_8.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/post_stage3/ABypassCtrl.A_pipeline_completes_within_8.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/post_stage3/ABypassCtrl.B_pipeline_completes_within_8.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_pipeline_completes_within_8.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/post_stage3/ABypassCtrl.B_pipeline_completes_within_8.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_pipeline_completes_within_8.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/post_stage3/ABypassCtrl.A_s2e_to_s1m_propagation.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_s2e_to_s1m_propagation.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/post_stage3/ABypassCtrl.A_s2e_to_s1m_propagation.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_s2e_to_s1m_propagation.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/post_stage3/ABypassCtrl.B_s2e_to_s1m_propagation.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_s2e_to_s1m_propagation.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/post_stage3/ABypassCtrl.B_s2e_to_s1m_propagation.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_s2e_to_s1m_propagation.vcd"
+            }
+          ],
+          "round": 1,
+          "round_summary": "Round 1/3: DUT bugfix for A_pipeline_completes_within_8 (and B_pipeline_completes_within_8). Removed & ~io.Except_s1w gating from both AValid_s2m (line 121) and BValid_s2m (line 139) assignments in the when(io.Phi1 & ~io.Stall_s1) blocks. Root cause: late-arriving io.Except_s1w was killing in-flight instructions at the s1m→s2m transition, even though those instructions entered the pipeline when no exception was present. The entry logic (AValid_s2e := ~(AKill|ANoDest|Except)) already prevents new entries during exceptions. Removing the gating allows cleanly-entered instructions to propagate through regardless of late exceptions, matching the assertion's natural language semantics. Also fixed homologous B-side assignment.",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst",
+            "name": "ABypassCtrl.A_pipeline_completes_within_8",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_01/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.vcd"
+            }
+          ],
+          "target_assertion_label": "A_pipeline_completes_within_8",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "ABypassCtrl.A_pipeline_completes_within_8",
+              "ABypassCtrl.A_s2e_to_s1m_propagation",
+              "ABypassCtrl.B_s2e_to_s1m_propagation"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "ABypassCtrl.AKill_clears_AValid_s1e",
+              "ABypassCtrl.ASBypassData_definition",
+              "ABypassCtrl.ASBypassLoad_definition",
+              "ABypassCtrl.ASBypass_mutex_load_vs_data",
+              "ABypassCtrl.ATBypassData_definition",
+              "ABypassCtrl.ATBypassLoad_definition",
+              "ABypassCtrl.ATBypass_mutex_load_vs_data",
+              "ABypassCtrl.A_pipeline_completes_within_8",
+              "ABypassCtrl.A_s2e_to_s1m_propagation",
+              "ABypassCtrl.Alpha1_requires_AValid",
+              "ABypassCtrl.B_pipeline_completes_within_8",
+              "ABypassCtrl.B_s2e_to_s1m_propagation",
+              "ABypassCtrl.Beta1_requires_BValid",
+              "ABypassCtrl.Delta2_q2_condition"
+            ]
+          }
+        },
+        {
+          "error_type": "dut_bug",
+          "homologous_assertions": [
+            "B_pipeline_completes_within_8",
+            "A_s2e_to_s1m_propagation",
+            "B_s2e_to_s1m_propagation"
+          ],
+          "post_cex_count": 4,
+          "post_failing_properties": [
+            "ABypassCtrl.A_pipeline_completes_within_8",
+            "ABypassCtrl.A_s2e_to_s1m_propagation",
+            "ABypassCtrl.B_pipeline_completes_within_8",
+            "ABypassCtrl.B_s2e_to_s1m_propagation"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/post_stage3/ABypassCtrl.A_pipeline_completes_within_8.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/post_stage3/ABypassCtrl.A_pipeline_completes_within_8.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/post_stage3/ABypassCtrl.B_pipeline_completes_within_8.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_pipeline_completes_within_8.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/post_stage3/ABypassCtrl.B_pipeline_completes_within_8.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_pipeline_completes_within_8.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/post_stage3/ABypassCtrl.A_s2e_to_s1m_propagation.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_s2e_to_s1m_propagation.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/post_stage3/ABypassCtrl.A_s2e_to_s1m_propagation.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_s2e_to_s1m_propagation.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/post_stage3/ABypassCtrl.B_s2e_to_s1m_propagation.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_s2e_to_s1m_propagation.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/post_stage3/ABypassCtrl.B_s2e_to_s1m_propagation.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_s2e_to_s1m_propagation.vcd"
+            }
+          ],
+          "round": 2,
+          "round_summary": "Round 2/3: DUT bugfix for A_pipeline_completes_within_8, A_s2e_to_s1m_propagation, B_pipeline_completes_within_8, B_s2e_to_s1m_propagation. Root cause: Phi2 blocks unconditionally overwrite AValid_s1m (line 118) and BValid_s1m (line 140) from s2e during stall transitions. When Stall_s1 is released at a Phi2 edge, the Phi2 update runs and can retroactively kill an instruction in s1m if AValid_s2e/AIgnore_s2e have changed during the stall. Fix: wrap both assignments in Mux(AValid_s1m && !AValid_s2m, AValid_s1m, ...) / Mux(BValid_s1m && !BValid_s2m, BValid_s1m, ...) to preserve s1m when it holds a valid instruction not yet captured by s2m (stuck during stall). The causal link: the Phi2 write path (s2e→s1m) should not destroy an instruction already in s1m that couldn't advance to s2m because the Phi1 path (s1m→s2m) was stalled; the Mux guard breaks that destructive path. All 4 failing assertions are addressed (2 A-side, 2 B-side, homologous structural repair). All assertion labels preserved unchanged.",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst",
+            "name": "ABypassCtrl.A_pipeline_completes_within_8",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_02/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.vcd"
+            }
+          ],
+          "target_assertion_label": "A_pipeline_completes_within_8",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "ABypassCtrl.A_pipeline_completes_within_8",
+              "ABypassCtrl.A_s2e_to_s1m_propagation",
+              "ABypassCtrl.B_s2e_to_s1m_propagation"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "ABypassCtrl.AKill_clears_AValid_s1e",
+              "ABypassCtrl.ASBypassData_definition",
+              "ABypassCtrl.ASBypassLoad_definition",
+              "ABypassCtrl.ASBypass_mutex_load_vs_data",
+              "ABypassCtrl.ATBypassData_definition",
+              "ABypassCtrl.ATBypassLoad_definition",
+              "ABypassCtrl.ATBypass_mutex_load_vs_data",
+              "ABypassCtrl.A_pipeline_completes_within_8",
+              "ABypassCtrl.A_s2e_to_s1m_propagation",
+              "ABypassCtrl.Alpha1_requires_AValid",
+              "ABypassCtrl.B_pipeline_completes_within_8",
+              "ABypassCtrl.B_s2e_to_s1m_propagation",
+              "ABypassCtrl.Beta1_requires_BValid",
+              "ABypassCtrl.Delta2_q2_condition"
+            ]
+          }
+        },
+        {
+          "error_type": "dut_bug",
+          "homologous_assertions": [
+            "A_s2e_to_s1m_propagation",
+            "B_pipeline_completes_within_8",
+            "B_s2e_to_s1m_propagation"
+          ],
+          "post_cex_count": 4,
+          "post_failing_properties": [
+            "ABypassCtrl.A_pipeline_completes_within_8",
+            "ABypassCtrl.A_s2e_to_s1m_propagation",
+            "ABypassCtrl.B_pipeline_completes_within_8",
+            "ABypassCtrl.B_s2e_to_s1m_propagation"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/post_stage3/ABypassCtrl.A_pipeline_completes_within_8.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/post_stage3/ABypassCtrl.A_pipeline_completes_within_8.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/post_stage3/ABypassCtrl.B_pipeline_completes_within_8.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_pipeline_completes_within_8.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/post_stage3/ABypassCtrl.B_pipeline_completes_within_8.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_pipeline_completes_within_8.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/post_stage3/ABypassCtrl.A_s2e_to_s1m_propagation.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_s2e_to_s1m_propagation.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/post_stage3/ABypassCtrl.A_s2e_to_s1m_propagation.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_s2e_to_s1m_propagation.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/post_stage3/ABypassCtrl.B_s2e_to_s1m_propagation.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_s2e_to_s1m_propagation.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/post_stage3/ABypassCtrl.B_s2e_to_s1m_propagation.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.B_s2e_to_s1m_propagation.vcd"
+            }
+          ],
+          "round": 3,
+          "round_summary": "Round 3/3: DUT bugfix targeting 4 failing assertions (A_pipeline_completes_within_8, A_s2e_to_s1m_propagation, B_pipeline_completes_within_8, B_s2e_to_s1m_propagation). Root cause: io.AIgnore_s2e and io.BIgnore_s2e are combinational inputs used in the Phi2 update block (AValid_s1m := AValid_s2e & ~io.AIgnore_s2e). Between the Phi1 posedge (where AValid_s2e is registered and the antecedent conditions are checked) and the Phi2 half-cycle (where AValid_s1m is updated), these signals can transition from 0→1, blocking the s2e→s1m pipeline propagation. The fix adds registered samplers AIgnoreReg_s2e and BIgnoreReg_s2e (latched at the same Phi1 posedge where AValid_s2e is updated), and uses them in the Phi2 assignments instead of the raw inputs. This ensures the ignore decision is sampled consistently with the pipeline stage entry time. Causal link: the assertions sample antecedent at Phi1 (where AIgnore_s2e=0), but the DUT uses the combinational value at Phi2 (where AIgnore_s2e may have changed); registering the Phi1 value breaks this causal mismatch. All assertion labels preserved unchanged. Homologous repair on B-side for the same structural issue.",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst",
+            "name": "ABypassCtrl.A_pipeline_completes_within_8",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/repair_loop/round_03/waveforms/selected_cex/ABypassCtrl.A_pipeline_completes_within_8.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.A_pipeline_completes_within_8.vcd"
+            }
+          ],
+          "target_assertion_label": "A_pipeline_completes_within_8",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "ABypassCtrl.A_pipeline_completes_within_8",
+              "ABypassCtrl.A_s2e_to_s1m_propagation",
+              "ABypassCtrl.B_s2e_to_s1m_propagation"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "ABypassCtrl.AKill_clears_AValid_s1e",
+              "ABypassCtrl.ASBypassData_definition",
+              "ABypassCtrl.ASBypassLoad_definition",
+              "ABypassCtrl.ASBypass_mutex_load_vs_data",
+              "ABypassCtrl.ATBypassData_definition",
+              "ABypassCtrl.ATBypassLoad_definition",
+              "ABypassCtrl.ATBypass_mutex_load_vs_data",
+              "ABypassCtrl.A_pipeline_completes_within_8",
+              "ABypassCtrl.A_s2e_to_s1m_propagation",
+              "ABypassCtrl.Alpha1_requires_AValid",
+              "ABypassCtrl.B_pipeline_completes_within_8",
+              "ABypassCtrl.B_s2e_to_s1m_propagation",
+              "ABypassCtrl.Beta1_requires_BValid",
+              "ABypassCtrl.Delta2_q2_condition"
+            ]
+          }
+        }
+      ],
+      "rounds_run": 3,
+      "target_presence": {
+        "all_present": true,
+        "checked_properties": [
+          "ABypassCtrl.A_pipeline_completes_within_8",
+          "ABypassCtrl.A_s2e_to_s1m_propagation",
+          "ABypassCtrl.B_s2e_to_s1m_propagation"
+        ],
+        "missing_properties": [],
+        "present_properties": [
+          "ABypassCtrl.AKill_clears_AValid_s1e",
+          "ABypassCtrl.ASBypassData_definition",
+          "ABypassCtrl.ASBypassLoad_definition",
+          "ABypassCtrl.ASBypass_mutex_load_vs_data",
+          "ABypassCtrl.ATBypassData_definition",
+          "ABypassCtrl.ATBypassLoad_definition",
+          "ABypassCtrl.ATBypass_mutex_load_vs_data",
+          "ABypassCtrl.A_pipeline_completes_within_8",
+          "ABypassCtrl.A_s2e_to_s1m_propagation",
+          "ABypassCtrl.Alpha1_requires_AValid",
+          "ABypassCtrl.B_pipeline_completes_within_8",
+          "ABypassCtrl.B_s2e_to_s1m_propagation",
+          "ABypassCtrl.Beta1_requires_BValid",
+          "ABypassCtrl.Delta2_q2_condition"
+        ]
+      }
+    },
+    "success": false,
+    "summary": "Repair loop reached the maximum number of rounds with remaining counterexamples.",
+    "verification_passed": false
+  },
+  "success": false
+}

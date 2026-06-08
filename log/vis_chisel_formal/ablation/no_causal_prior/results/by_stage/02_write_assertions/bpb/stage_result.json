@@ -1,0 +1,105 @@
+{
+  "ablation_modes": [
+    "no_causal_prior"
+  ],
+  "original_query": "Add formal verification assertions to the design using ChiselFV or Chisel LTL. Place assertions directly inside the original DUT module/class emitted by VerilogGenerator, not in a separate *Formal wrapper or sibling module. Focus on key properties like safety and liveness.",
+  "stage": "write_assertions",
+  "stage_result": {
+    "counterexample_path": null,
+    "iterations": [
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\n\nclass branchPredictionBuffer(PRED_BUFFER_SIZE: Int = 4) extends Module {\n  val io = IO(new Bundle {\n    val stall = Input(Bool())\n    val inst_addr = Input(UInt(2.W))\n    val update = Input(Bool())\n    val branch_result = Input(Bool())\n    val buffer_addr = Input(UInt(2.W))\n    val buffer_offset = Input(UInt(2.W))\n    val prediction = Output(UInt(4.W))\n  })\n\n  // State banks - 2-bit saturating counters for each entry\n  // Initialize to weak not taken (01)\n  val state_bank0 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank1 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank2 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank3 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n\n  // Prediction register\n  val prediction = RegInit(0.U(4.W))\n\n  // Prediction logic - read from all 4 banks when not stalled\n  when (!io.stall) {\n    // Construct the entire 4-bit prediction value at once\n    val pred3 = Mux(state_bank3(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred2 = Mux(state_bank2(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred1 = Mux(state_bank1(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred0 = Mux(state_bank0(io.inst_addr) > 1.U, 1.U, 0.U)\n    prediction := Cat(pred3, pred2, pred1, pred0)\n  }\n\n  // Update logic - modify one bank based on buffer_offset\n  when (io.update) {\n    when (io.branch_result) { // Branch was taken - increment\n      when (io.buffer_offset === 0.U) {\n        when (state_bank0(io.buffer_addr) =/= 3.U) {\n          state_bank0(io.buffer_addr) := state_bank0(io.buffer_addr) + 1.U\n        }\n      }.elsewhen (io.buffer_offset === 1.U) {\n        when (state_bank1(io.buffer_addr) =/= 3.U) {\n          state_bank1(io.buffer_addr) := state_bank1(io.buffer_addr) + 1.U\n        }\n      }.elsewhen (io.buffer_offset === 2.U) {\n        when (state_bank2(io.buffer_addr) =/= 3.U) {\n          state_bank2(io.buffer_addr) := state_bank2(io.buffer_addr) + 1.U\n        }\n      }.otherwise {\n        when (state_bank3(io.buffer_addr) =/= 3.U) {\n          state_bank3(io.buffer_addr) := state_bank3(io.buffer_addr) + 1.U\n        }\n      }\n    }.otherwise { // Branch was not taken - decrement\n      when (io.buffer_offset === 0.U) {\n        when (state_bank0(io.buffer_addr) =/= 0.U) {\n          state_bank0(io.buffer_addr) := state_bank0(io.buffer_addr) - 1.U\n        }\n      }.elsewhen (io.buffer_offset === 1.U) {\n        when (state_bank1(io.buffer_addr) =/= 0.U) {\n          state_bank1(io.buffer_addr) := state_bank1(io.buffer_addr) - 1.U\n        }\n      }.elsewhen (io.buffer_offset === 2.U) {\n        when (state_bank2(io.buffer_addr) =/= 0.U) {\n          state_bank2(io.buffer_addr) := state_bank2(io.buffer_addr) - 1.U\n        }\n      }.otherwise {\n        when (state_bank3(io.buffer_addr) =/= 0.U) {\n          state_bank3(io.buffer_addr) := state_bank3(io.buffer_addr) - 1.U\n        }\n      }\n    }\n  }\n\n  // Connect prediction to output\n  io.prediction := prediction\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new branchPredictionBuffer(), args)\n}",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/bpbs.scala",
+                "original_chars": 3120,
+                "original_lines": 84,
+                "returned_chars": 3120,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "bpbs.scala"
+              ],
+              "reason": "Read the design source to understand the branch prediction buffer module structure and signals"
+            },
+            "id": "call_00_cEIt5MTr9JQHURx4R8Tt2830",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 1
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\n\nclass branchPredictionBuffer(PRED_BUFFER_SIZE: Int = 4) extends Module {\n  val io = IO(new Bundle {\n    val stall = Input(Bool())\n    val inst_addr = Input(UInt(2.W))\n    val update = Input(Bool())\n    val branch_result = Input(Bool())\n    val buffer_addr = Input(UInt(2.W))\n    val buffer_offset = Input(UInt(2.W))\n    val prediction = Output(UInt(4.W))\n  })\n\n  // State banks - 2-bit saturating counters for each entry\n  // Initialize to weak not taken (01)\n  val state_bank0 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank1 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank2 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank3 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n\n  // Prediction register\n  val prediction = RegInit(0.U(4.W))\n\n  // Prediction logic - read from all 4 banks when not stalled\n  when (!io.stall) {\n    // Construct the entire 4-bit prediction value at once\n    val pred3 = Mux(state_bank3(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred2 = Mux(state_bank2(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred1 = Mux(state_bank1(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred0 = Mux(state_bank0(io.inst_addr) > 1.U, 1.U, 0.U)\n    prediction := Cat(pred3, pred2, pred1, pred0)\n  }\n\n  // Update logic - modify one bank based on buffer_offset\n  when (io.update) {\n    when (io.branch_result) { // Branch was taken - increment\n      when (io.buffer_offset === 0.U) {\n        when (state_bank0(io.buffer_addr) =/= 3.U) {\n          state_bank0(io.buffer_addr) := state_bank0(io.buffer_addr) + 1.U\n        }\n      }.elsewhen (io.buffer_offset === 1.U) {\n        when (state_bank1(io.buffer_addr) =/= 3.U) {\n          state_bank1(io.buffer_addr) := state_bank1(io.buffer_addr) + 1.U\n        }\n      }.elsewhen (io.buffer_offset === 2.U) {\n        when (state_bank2(io.buffer_addr) =/= 3.U) {\n          state_bank2(io.buffer_addr) := state_bank2(io.buffer_addr) + 1.U\n        }\n      }.otherwise {\n        when (state_bank3(io.buffer_addr) =/= 3.U) {\n          state_bank3(io.buffer_addr) := state_bank3(io.buffer_addr) + 1.U\n        }\n      }\n    }.otherwise { // Branch was not taken - decrement\n      when (io.buffer_offset === 0.U) {\n        when (state_bank0(io.buffer_addr) =/= 0.U) {\n          state_bank0(io.buffer_addr) := state_bank0(io.buffer_addr) - 1.U\n        }\n      }.elsewhen (io.buffer_offset === 1.U) {\n        when (state_bank1(io.buffer_addr) =/= 0.U) {\n          state_bank1(io.buffer_addr) := state_bank1(io.buffer_addr) - 1.U\n        }\n      }.elsewhen (io.buffer_offset === 2.U) {\n        when (state_bank2(io.buffer_addr) =/= 0.U) {\n          state_bank2(io.buffer_addr) := state_bank2(io.buffer_addr) - 1.U\n        }\n      }.otherwise {\n        when (state_bank3(io.buffer_addr) =/= 0.U) {\n          state_bank3(io.buffer_addr) := state_bank3(io.buffer_addr) - 1.U\n        }\n      }\n    }\n  }\n\n  // Connect prediction to output\n  io.prediction := prediction\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new branchPredictionBuffer(), args)\n}",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/bpbs.scala",
+                "original_chars": 3120,
+                "original_lines": 84,
+                "returned_chars": 3120,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "bpbs.scala"
+              ],
+              "reason": "Confirm VerilogGenerator targets branchPredictionBuffer and inspect exact code structure"
+            },
+            "id": "call_00_jolbniRPQvtPDJyyTf5m8498",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 2
+      },
+      {
+        "action_results": [
+          {
+            "error": null,
+            "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/bpbs.scala",
+            "success": true,
+            "type": "write_assertions"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\nclass branchPredictionBuffer(PRED_BUFFER_SIZE: Int = 4) extends Module with Formal {\n  val io = IO(new Bundle {\n    val stall = Input(Bool())\n    val inst_addr = Input(UInt(2.W))\n    val update = Input(Bool())\n    val branch_result = Input(Bool())\n    val buffer_addr = Input(UInt(2.W))\n    val buffer_offset = Input(UInt(2.W))\n    val prediction = Output(UInt(4.W))\n  })\n\n  // State banks - 2-bit saturating counters for each entry\n  // Initialize to weak not taken (01)\n  val state_bank0 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank1 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank2 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank3 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n\n  // Prediction register\n  val prediction = RegInit(0.U(4.W))\n\n  // Prediction logic - read from all 4 banks when not stalled\n  when (!io.stall) {\n    // Construct the entire 4-bit prediction value at once\n    val pred3 = Mux(state_bank3(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred2 = Mux(state_bank2(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred1 = Mux(state_bank1(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred0 = Mux(state_bank0(io.inst_addr) > 1.U, 1.U, 0.U)\n    prediction := Cat(pred3, pred2, pred1, pred0)\n  }\n\n  // Update logic - modify one bank based on buffer_offset\n  when (io.update) {\n    when (io.branch_result) { // Branch was taken - increment\n      when (io.buffer_offset === 0.U) {\n        when (state_bank0(io.buffer_addr) =/= 3.U) {\n          state_bank0(io.buffer_addr) := state_bank0(io.buffer_addr) + 1.U\n        }\n      }.elsewhen (io.buffer_offset === 1.U) {\n        when (state_bank1(io.buffer_addr) =/= 3.U) {\n          state_bank1(io.buffer_addr) := state_bank1(io.buffer_addr) + 1.U\n        }\n      }.elsewhen (io.buffer_offset === 2.U) {\n        when (state_bank2(io.buffer_addr) =/= 3.U) {\n          state_bank2(io.buffer_addr) := state_bank2(io.buffer_addr) + 1.U\n        }\n      }.otherwise {\n        when (state_bank3(io.buffer_addr) =/= 3.U) {\n          state_bank3(io.buffer_addr) := state_bank3(io.buffer_addr) + 1.U\n        }\n      }\n    }.otherwise { // Branch was not taken - decrement\n      when (io.buffer_offset === 0.U) {\n        when (state_bank0(io.buffer_addr) =/= 0.U) {\n          state_bank0(io.buffer_addr) := state_bank0(io.buffer_addr) - 1.U\n        }\n      }.elsewhen (io.buffer_offset === 1.U) {\n        when (state_bank1(io.buffer_addr) =/= 0.U) {\n          state_bank1(io.buffer_addr) := state_bank1(io.buffer_addr) - 1.U\n        }\n      }.elsewhen (io.buffer_offset === 2.U) {\n        when (state_bank2(io.buffer_addr) =/= 0.U) {\n          state_bank2(io.buffer_addr) := state_bank2(io.buffer_addr) - 1.U\n        }\n      }.otherwise {\n        when (state_bank3(io.buffer_addr) =/= 0.U) {\n          state_bank3(io.buffer_addr) := state_bank3(io.buffer_addr) - 1.U\n        }\n      }\n    }\n  }\n\n  // Connect prediction to output\n  io.prediction := prediction\n\n  // ================================================================\n  // Formal Verification Assertions\n  // ================================================================\n\n  // --- Safety: Prediction remains stable when stalled ---\n  // When stall is asserted, the prediction register should not be updated.\n  // Simulation is unlikely to exercise all stall-to-update interleavings,\n  // making this a high-value formal check.\n  assertStableWhen(io.stall, io.prediction.asUInt, \"prediction_stable_when_stalled\")\n\n  // --- Safety: Saturating counters stay within valid [0, 3] range ---\n  // Each state bank entry is a 2-bit saturating counter.  The update logic\n  // explicitly guards against wraparound (inhibit increment at 3, decrement at\n  // 0).  These assertions verify that no other unintended path modifies the\n  // counter out of bounds.\n  for (i <- 0 until PRED_BUFFER_SIZE) {\n    fvAssert(state_bank0(i) <= 3.U, s\"state_bank0_${i}_in_range\")\n    fvAssert(state_bank1(i) <= 3.U, s\"state_bank1_${i}_in_range\")\n    fvAssert(state_bank2(i) <= 3.U, s\"state_bank2_${i}_in_range\")\n    fvAssert(state_bank3(i) <= 3.U, s\"state_bank3_${i}_in_range\")\n  }\n\n  // --- Safety: buffer_offset selects at most one bank per cycle ---\n  // The update logic uses mutually exclusive when/elsewhen branches keyed on\n  // buffer_offset === {0,1,2,3}.  This assertion catches a micro-architectural\n  // bug where the decoder could fire multiple banks simultaneously (e.g. due to\n  // an X source, a glitch on a wide bus, or an unintended overlap in the\n  // comparison logic).\n  assertMutex(Seq(\n    io.buffer_offset === 0.U,\n    io.buffer_offset === 1.U,\n    io.buffer_offset === 2.U,\n    io.buffer_offset === 3.U\n  ), \"buffer_offset_mutex\")\n\n  // --- Liveness: Update request is serviced within a bounded number of cycles ---\n  // When an update is requested and the system is not stalled, the prediction\n  // output must change within 2 cycles to reflect the updated saturating-counter\n  // state.  The relaxation accounts for the fact that the prediction register is\n  // frozen while stalled; here we tie the request to !stall so that if stall\n  // holds the response is vacuously satisfied.  The bound of 2 covers the\n  // following pipeline: cycle 0 update arrives and state banks change\n  // combinatorially; cycle 1 (non-stalled) prediction register captures the new\n  // state.  An extra cycle of slack handles a stall that clears on the\n  // following cycle.\n  astRelaxedLiveness(\n    io.update && !io.stall,\n    io.prediction =/= RegNext(io.prediction),\n    2,\n    \"prediction_updates_after_update\"\n  )\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new branchPredictionBuffer(), args)\n}\n",
+              "file_path": "bpbs.scala",
+              "stage_complete": true
+            },
+            "id": "call_00_x2xO75AyXHAoZPQa5FrQ1542",
+            "name": "write_assertions"
+          }
+        ],
+        "iteration": 3
+      }
+    ],
+    "root_cause": null,
+    "success": true,
+    "summary": "",
+    "verification_passed": true
+  },
+  "success": true
+}

@@ -1,0 +1,1 @@
+Round 1/3 fix v3: Removed the fvAssume line which wasn't supported. Fixed cnt_stays_zero_in_mode1 by changing from !(mode===1 && cnt===0) || RegNext(cnt)===0 (past-looking) to !RegNext(mode===1 && cnt===0) || cnt===0 (forward-looking: if cnt was 0 in mode 1 last cycle, it's 0 this cycle). Restored original liveness antecedent unchanged.

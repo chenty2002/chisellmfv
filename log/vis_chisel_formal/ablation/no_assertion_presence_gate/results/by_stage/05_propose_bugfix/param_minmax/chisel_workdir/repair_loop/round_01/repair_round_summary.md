@@ -1,0 +1,1 @@
+Repair round 1/3 (revised): Fixed compilation error - hasBeenReset not found in this Chisel version. Replaced with initDone = RegNext(true.B, false.B) which serves the same purpose: a one-cycle-delayed flag that ensures $past() and RegNext() values are well-defined before the assertion fires. Assertion label 'last_stores_previous_in' preserved. No homologous assertions.

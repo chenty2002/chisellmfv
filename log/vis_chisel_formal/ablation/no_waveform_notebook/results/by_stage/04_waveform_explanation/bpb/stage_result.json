@@ -1,0 +1,2442 @@
+{
+  "ablation_modes": [
+    "no_waveform_notebook"
+  ],
+  "original_query": "Analyze the counterexample waveform to identify the bug. Trace signal values and identify the root cause. Use the causal analysis report as prior evidence when available.",
+  "stage": "waveform_explanation",
+  "stage_result": {
+    "counterexample_path": null,
+    "error_type": "dut_bug",
+    "files_modified": [],
+    "iterations": [
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\nclass branchPredictionBuffer(PRED_BUFFER_SIZE: Int = 4) extends Module with Formal {\n  val io = IO(new Bundle {\n    val stall = Input(Bool())\n    val inst_addr = Input(UInt(2.W))\n    val update = Input(Bool())\n    val branch_result = Input(Bool())\n    val buffer_addr = Input(UInt(2.W))\n    val buffer_offset = Input(UInt(2.W))\n    val prediction = Output(UInt(4.W))\n  })\n\n  // State banks - 2-bit saturating counters for each entry\n  // Initialize to weak not taken (01)\n  val state_bank0 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank1 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank2 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n  val state_bank3 = RegInit(VecInit(Seq.fill(PRED_BUFFER_SIZE)(1.U(2.W))))\n\n  // Prediction register\n  val prediction = RegInit(0.U(4.W))\n\n  // Prediction logic - read from all 4 banks when not stalled\n  when (!io.stall) {\n    // Construct the entire 4-bit prediction value at once\n    val pred3 = Mux(state_bank3(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred2 = Mux(state_bank2(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred1 = Mux(state_bank1(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred0 = Mux(state_bank0(io.inst_addr) > 1.U, 1.U, 0.U)\n    prediction := Cat(pred3, pred2, pred1, pred0)\n  }\n\n  // Update logic - modify one bank based on buffer_offset\n  when (io.update) {\n    when (io.branch_result) { // Branch was taken - increment\n      when (io.buffer_offset === 0.U) {\n        when (state_bank0(io.buffer_addr) =/= 3.U) {\n          state_bank0(io.buffer_addr) := state_bank0(io.buffer_addr) + 1.U\n        }\n      }.elsewhen (io.buffer_offset === 1.U) {\n        when (state_bank1(io.buffer_addr) =/= 3.U) {\n          state_bank1(io.buffer_addr) := state_bank1(io.buffer_addr) + 1.U\n        }\n      }.elsewhen (io.buffer_offset === 2.U) {\n        when (state_bank2(io.buffer_addr) =/= 3.U) {\n          state_bank2(io.buffer_addr) := state_bank2(io.buffer_addr) + 1.U\n        }\n      }.otherwise {\n        when (state_bank3(io.buffer_addr) =/= 3.U) {\n          state_bank3(io.buffer_addr) := state_bank3(io.buffer_addr) + 1.U\n        }\n      }\n    }.otherwise { // Branch was not taken - decrement\n      when (io.buffer_offset === 0.U) {\n        when (state_bank0(io.buffer_addr) =/= 0.U) {\n          state_bank0(io.buffer_addr) := state_bank0(io.buffer_addr) - 1.U\n        }\n      }.elsewhen (io.buffer_offset === 1.U) {\n        when (state_bank1(io.buffer_addr) =/= 0.U) {\n          state_bank1(io.buffer_addr) := state_bank1(io.buffer_addr) - 1.U\n        }\n      }.elsewhen (io.buffer_offset === 2.U) {\n        when (state_bank2(io.buffer_addr) =/= 0.U) {\n          state_bank2(io.buffer_addr) := state_bank2(io.buffer_addr) - 1.U\n        }\n      }.otherwise {\n        when (state_bank3(io.buffer_addr) =/= 0.U) {\n          state_bank3(io.buffer_addr) := state_bank3(io.buffer_addr) - 1.U\n        }\n      }\n    }\n  }\n\n  // Connect prediction to output\n  io.prediction := prediction\n\n  // ============ FORMAL ASSERTIONS ============\n\n  // -------------------------------------------------------\n  // 1. STALL INVARIANT: When stalled, prediction must hold stable\n  //    Critical: if prediction changes during a stall, the pipeline\n  //    could use incorrect branch direction speculation.\n  // -------------------------------------------------------\n  assertStableWhen(io.stall, prediction.asUInt, \"stall_preserves_prediction\")\n\n  // -------------------------------------------------------\n  // 2. SATURATING COUNTER BOUNDS: All state entries must stay\n  //    within the valid 2-bit saturating range [0, 3].\n  //    Catches off-by-one bugs where increment-at-3 or decrement-at-0\n  //    wraps around instead of saturating.\n  // -------------------------------------------------------\n  for (i <- 0 until PRED_BUFFER_SIZE) {\n    fvAssert(state_bank0(i) <= 3.U, s\"bank0_entry_${i}_within_bounds\")\n    fvAssert(state_bank1(i) <= 3.U, s\"bank1_entry_${i}_within_bounds\")\n    fvAssert(state_bank2(i) <= 3.U, s\"bank2_entry_${i}_within_bounds\")\n    fvAssert(state_bank3(i) <= 3.U, s\"bank3_entry_${i}_within_bounds\")\n  }\n\n  // -------------------------------------------------------\n  // 3. BANK ISOLATION: When updating one bank, the other three\n  //    banks at the same buffer address must NOT change state.\n  //    Catches bugs where update bleeds into adjacent banks.\n  // -------------------------------------------------------\n  assertStableWhen(!(io.update && io.buffer_offset === 0.U), state_bank0(io.buffer_addr).asUInt, \"bank0_stable_except_when_selected\")\n  assertStableWhen(!(io.update && io.buffer_offset === 1.U), state_bank1(io.buffer_addr).asUInt, \"bank1_stable_except_when_selected\")\n  assertStableWhen(!(io.update && io.buffer_offset === 2.U), state_bank2(io.buffer_addr).asUInt, \"bank2_stable_except_when_selected\")\n  assertStableWhen(!(io.update && io.buffer_offset === 3.U), state_bank3(io.buffer_addr).asUInt, \"bank3_stable_except_when_selected\")\n\n  // -------------------------------------------------------\n  // 4. SATURATING UPDATE CORRECTNESS (INCREMENT):\n  //    When updating with branch_result=true (taken), the targeted\n  //    counter must not wrap from 3 to 0. I.e., if the counter\n  //    was already 3, it stays at 3 after the increment attempt.\n  //    Check: after an increment update, the value is never 0\n  //    unless it was already 0 and somehow... actually the simpler\n  //    check: when update=true & branch_result=true & counter=3,\n  //    the counter must remain 3 (no wraparound).\n  // -------------------------------------------------------\n  // When counter is at max (3) and an increment update targets it,\n  // it must stay at 3 (saturating, not wrapping to 0).\n  fvAssert(\n    !(io.update && io.branch_result && io.buffer_offset === 0.U && state_bank0(io.buffer_addr) === 3.U) ||\n    state_bank0(io.buffer_addr) === 3.U,\n    \"bank0_saturating_increment_no_wrap\"\n  )\n  fvAssert(\n    !(io.update && io.branch_result && io.buffer_offset === 1.U && state_bank1(io.buffer_addr) === 3.U) ||\n    state_bank1(io.buffer_addr) === 3.U,\n    \"bank1_saturating_increment_no_wrap\"\n  )\n  fvAssert(\n    !(io.update && io.branch_result && io.buffer_offset === 2.U && state_bank2(io.buffer_addr) === 3.U) ||\n    state_bank2(io.buffer_addr) === 3.U,\n    \"bank2_saturating_increment_no_wrap\"\n  )\n  fvAssert(\n    !(io.update && io.branch_result && io.buffer_offset === 3.U && state_bank3(io.buffer_addr) === 3.U) ||\n    state_bank3(io.buffer_addr) === 3.U,\n    \"bank3_saturating_increment_no_wrap\"\n  )\n\n  // -------------------------------------------------------\n  // 5. SATURATING UPDATE CORRECTNESS (DECREMENT):\n  //    When updating with branch_result=false (not taken), the\n  //    targeted counter must not wrap from 0 to 3. If the counter\n  //    was already 0, it stays at 0 after the decrement attempt.\n  // -------------------------------------------------------\n  fvAssert(\n    !(io.update && !io.branch_result && io.buffer_offset === 0.U && state_bank0(io.buffer_addr) === 0.U) ||\n    state_bank0(io.buffer_addr) === 0.U,\n    \"bank0_saturating_decrement_no_wrap\"\n  )\n  fvAssert(\n    !(io.update && !io.branch_result && io.buffer_offset === 1.U && state_bank1(io.buffer_addr) === 0.U) ||\n    state_bank1(io.buffer_addr) === 0.U,\n    \"bank1_saturating_decrement_no_wrap\"\n  )\n  fvAssert(\n    !(io.update && !io.branch_result && io.buffer_offset === 2.U && state_bank2(io.buffer_addr) === 0.U) ||\n    state_bank2(io.buffer_addr) === 0.U,\n    \"bank2_saturating_decrement_no_wrap\"\n  )\n  fvAssert(\n    !(io.update && !io.branch_result && io.buffer_offset === 3.U && state_bank3(io.buffer_addr) === 0.U) ||\n    state_bank3(io.buffer_addr) === 0.U,\n    \"bank3_saturating_decrement_no_wrap\"\n  )\n\n  // -------------------------------------------------------\n  // 6. BOUNDED LIVENESS: The prediction register updates\n  //    within a bounded number of cycles after a stall ends.\n  //    If not stalled, the prediction will reflect the current\n  //    state banks within 2 cycles (1 cycle for read + register).\n  //    This catches deadlocks where the prediction freezes\n  //    indefinitely despite not being stalled.\n  // -------------------------------------------------------\n  astRelaxedLiveness(\n    !io.stall,           // request: not stalled (should be able to update prediction)\n    io.prediction =/= prediction,  // response: prediction value changes (progress)\n    5,                   // bound: within 5 cycles\n    \"prediction_progress_when_not_stalled\"\n  )\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new branchPredictionBuffer(), args)\n}\n",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/bpb/bpbs.scala",
+                "original_chars": 8662,
+                "original_lines": 193,
+                "returned_chars": 8662,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          },
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "bpbs.scala"
+              ],
+              "reason": "Read the source code to understand the design and find the assertion"
+            },
+            "id": "call_00_apQtlDRO80dWoSHpJ1AG1392",
+            "name": "read_files"
+          },
+          {
+            "arguments": {
+              "max_results": 100,
+              "pattern": "*"
+            },
+            "id": "call_01_X7GO6p2RdK1tM11CzbIq7020",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 1
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": null,
+                "error": "Error reading file: File does not exist: log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/bpb/generated/branchPredictionBuffer.v",
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/bpb/generated/branchPredictionBuffer.v",
+                "success": false
+              }
+            ],
+            "success": false,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "chisel/extra_bench/bpb/generated/branchPredictionBuffer.v"
+              ],
+              "reason": "Read generated Verilog to understand signal naming"
+            },
+            "id": "call_00_uJoHn3ZbDfepuitgMYmA4627",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 2
+      },
+      {
+        "action_results": [
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 200,
+              "pattern": "*"
+            },
+            "id": "call_00_075DDFkh3Oh2qBgrDXc72277",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 3
+      },
+      {
+        "action_results": [
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 100,
+              "pattern": "branchPredictionBuffer*"
+            },
+            "id": "call_00_XzNRcAbESARNF1Ya6CTp1191",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 4
+      },
+      {
+        "action_results": [
+          {
+            "active_signals": [
+              {
+                "length": 32,
+                "name": "branchPredictionBuffer.resetCounter.timeSinceReset [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.resetCounter.notChaos",
+                "value": "1"
+              },
+              {
+                "length": 32,
+                "name": "branchPredictionBuffer.resetCounter.count [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.resetCounter.flag",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.resetCounter.clk",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.io_update",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.io_branch_result",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.io_buffer_addr [1:0]",
+                "value": "11"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.io_buffer_offset [1:0]",
+                "value": "11"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._resetCounter_notChaos",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_0 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_0 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_0 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_0 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[3] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[0] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[3] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[0] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[3] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[0] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[3] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[0] [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.hasBeenResetReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.hasBeenReset",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_4 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._GEN_6",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.pending",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.nextPending",
+                "value": "1"
+              },
+              {
+                "length": 3,
+                "name": "branchPredictionBuffer._nextTimer_T_2 [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._GEN_8",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._GEN_11",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._GEN_12",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank0_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank1_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank2_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank3_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.stall_preserves_prediction",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.:jasper_formal_clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.clock",
+                "value": "1"
+              }
+            ],
+            "count": 62,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 200,
+              "time": 10
+            },
+            "id": "call_00_RP7o1X5xOfs0VamuNaMY4757",
+            "name": "waveform_get_active_signals"
+          }
+        ],
+        "iteration": 5
+      },
+      {
+        "action_results": [
+          {
+            "count": 1,
+            "signals": [
+              {
+                "handle": 9,
+                "length": 1,
+                "name": "branchPredictionBuffer.io_stall"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 1,
+            "signals": [
+              {
+                "handle": 33,
+                "length": 4,
+                "name": "branchPredictionBuffer.prediction [3:0]"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 1,
+            "signals": [
+              {
+                "handle": 15,
+                "length": 4,
+                "name": "branchPredictionBuffer.io_prediction [3:0]"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 10,
+              "pattern": "branchPredictionBuffer.io_stall"
+            },
+            "id": "call_00_Ve5lw9O7foSUM4Vt3R068113",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "max_results": 10,
+              "pattern": "branchPredictionBuffer.prediction"
+            },
+            "id": "call_01_ZakvylvWsFJPLh5XqDAs1720",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "max_results": 10,
+              "pattern": "branchPredictionBuffer.io_prediction"
+            },
+            "id": "call_02_esqxwwOCR9CnXlJ8qToU7414",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 6
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 20,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "branchPredictionBuffer.io_stall",
+            "signal_name": "branchPredictionBuffer.io_stall",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0000"
+              },
+              {
+                "time": 20,
+                "value": "0001"
+              }
+            ],
+            "length": 4,
+            "resolved_name": "branchPredictionBuffer.prediction [3:0]",
+            "signal_name": "branchPredictionBuffer.prediction [3:0]",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0000"
+              },
+              {
+                "time": 20,
+                "value": "0001"
+              }
+            ],
+            "length": 4,
+            "resolved_name": "branchPredictionBuffer.io_prediction [3:0]",
+            "signal_name": "branchPredictionBuffer.io_prediction [3:0]",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.io_stall",
+              "start_time": 0
+            },
+            "id": "call_00_2p6SQq0W9iuxc6lUPgNb6624",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.prediction [3:0]",
+              "start_time": 0
+            },
+            "id": "call_01_gD9h8bi1eBa87T1QNRf23035",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.io_prediction [3:0]",
+              "start_time": 0
+            },
+            "id": "call_02_lzW3ioqrukOGmvQ9enug8041",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 7
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 5,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "time": 15,
+                "value": "0"
+              },
+              {
+                "time": 20,
+                "value": "1"
+              },
+              {
+                "time": 25,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "branchPredictionBuffer.clock",
+            "signal_name": "branchPredictionBuffer.clock",
+            "success": true,
+            "total_changes": 6,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "count": 3,
+            "failed_count": 0,
+            "resolved_count": 3,
+            "results": [
+              {
+                "signal_name": "branchPredictionBuffer.io_stall",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.io_stall",
+                "time": 10,
+                "value": "0"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.io_stall",
+                "time": 20,
+                "value": "1"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 3,
+            "failed_count": 0,
+            "resolved_count": 3,
+            "results": [
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 0,
+                "value": "0000"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 10,
+                "value": "0000"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 20,
+                "value": "0001"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.clock",
+              "start_time": 0
+            },
+            "id": "call_00_pwxTsKxTO9ZGCHl89t5w4378",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "branchPredictionBuffer.io_stall",
+                "branchPredictionBuffer.io_stall",
+                "branchPredictionBuffer.io_stall"
+              ],
+              "times": [
+                0,
+                10,
+                20
+              ]
+            },
+            "id": "call_01_7YQnuLBlpTcChsHzL1Q35843",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "branchPredictionBuffer.prediction [3:0]",
+                "branchPredictionBuffer.prediction [3:0]",
+                "branchPredictionBuffer.prediction [3:0]"
+              ],
+              "times": [
+                0,
+                10,
+                20
+              ]
+            },
+            "id": "call_02_5ICU0Q3MSNUu5FPpwI808084",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 8
+      },
+      {
+        "action_results": [
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "branchPredictionBuffer.io_stall",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.io_stall",
+                "time": 10,
+                "value": "0"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.io_stall",
+                "time": 19,
+                "value": "0"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.io_stall",
+                "time": 20,
+                "value": "1"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 0,
+                "value": "0000"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 10,
+                "value": "0000"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 19,
+                "value": "0000"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 20,
+                "value": "0001"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "branchPredictionBuffer.io_stall",
+                "branchPredictionBuffer.io_stall",
+                "branchPredictionBuffer.io_stall",
+                "branchPredictionBuffer.io_stall"
+              ],
+              "times": [
+                0,
+                10,
+                19,
+                20
+              ]
+            },
+            "id": "call_00_siTviT6S69rl7QEiSQ4D9936",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "branchPredictionBuffer.prediction [3:0]",
+                "branchPredictionBuffer.prediction [3:0]",
+                "branchPredictionBuffer.prediction [3:0]",
+                "branchPredictionBuffer.prediction [3:0]"
+              ],
+              "times": [
+                0,
+                10,
+                19,
+                20
+              ]
+            },
+            "id": "call_01_IB8wQWbdj7Jno2x8CGId4856",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 9
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 20,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "branchPredictionBuffer.stall_preserves_prediction",
+            "signal_name": "branchPredictionBuffer.stall_preserves_prediction",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.stall_preserves_prediction",
+              "start_time": 0
+            },
+            "id": "call_00_y2MYXgT9ExZZx62Zyg5q0567",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 10
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "branchPredictionBuffer.io_update",
+            "signal_name": "branchPredictionBuffer.io_update",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.io_inst_addr [1:0]",
+            "signal_name": "branchPredictionBuffer.io_inst_addr [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 10,
+                "value": "11"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.io_buffer_addr [1:0]",
+            "signal_name": "branchPredictionBuffer.io_buffer_addr [1:0]",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 10,
+                "value": "11"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.io_buffer_offset [1:0]",
+            "signal_name": "branchPredictionBuffer.io_buffer_offset [1:0]",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "branchPredictionBuffer.io_branch_result",
+            "signal_name": "branchPredictionBuffer.io_branch_result",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.io_update",
+              "start_time": 0
+            },
+            "id": "call_00_80vS0sbTqkOqGGRW950w1827",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.io_inst_addr [1:0]",
+              "start_time": 0
+            },
+            "id": "call_01_duQpvbt4BzEzjeReGNfT4778",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.io_buffer_addr [1:0]",
+              "start_time": 0
+            },
+            "id": "call_02_3xJNkzURmAOghvglB0od3592",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.io_buffer_offset [1:0]",
+              "start_time": 0
+            },
+            "id": "call_03_AiU97FqvrwIbFJRZvQkb8793",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.io_branch_result",
+              "start_time": 0
+            },
+            "id": "call_04_iCrRZsRwFnHJXWvmFPJ92537",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 11
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              },
+              {
+                "time": 10,
+                "value": "10"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank0_0 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank0_0 [1:0]",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank0_1 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank0_1 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank0_2 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank0_2 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank0_3 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank0_3 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank0_0 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_00_7BDDeQQt1Haq7PMYVWiy8809",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank0_1 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_01_k5d7Wu8Ncc1usOxwp4sd2113",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank0_2 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_02_WxCeR4S50H7aWkko0UsZ2732",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank0_3 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_03_9tzkJWfb9f3ncX6KE40d8886",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 12
+      },
+      {
+        "action_results": [
+          {
+            "error": "Causal analysis JSON is not available for this waveform",
+            "success": false,
+            "type": "causal_get_roots"
+          },
+          {
+            "active_signals": [
+              {
+                "length": 32,
+                "name": "branchPredictionBuffer.resetCounter.timeSinceReset [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.resetCounter.notChaos",
+                "value": "1"
+              },
+              {
+                "length": 32,
+                "name": "branchPredictionBuffer.resetCounter.count [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.resetCounter.flag",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.resetCounter.clk",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.io_update",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.io_branch_result",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.io_buffer_addr [1:0]",
+                "value": "11"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.io_buffer_offset [1:0]",
+                "value": "11"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._resetCounter_notChaos",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_0 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_0 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_0 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_0 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[3] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[0] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[3] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[0] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[3] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[0] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[3] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[0] [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.hasBeenResetReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.hasBeenReset",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_4 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._GEN_6",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.pending",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.nextPending",
+                "value": "1"
+              },
+              {
+                "length": 3,
+                "name": "branchPredictionBuffer._nextTimer_T_2 [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._GEN_8",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._GEN_11",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._GEN_12",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank0_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank1_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank2_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank3_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.stall_preserves_prediction",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.:jasper_formal_clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.clock",
+                "value": "1"
+              }
+            ],
+            "count": 62,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "limit": 10
+            },
+            "id": "call_00_9OKTFz5gOaFY28wFtazB7873",
+            "name": "causal_get_roots"
+          },
+          {
+            "arguments": {
+              "max_results": 100,
+              "time": 10
+            },
+            "id": "call_01_KBPc08As91kq6UORG5vU8505",
+            "name": "waveform_get_active_signals"
+          }
+        ],
+        "iteration": 13
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank1_0 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank1_0 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank1_1 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank1_1 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank1_2 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank1_2 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank1_3 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank1_3 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank2_0 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank2_0 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank2_1 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank2_1 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank2_2 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank2_2 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank2_3 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank2_3 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank3_0 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank3_0 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank3_1 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank3_1 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank3_2 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank3_2 [1:0]",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              },
+              {
+                "time": 20,
+                "value": "10"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "branchPredictionBuffer.state_bank3_3 [1:0]",
+            "signal_name": "branchPredictionBuffer.state_bank3_3 [1:0]",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank1_0 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_00_Oy9i5j05nYa5hYwnHi0O8300",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank1_1 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_01_wRSunnq4WkDACUqtDHRt5456",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank1_2 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_02_1kzDhxCoXCPWfb7WY8Na8889",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank1_3 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_03_8Oqbqf11Xf4Cik78W4Kd4786",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank2_0 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_04_Op2NxvjkVrMxzG9UosEQ6320",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank2_1 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_05_TmcfsfsnTZZzm4kHTcle5438",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank2_2 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_06_rBYoYr5A2O35UdvHIJJL6353",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank2_3 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_07_PELLo6mc0E1rBQotqjOd6353",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank3_0 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_08_TuHHZbjdRulis9cYxgqM6824",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank3_1 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_09_6xTFUuJdMYvePDjpEF5V4471",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank3_2 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_10_vWvW3VCh3TjNnfW0UXBD9171",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "branchPredictionBuffer.state_bank3_3 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_11_vXEkIkZ3GES4MTZZYZWZ8831",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 14
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": null,
+                "error": "Error reading file: File does not exist: log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/bpb/verilog/extra_bench/bpb/branchPredictionBuffer.v",
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/bpb/verilog/extra_bench/bpb/branchPredictionBuffer.v",
+                "success": false
+              }
+            ],
+            "success": false,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "chisel/extra_bench/bpb/verilog/extra_bench/bpb/branchPredictionBuffer.v"
+              ],
+              "reason": "Read generated Verilog to understand prediction register implementation"
+            },
+            "id": "call_00_UVykDthyGKcqTJHIoTH03090",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 15
+      },
+      {
+        "action_results": [
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 50,
+              "pattern": "branchPredictionBuffer._GEN*"
+            },
+            "id": "call_00_ESSNj2O1tOT301cQ1iuG8683",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 16
+      },
+      {
+        "action_results": [
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 100,
+              "pattern": "branchPredictionBuffer.*"
+            },
+            "id": "call_00_oOmCQ0Kz0THilEGotuGW6010",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 17
+      },
+      {
+        "action_results": [
+          {
+            "active_signals": [
+              {
+                "length": 32,
+                "name": "branchPredictionBuffer.resetCounter.timeSinceReset [31:0]",
+                "value": "00000000000000000000000000000010"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.resetCounter.notChaos",
+                "value": "1"
+              },
+              {
+                "length": 32,
+                "name": "branchPredictionBuffer.resetCounter.count [31:0]",
+                "value": "00000000000000000000000000000010"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.resetCounter.flag",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.resetCounter.clk",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.io_stall",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.io_update",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.io_branch_result",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.io_buffer_addr [1:0]",
+                "value": "11"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.io_buffer_offset [1:0]",
+                "value": "11"
+              },
+              {
+                "length": 4,
+                "name": "branchPredictionBuffer.io_prediction [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._resetCounter_notChaos",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_0 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank0_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_0 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank1_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_0 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank2_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_0 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.state_bank3_3 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 4,
+                "name": "branchPredictionBuffer.prediction [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[3] [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN[0] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[3] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_0[0] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[3] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_1[0] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[3] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[2] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[1] [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._GEN_2[0] [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.hasBeenResetReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.hasBeenReset",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_2 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer.r_4 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer._GEN_6",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.pending",
+                "value": "1"
+              },
+              {
+                "length": 3,
+                "name": "branchPredictionBuffer.timer [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.nextPending",
+                "value": "1"
+              },
+              {
+                "length": 3,
+                "name": "branchPredictionBuffer._nextTimer_T_2 [2:0]",
+                "value": "010"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank0_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank1_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank2_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "branchPredictionBuffer._state_bank3_T [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.:jasper_formal_clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "branchPredictionBuffer.clock",
+                "value": "1"
+              }
+            ],
+            "count": 62,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 100,
+              "time": 20
+            },
+            "id": "call_00_b5i64RfFa2WDb9covyVP7558",
+            "name": "waveform_get_active_signals"
+          }
+        ],
+        "iteration": 18
+      },
+      {
+        "action_results": [
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 0,
+                "value": "0000"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.io_prediction [3:0]",
+                "time": 0,
+                "value": "0000"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 10,
+                "value": "0000"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.io_prediction [3:0]",
+                "time": 10,
+                "value": "0000"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 2,
+            "failed_count": 0,
+            "resolved_count": 2,
+            "results": [
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 30,
+                "value": "0001"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.io_prediction [3:0]",
+                "time": 30,
+                "value": "0001"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "branchPredictionBuffer.prediction [3:0]",
+                "branchPredictionBuffer.io_prediction [3:0]",
+                "branchPredictionBuffer.prediction [3:0]",
+                "branchPredictionBuffer.io_prediction [3:0]"
+              ],
+              "times": [
+                0,
+                0,
+                10,
+                10
+              ]
+            },
+            "id": "call_00_qNFiuLY67Zcu4SDWJibd6133",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "branchPredictionBuffer.prediction [3:0]",
+                "branchPredictionBuffer.io_prediction [3:0]"
+              ],
+              "times": [
+                30,
+                30
+              ]
+            },
+            "id": "call_01_E4em0luMGnCOJdjYH6mu3971",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 19
+      },
+      {
+        "action_results": [
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "branchPredictionBuffer.io_stall",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.io_stall",
+                "time": 10,
+                "value": "0"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.io_stall",
+                "time": 20,
+                "value": "1"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.io_stall",
+                "time": 30,
+                "value": "1"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 4,
+            "failed_count": 0,
+            "resolved_count": 4,
+            "results": [
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 0,
+                "value": "0000"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 10,
+                "value": "0000"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 20,
+                "value": "0001"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.prediction [3:0]",
+                "time": 30,
+                "value": "0001"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          },
+          {
+            "count": 3,
+            "failed_count": 0,
+            "resolved_count": 3,
+            "results": [
+              {
+                "signal_name": "branchPredictionBuffer.state_bank0_0 [1:0]",
+                "time": 0,
+                "value": "01"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.state_bank0_0 [1:0]",
+                "time": 10,
+                "value": "10"
+              },
+              {
+                "signal_name": "branchPredictionBuffer.state_bank0_0 [1:0]",
+                "time": 20,
+                "value": "10"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "signal_names": [
+                "branchPredictionBuffer.io_stall",
+                "branchPredictionBuffer.io_stall",
+                "branchPredictionBuffer.io_stall",
+                "branchPredictionBuffer.io_stall"
+              ],
+              "times": [
+                0,
+                10,
+                20,
+                30
+              ]
+            },
+            "id": "call_00_33A3aqvJGEXjV5BuDaNg3921",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "branchPredictionBuffer.prediction [3:0]",
+                "branchPredictionBuffer.prediction [3:0]",
+                "branchPredictionBuffer.prediction [3:0]",
+                "branchPredictionBuffer.prediction [3:0]"
+              ],
+              "times": [
+                0,
+                10,
+                20,
+                30
+              ]
+            },
+            "id": "call_01_YZ0aNadsHNB0XLPcnr1i9575",
+            "name": "waveform_get_signal_value"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "branchPredictionBuffer.state_bank0_0 [1:0]",
+                "branchPredictionBuffer.state_bank0_0 [1:0]",
+                "branchPredictionBuffer.state_bank0_0 [1:0]"
+              ],
+              "times": [
+                0,
+                10,
+                20
+              ]
+            },
+            "id": "call_02_5fGi2OcOEcS4kmwK91Re0099",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 20
+      },
+      {
+        "action_results": [
+          {
+            "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_waveform_notebook/workspace/chisel/extra_bench/bpb/counterexample_analysis.md",
+            "success": true,
+            "type": "write_report"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "content": "# Counterexample Analysis Report: `stall_preserves_prediction`\n\n## 1. Verification Environment\n\n- **Top Module**: `branchPredictionBuffer` (Chisel)\n- **File**: `bpbs.scala` (package `llmverify`)\n- **Writable Directory**: `chisel/extra_bench/bpb/`\n- **Waveform File**: `verilog/extra_bench/bpb/branchPredictionBuffer.stall_preserves_prediction.fst`\n- **Design Description**: A branch prediction buffer with 4 state banks (bank0–bank3), each with 4 entries of 2-bit saturating counters (PRED_BUFFER_SIZE=4). It provides a 4-bit prediction output (one bit per bank) and supports updates via `io.update`, `io.branch_result`, `io.buffer_addr`, and `io.buffer_offset`. The pipeline can be stalled via `io.stall`.\n\n## 2. Violated Assertion\n\n- **Assertion Name**: `stall_preserves_prediction`\n- **File**: `bpbs.scala`, line 181\n- **Code Snippet**:\n  ```scala\n  assertStableWhen(io.stall, prediction.asUInt, \"stall_preserves_prediction\")\n  ```\n- **Natural Language Description**: When the pipeline stall signal (`io.stall`) is asserted high, the `prediction` register must remain stable (not change value). This ensures that during a pipeline stall, the branch predictor's output stays consistent and the pipeline does not use incorrect branch speculation.\n\n## 3. Waveform Information\n\n- **Waveform File**: `verilog/extra_bench/bpb/branchPredictionBuffer.stall_preserves_prediction.fst`\n- **Clock Period**: 10 ns (rising edges at 0, 10, 20, 30 ns)\n- **Time Range**: 0 ns → 30 ns (3 clock cycles)\n- **Key Time Points**:\n  - **t=0 ns** (cycle 0, posedge): Reset state. `io_stall=0`, `prediction=0000`, `io_inst_addr=00`, `state_bank0(0)=01` (weak not taken). Update occurs on bank0, offset=0, addr=0.\n  - **t=10 ns** (cycle 1, posedge): `io_stall=0`. `state_bank0(0)` updated to `10` (weak taken). Prediction computation yields `0001`, scheduled for next cycle. Update on bank3, offset=3, addr=3.\n  - **t=20 ns** (cycle 2, posedge): **Failure point!** `io_stall` transitions **0→1**, `prediction` transitions **0000→0001**. The assertion `stall_preserves_prediction` drops from 1 to 0.\n  - **t=30 ns** (cycle 3): `io_stall=1`, `prediction=0001` (stable after the failure).\n\n## 4. Root Cause Analysis\n\n### Bug Location\n\n- **File**: `bpbs.scala`\n- **Module**: `branchPredictionBuffer` (class declaration line 7)\n- **Buggy Code**: Lines 34–42\n  ```scala\n  val prediction = RegInit(0.U(4.W))\n\n  // Prediction logic - read from all 4 banks when not stalled\n  when (!io.stall) {\n    val pred3 = Mux(state_bank3(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred2 = Mux(state_bank2(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred1 = Mux(state_bank1(io.inst_addr) > 1.U, 1.U, 0.U)\n    val pred0 = Mux(state_bank0(io.inst_addr) > 1.U, 1.U, 0.U)\n    prediction := Cat(pred3, pred2, pred1, pred0)\n  }\n  ```\n\n### Bug Description\n\nThe `prediction` register is guarded by `when (!io.stall)`, which should prevent updates when the pipeline is stalled. However, due to the register's pipeline timing, there is a **one-cycle bubble**: a prediction value computed in a non-stalled cycle (when `!io.stall` was true) takes effect on the *next* clock edge — the very same edge where `io.stall` may be asserted for the first time.\n\n**Sequence of events leading to the failure:**\n\n| Cycle | Posedge | `io_stall` | `prediction` | State Bank Update | What Happens |\n|-------|---------|------------|--------------|-------------------|--------------|\n| 0     | 0 ns    | 0          | 0000         | bank0[0]: 01→10  | Prediction computed as 0000 (all banks at inst_addr=00 are `01`, none >1) |\n| 1     | 10 ns   | 0          | 0000         | bank3[3]: 01→10  | Prediction recomputed: bank0[0]=10 (2) > 1 → pred0=1, others=0 → **Cat(0001)** |\n| 2     | 20 ns   | **1**      | **0001**     | —                | **Assertion violated!** prediction=0001 appears despite io_stall=1 |\n| 3     | 30 ns   | 1          | 0001         | —                | prediction holds stable |\n\n**The critical timing mismatch:**\n1. At t=10 ns (cycle 1), `io_stall=0`, so the `when` block executes and `prediction` is **scheduled** to update to `0001` on the next clock edge. The register's clock enable was sampled as high.\n2. At t=20 ns (cycle 2), the register latches the new value `0001`, BUT `io_stall` also becomes `1` at this same clock edge.\n3. The assertion `assertStableWhen(io.stall, prediction.asUInt)` checks that when `io_stall=1`, `prediction` at cycle 2 equals `prediction` at cycle 1. They differ (`0001 ≠ 0000`), so the assertion fires.\n\n**Root cause category: Bug in the Original Design (DUT bug)**\n\nThe `when (!io.stall)` guard prevents the prediction register from being *enabled* when stall is active, but it does not prevent a previously-computed value (from the last non-stalled cycle) from appearing at the register output on the exact same cycle that stall is first asserted. In other words, there is a **pipeline bubble** where the prediction register updates one cycle after computation, regardless of whether stall went high in the meantime.\n\n### Proposed Fix\n\nTo properly gate the prediction output during stalls, the prediction should either be computed speculatively and masked at the output, or the register should use an explicit enable that is also qualified by stall:\n\n**Option 1 (recommended): Separate computation from output gating**\n```scala\n// Always compute prediction\nval pred3 = Mux(state_bank3(io.inst_addr) > 1.U, 1.U, 0.U)\nval pred2 = Mux(state_bank2(io.inst_addr) > 1.U, 1.U, 0.U)\nval pred1 = Mux(state_bank1(io.inst_addr) > 1.U, 1.U, 0.U)\nval pred0 = Mux(state_bank0(io.inst_addr) > 1.U, 1.U, 0.U)\nval next_prediction = Cat(pred3, pred2, pred1, pred0)\n\n// Only update register when not stalled\nwhen (!io.stall) {\n  prediction := next_prediction\n}\n```\n\n**Option 2: Use RegEnable with explicit enable**\n```scala\nval prediction = RegEnable(0.U(4.W), !io.stall)\n```\n\nEither approach ensures that the `prediction` register only updates on clock edges where `!io.stall` is true, preventing the stale computed value from appearing when stall is first asserted.\n",
+              "error_type": "dut_bug",
+              "stage_complete": true
+            },
+            "id": "call_00_75UjUljKN3T4onosUzsr4151",
+            "name": "write_report"
+          }
+        ],
+        "iteration": 21
+      }
+    ],
+    "root_cause": null,
+    "success": true,
+    "summary": "",
+    "verification_passed": true
+  },
+  "success": true
+}

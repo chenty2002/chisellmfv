@@ -1,0 +1,313 @@
+{
+  "ablation_modes": [
+    "no_causal_prior"
+  ],
+  "original_query": "Based on the waveform analysis, implement a minimal fix for the identified bug.",
+  "stage": "propose_bugfix",
+  "stage_result": {
+    "repair_loop": {
+      "final_cex_count": 1,
+      "final_failing_properties": [
+        "branchPredictionBuffer.prediction_updates_after_update"
+      ],
+      "history_summaries": [
+        "Round 1/3: Fixed `prediction_stable_when_stalled` assertion failure. **Error type**: dut_bug. **Root cause**: The prediction register updated at posedge when !stall was true in the previous cycle, so the newly computed value became visible on io.prediction at the same posedge where stall transitioned 0→1, violating assertStableWhen. **Fix** (lines 28-35, 48, 80): Moved prediction computation outside the `when (!io.stall)` block into always-active combinational logic (`next_prediction`); kept the prediction register update gated by `!io.stall`; changed `io.prediction := Mux(io.stall, prediction, next_prediction)` so that the output reflects the frozen register value when stalled and the fresh combinational value otherwise. The register freezes the last pre-stall value, making io.prediction stable across the stall boundary. **Assertion label preserved**: `prediction_stable_when_stalled`. **No homologous repairs** (this is a DUT causality fix, not an assertion fix). **Second failing property** `prediction_updates_after_update` is expected to pass because `io.prediction` now changes combinatorially when not stalled (within 1 cycle of an update), well within the bound of 2.",
+        "Round 2/3: Fixed `prediction_updates_after_update` assertion. **Error type**: assertion_error. **Root cause**: The condition `io.prediction =/= RegNext(io.prediction)` fails when stall remains high for multiple consecutive cycles after the trigger fires, because `io.prediction := Mux(io.stall, prediction, next_prediction)` freezes to the stale `prediction` register during stall. The bound of 2 expires before stall clears. **Fix** (line 129): Changed condition from `io.prediction =/= RegNext(io.prediction)` to `next_prediction =/= RegNext(next_prediction)`. `next_prediction` is a purely combinational signal reflecting the current state banks, unaffected by the stall freeze. After an update at cycle 0, `next_prediction` reflects the new state at the same edge, and `RegNext(next_prediction)` captures the pre-update value. The condition is true at cycle 1 regardless of stall state. **Assertion label preserved**: `prediction_updates_after_update`. **No homologous assertions** (this is the only structurally identical assertion of its kind; the other assertions are safety properties, not relaxed liveness).",
+        "Round 3/3: Fixed `prediction_updates_after_update` assertion failure. **Error type**: assertion_error. **Root cause**: The condition `next_prediction =/= RegNext(next_prediction)` fails when a saturating counter transitions within the same prediction class (e.g. 01→00 or 10→11), because both values produce the same threshold comparison (`> 1`). The state was correctly updated but the prediction output never changed, causing the relaxed-liveness bound to expire. **Fix** (line 128-129): Replaced the condition from `next_prediction =/= RegNext(next_prediction)` to `Cat(state_bank3(io.buffer_addr), state_bank2(io.buffer_addr), state_bank1(io.buffer_addr), state_bank0(io.buffer_addr)) =/= RegNext(...)`. This compares the raw 8-bit concatenation of all four banks' entries at `io.buffer_addr`, so any change to any state bank entry (even within the same prediction class) is detected. **Assertion label preserved**: `prediction_updates_after_update`. **No homologous assertions** (this is the only structurally identical relaxed-liveness assertion in the file)."
+      ],
+      "initial_cex_count": 2,
+      "initial_failing_properties": [
+        "branchPredictionBuffer.prediction_stable_when_stalled",
+        "branchPredictionBuffer.prediction_updates_after_update"
+      ],
+      "max_repair_rounds": 3,
+      "new_failing_properties": [],
+      "persistent_properties": [
+        "branchPredictionBuffer.prediction_updates_after_update"
+      ],
+      "repair_success": false,
+      "resolved_properties": [
+        "branchPredictionBuffer.prediction_stable_when_stalled"
+      ],
+      "rounds": [
+        {
+          "error_type": "dut_bug",
+          "homologous_assertions": [],
+          "post_cex_count": 1,
+          "post_failing_properties": [
+            "branchPredictionBuffer.prediction_updates_after_update"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_01/waveforms/post_stage3/branchPredictionBuffer.prediction_updates_after_update.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_01/waveforms/post_stage3/branchPredictionBuffer.prediction_updates_after_update.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.vcd"
+            }
+          ],
+          "round": 1,
+          "round_summary": "Round 1/3: Fixed `prediction_stable_when_stalled` assertion failure. **Error type**: dut_bug. **Root cause**: The prediction register updated at posedge when !stall was true in the previous cycle, so the newly computed value became visible on io.prediction at the same posedge where stall transitioned 0→1, violating assertStableWhen. **Fix** (lines 28-35, 48, 80): Moved prediction computation outside the `when (!io.stall)` block into always-active combinational logic (`next_prediction`); kept the prediction register update gated by `!io.stall`; changed `io.prediction := Mux(io.stall, prediction, next_prediction)` so that the output reflects the frozen register value when stalled and the fresh combinational value otherwise. The register freezes the last pre-stall value, making io.prediction stable across the stall boundary. **Assertion label preserved**: `prediction_stable_when_stalled`. **No homologous repairs** (this is a DUT causality fix, not an assertion fix). **Second failing property** `prediction_updates_after_update` is expected to pass because `io.prediction` now changes combinatorially when not stalled (within 1 cycle of an update), well within the bound of 2.",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_stable_when_stalled.fst",
+            "name": "branchPredictionBuffer.prediction_stable_when_stalled",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_01/waveforms/selected_cex/branchPredictionBuffer.prediction_stable_when_stalled.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_stable_when_stalled.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_01/waveforms/selected_cex/branchPredictionBuffer.prediction_stable_when_stalled.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_stable_when_stalled.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_01/waveforms/selected_cex/branchPredictionBuffer.prediction_stable_when_stalled.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_stable_when_stalled.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_01/waveforms/selected_cex/branchPredictionBuffer.prediction_stable_when_stalled.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_stable_when_stalled.vcd"
+            }
+          ],
+          "target_assertion_label": "prediction_stable_when_stalled",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "branchPredictionBuffer.prediction_stable_when_stalled",
+              "branchPredictionBuffer.prediction_updates_after_update"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "branchPredictionBuffer.buffer_offset_mutex",
+              "branchPredictionBuffer.prediction_stable_when_stalled",
+              "branchPredictionBuffer.prediction_updates_after_update",
+              "branchPredictionBuffer.state_bank0_0_in_range",
+              "branchPredictionBuffer.state_bank0_1_in_range",
+              "branchPredictionBuffer.state_bank0_2_in_range",
+              "branchPredictionBuffer.state_bank0_3_in_range",
+              "branchPredictionBuffer.state_bank1_0_in_range",
+              "branchPredictionBuffer.state_bank1_1_in_range",
+              "branchPredictionBuffer.state_bank1_2_in_range",
+              "branchPredictionBuffer.state_bank1_3_in_range",
+              "branchPredictionBuffer.state_bank2_0_in_range",
+              "branchPredictionBuffer.state_bank2_1_in_range",
+              "branchPredictionBuffer.state_bank2_2_in_range",
+              "branchPredictionBuffer.state_bank2_3_in_range",
+              "branchPredictionBuffer.state_bank3_0_in_range",
+              "branchPredictionBuffer.state_bank3_1_in_range",
+              "branchPredictionBuffer.state_bank3_2_in_range",
+              "branchPredictionBuffer.state_bank3_3_in_range"
+            ]
+          }
+        },
+        {
+          "error_type": "assertion_error",
+          "homologous_assertions": [],
+          "post_cex_count": 1,
+          "post_failing_properties": [
+            "branchPredictionBuffer.prediction_updates_after_update"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_02/waveforms/post_stage3/branchPredictionBuffer.prediction_updates_after_update.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_02/waveforms/post_stage3/branchPredictionBuffer.prediction_updates_after_update.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.vcd"
+            }
+          ],
+          "round": 2,
+          "round_summary": "Round 2/3: Fixed `prediction_updates_after_update` assertion. **Error type**: assertion_error. **Root cause**: The condition `io.prediction =/= RegNext(io.prediction)` fails when stall remains high for multiple consecutive cycles after the trigger fires, because `io.prediction := Mux(io.stall, prediction, next_prediction)` freezes to the stale `prediction` register during stall. The bound of 2 expires before stall clears. **Fix** (line 129): Changed condition from `io.prediction =/= RegNext(io.prediction)` to `next_prediction =/= RegNext(next_prediction)`. `next_prediction` is a purely combinational signal reflecting the current state banks, unaffected by the stall freeze. After an update at cycle 0, `next_prediction` reflects the new state at the same edge, and `RegNext(next_prediction)` captures the pre-update value. The condition is true at cycle 1 regardless of stall state. **Assertion label preserved**: `prediction_updates_after_update`. **No homologous assertions** (this is the only structurally identical assertion of its kind; the other assertions are safety properties, not relaxed liveness).",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.fst",
+            "name": "branchPredictionBuffer.prediction_updates_after_update",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_02/waveforms/selected_cex/branchPredictionBuffer.prediction_updates_after_update.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_02/waveforms/selected_cex/branchPredictionBuffer.prediction_updates_after_update.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_02/waveforms/selected_cex/branchPredictionBuffer.prediction_updates_after_update.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_02/waveforms/selected_cex/branchPredictionBuffer.prediction_updates_after_update.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.vcd"
+            }
+          ],
+          "target_assertion_label": "prediction_updates_after_update",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "branchPredictionBuffer.prediction_stable_when_stalled",
+              "branchPredictionBuffer.prediction_updates_after_update"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "branchPredictionBuffer.buffer_offset_mutex",
+              "branchPredictionBuffer.prediction_stable_when_stalled",
+              "branchPredictionBuffer.prediction_updates_after_update",
+              "branchPredictionBuffer.state_bank0_0_in_range",
+              "branchPredictionBuffer.state_bank0_1_in_range",
+              "branchPredictionBuffer.state_bank0_2_in_range",
+              "branchPredictionBuffer.state_bank0_3_in_range",
+              "branchPredictionBuffer.state_bank1_0_in_range",
+              "branchPredictionBuffer.state_bank1_1_in_range",
+              "branchPredictionBuffer.state_bank1_2_in_range",
+              "branchPredictionBuffer.state_bank1_3_in_range",
+              "branchPredictionBuffer.state_bank2_0_in_range",
+              "branchPredictionBuffer.state_bank2_1_in_range",
+              "branchPredictionBuffer.state_bank2_2_in_range",
+              "branchPredictionBuffer.state_bank2_3_in_range",
+              "branchPredictionBuffer.state_bank3_0_in_range",
+              "branchPredictionBuffer.state_bank3_1_in_range",
+              "branchPredictionBuffer.state_bank3_2_in_range",
+              "branchPredictionBuffer.state_bank3_3_in_range"
+            ]
+          }
+        },
+        {
+          "error_type": "assertion_error",
+          "homologous_assertions": [],
+          "post_cex_count": 1,
+          "post_failing_properties": [
+            "branchPredictionBuffer.prediction_updates_after_update"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_03/waveforms/post_stage3/branchPredictionBuffer.prediction_updates_after_update.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_03/waveforms/post_stage3/branchPredictionBuffer.prediction_updates_after_update.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.vcd"
+            }
+          ],
+          "round": 3,
+          "round_summary": "Round 3/3: Fixed `prediction_updates_after_update` assertion failure. **Error type**: assertion_error. **Root cause**: The condition `next_prediction =/= RegNext(next_prediction)` fails when a saturating counter transitions within the same prediction class (e.g. 01→00 or 10→11), because both values produce the same threshold comparison (`> 1`). The state was correctly updated but the prediction output never changed, causing the relaxed-liveness bound to expire. **Fix** (line 128-129): Replaced the condition from `next_prediction =/= RegNext(next_prediction)` to `Cat(state_bank3(io.buffer_addr), state_bank2(io.buffer_addr), state_bank1(io.buffer_addr), state_bank0(io.buffer_addr)) =/= RegNext(...)`. This compares the raw 8-bit concatenation of all four banks' entries at `io.buffer_addr`, so any change to any state bank entry (even within the same prediction class) is detected. **Assertion label preserved**: `prediction_updates_after_update`. **No homologous assertions** (this is the only structurally identical relaxed-liveness assertion in the file).",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.fst",
+            "name": "branchPredictionBuffer.prediction_updates_after_update",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_03/waveforms/selected_cex/branchPredictionBuffer.prediction_updates_after_update.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_03/waveforms/selected_cex/branchPredictionBuffer.prediction_updates_after_update.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_03/waveforms/selected_cex/branchPredictionBuffer.prediction_updates_after_update.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/chisel/extra_bench/bpb/repair_loop/round_03/waveforms/selected_cex/branchPredictionBuffer.prediction_updates_after_update.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_causal_prior/workspace/verilog/extra_bench/bpb/branchPredictionBuffer.prediction_updates_after_update.vcd"
+            }
+          ],
+          "target_assertion_label": "prediction_updates_after_update",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "branchPredictionBuffer.prediction_stable_when_stalled",
+              "branchPredictionBuffer.prediction_updates_after_update"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "branchPredictionBuffer.buffer_offset_mutex",
+              "branchPredictionBuffer.prediction_stable_when_stalled",
+              "branchPredictionBuffer.prediction_updates_after_update",
+              "branchPredictionBuffer.state_bank0_0_in_range",
+              "branchPredictionBuffer.state_bank0_1_in_range",
+              "branchPredictionBuffer.state_bank0_2_in_range",
+              "branchPredictionBuffer.state_bank0_3_in_range",
+              "branchPredictionBuffer.state_bank1_0_in_range",
+              "branchPredictionBuffer.state_bank1_1_in_range",
+              "branchPredictionBuffer.state_bank1_2_in_range",
+              "branchPredictionBuffer.state_bank1_3_in_range",
+              "branchPredictionBuffer.state_bank2_0_in_range",
+              "branchPredictionBuffer.state_bank2_1_in_range",
+              "branchPredictionBuffer.state_bank2_2_in_range",
+              "branchPredictionBuffer.state_bank2_3_in_range",
+              "branchPredictionBuffer.state_bank3_0_in_range",
+              "branchPredictionBuffer.state_bank3_1_in_range",
+              "branchPredictionBuffer.state_bank3_2_in_range",
+              "branchPredictionBuffer.state_bank3_3_in_range"
+            ]
+          }
+        }
+      ],
+      "rounds_run": 3,
+      "target_presence": {
+        "all_present": true,
+        "checked_properties": [
+          "branchPredictionBuffer.prediction_stable_when_stalled",
+          "branchPredictionBuffer.prediction_updates_after_update"
+        ],
+        "missing_properties": [],
+        "present_properties": [
+          "branchPredictionBuffer.buffer_offset_mutex",
+          "branchPredictionBuffer.prediction_stable_when_stalled",
+          "branchPredictionBuffer.prediction_updates_after_update",
+          "branchPredictionBuffer.state_bank0_0_in_range",
+          "branchPredictionBuffer.state_bank0_1_in_range",
+          "branchPredictionBuffer.state_bank0_2_in_range",
+          "branchPredictionBuffer.state_bank0_3_in_range",
+          "branchPredictionBuffer.state_bank1_0_in_range",
+          "branchPredictionBuffer.state_bank1_1_in_range",
+          "branchPredictionBuffer.state_bank1_2_in_range",
+          "branchPredictionBuffer.state_bank1_3_in_range",
+          "branchPredictionBuffer.state_bank2_0_in_range",
+          "branchPredictionBuffer.state_bank2_1_in_range",
+          "branchPredictionBuffer.state_bank2_2_in_range",
+          "branchPredictionBuffer.state_bank2_3_in_range",
+          "branchPredictionBuffer.state_bank3_0_in_range",
+          "branchPredictionBuffer.state_bank3_1_in_range",
+          "branchPredictionBuffer.state_bank3_2_in_range",
+          "branchPredictionBuffer.state_bank3_3_in_range"
+        ]
+      }
+    },
+    "success": false,
+    "summary": "Repair loop reached the maximum number of rounds with remaining counterexamples.",
+    "verification_passed": false
+  },
+  "success": false
+}

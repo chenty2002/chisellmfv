@@ -1,0 +1,4 @@
+Round 3/3 fix (build fix): Two assertion errors in spinner32.scala.
+(1) A2 (dout_equals_shifter_output, line 105): Fixed by using `val prevTmp5 = RegNext(tmp5)` and `doutReg === prevTmp5` instead of `Past(tmp5, 1)` (Past not available in this Chisel LTL library). RegNext samples tmp5 on the clock edge, giving the one-cycle-delayed value that correctly matches doutReg. The assertion label \"dout_equals_shifter_output\" is preserved exactly.
+(2) A3 (spin_nonzero_rotation_changes_value, line 117-119): `!(io.spin && amountNonZero && tmpNonZero) || (tmp5 =/= tmp0)` is mathematically incorrect — ROR(X,n) == X for non-zero X and n when X=0xFFFFFFFF (all-ones is invariant under all rotations). Fixed by adding `tmpNotAllOnes = tmp0 =/= \"hFFFFFFFF\".U(32.W)` to the antecedent. The assertion label \"spin_nonzero_rotation_changes_value\" is preserved exactly.
+No structurally identical homologous assertions found after inspection — each assertion has a unique structure.

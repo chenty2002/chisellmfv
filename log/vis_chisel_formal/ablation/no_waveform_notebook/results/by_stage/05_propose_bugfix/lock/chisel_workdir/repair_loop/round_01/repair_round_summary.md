@@ -1,0 +1,1 @@
+Round 1 (fix 2): chiselFv does not expose assumeMutex; replaced with assume(!(io.up && io.down), "up_down_mutex") using chisel3's built-in assume primitive. This constrains the formal tool to never drive both inputs high simultaneously, converting the environmental property to a correct input constraint.

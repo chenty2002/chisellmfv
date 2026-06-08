@@ -64,31 +64,39 @@ module branchPredictionBuffer(	// bpbs.scala:7:7
   output [3:0] io_prediction	// bpbs.scala:8:14
 );
 
-  reg  [1:0] state_bank0_0;	// bpbs.scala:20:28
-  reg  [1:0] state_bank0_1;	// bpbs.scala:20:28
-  reg  [1:0] state_bank0_2;	// bpbs.scala:20:28
-  reg  [1:0] state_bank0_3;	// bpbs.scala:20:28
-  reg  [1:0] state_bank1_0;	// bpbs.scala:21:28
-  reg  [1:0] state_bank1_1;	// bpbs.scala:21:28
-  reg  [1:0] state_bank1_2;	// bpbs.scala:21:28
-  reg  [1:0] state_bank1_3;	// bpbs.scala:21:28
-  reg  [1:0] state_bank2_0;	// bpbs.scala:22:28
-  reg  [1:0] state_bank2_1;	// bpbs.scala:22:28
-  reg  [1:0] state_bank2_2;	// bpbs.scala:22:28
-  reg  [1:0] state_bank2_3;	// bpbs.scala:22:28
-  reg  [1:0] state_bank3_0;	// bpbs.scala:23:28
-  reg  [1:0] state_bank3_1;	// bpbs.scala:23:28
-  reg  [1:0] state_bank3_2;	// bpbs.scala:23:28
-  reg  [1:0] state_bank3_3;	// bpbs.scala:23:28
-  reg  [3:0] prediction;	// bpbs.scala:26:27
-  reg  [3:0] r;	// chisel/chiselfv/src/main/scala/chiselFv/Delay.scala:11:20
-  reg        hasBeenResetReg;	// src/main/scala/chisel3/ltl/LTL.scala:362:39
+  reg  [1:0]      state_bank0_0;	// bpbs.scala:20:28
+  reg  [1:0]      state_bank0_1;	// bpbs.scala:20:28
+  reg  [1:0]      state_bank0_2;	// bpbs.scala:20:28
+  reg  [1:0]      state_bank0_3;	// bpbs.scala:20:28
+  reg  [1:0]      state_bank1_0;	// bpbs.scala:21:28
+  reg  [1:0]      state_bank1_1;	// bpbs.scala:21:28
+  reg  [1:0]      state_bank1_2;	// bpbs.scala:21:28
+  reg  [1:0]      state_bank1_3;	// bpbs.scala:21:28
+  reg  [1:0]      state_bank2_0;	// bpbs.scala:22:28
+  reg  [1:0]      state_bank2_1;	// bpbs.scala:22:28
+  reg  [1:0]      state_bank2_2;	// bpbs.scala:22:28
+  reg  [1:0]      state_bank2_3;	// bpbs.scala:22:28
+  reg  [1:0]      state_bank3_0;	// bpbs.scala:23:28
+  reg  [1:0]      state_bank3_1;	// bpbs.scala:23:28
+  reg  [1:0]      state_bank3_2;	// bpbs.scala:23:28
+  reg  [1:0]      state_bank3_3;	// bpbs.scala:23:28
+  reg  [3:0]      prediction;	// bpbs.scala:26:27
+  wire [3:0][1:0] _GEN =
+    {{state_bank3_3}, {state_bank3_2}, {state_bank3_1}, {state_bank3_0}};	// bpbs.scala:23:28, :31:47
+  wire [3:0][1:0] _GEN_0 =
+    {{state_bank2_3}, {state_bank2_2}, {state_bank2_1}, {state_bank2_0}};	// bpbs.scala:22:28, :32:47
+  wire [3:0][1:0] _GEN_1 =
+    {{state_bank1_3}, {state_bank1_2}, {state_bank1_1}, {state_bank1_0}};	// bpbs.scala:21:28, :33:47
+  wire [3:0][1:0] _GEN_2 =
+    {{state_bank0_3}, {state_bank0_2}, {state_bank0_1}, {state_bank0_0}};	// bpbs.scala:20:28, :34:47
+  reg  [3:0]      r;	// log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/chiselfv/src/main/scala/chiselFv/Delay.scala:11:20
+  reg             hasBeenResetReg;	// src/main/scala/chisel3/ltl/LTL.scala:362:39
   initial	// src/main/scala/chisel3/ltl/LTL.scala:362:39
     hasBeenResetReg = 1'bx;	// src/main/scala/chisel3/ltl/LTL.scala:362:39
-  wire       hasBeenReset = hasBeenResetReg === 1'h1 & reset === 1'h0;	// bpbs.scala:7:7, src/main/scala/chisel3/ltl/LTL.scala:362:39
+  wire            hasBeenReset = hasBeenResetReg === 1'h1 & reset === 1'h0;	// bpbs.scala:7:7, src/main/scala/chisel3/ltl/LTL.scala:362:39
   prediction_stable_during_stall:
     assert property (@(posedge clock) disable iff (~hasBeenReset)
-                     ~io_stall | prediction == r);	// bpbs.scala:26:27, :29:9, :88:19, chisel/chiselfv/src/main/scala/chiselFv/Delay.scala:11:20, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
+                     ~io_stall | prediction == r);	// bpbs.scala:26:27, :29:9, :88:19, log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/chiselfv/src/main/scala/chiselFv/Delay.scala:11:20, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
   state_bank0_0_saturated_high:
     assert property (@(posedge clock) disable iff (~hasBeenReset) 1'h1);	// bpbs.scala:7:7, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
   state_bank1_0_saturated_high:
@@ -121,7 +129,24 @@ module branchPredictionBuffer(	// bpbs.scala:7:7
     assert property (@(posedge clock) disable iff (~hasBeenReset) 1'h1);	// bpbs.scala:7:7, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
   state_bank3_3_saturated_high:
     assert property (@(posedge clock) disable iff (~hasBeenReset) 1'h1);	// bpbs.scala:7:7, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
-  buffer_offset_valid_range:
+  prediction_matches_bank_msbs_when_not_stalled:
+    assert property (@(posedge clock) disable iff (~hasBeenReset)
+                     io_stall
+                     | prediction == {_GEN[io_inst_addr][1],
+                                      _GEN_0[io_inst_addr][1],
+                                      _GEN_1[io_inst_addr][1],
+                                      _GEN_2[io_inst_addr][1]});	// bpbs.scala:26:27, :31:47, :32:47, :33:47, :34:47, :108:49, :109:49, :110:49, :111:49, :112:34, :113:{23,38}, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
+  counter_stays_at_max_on_taken_update:
+    assert property (@(posedge clock) disable iff (~hasBeenReset) 1'h1);	// bpbs.scala:7:7, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
+  counter_stays_at_min_on_not_taken_update:
+    assert property (@(posedge clock) disable iff (~hasBeenReset) 1'h1);	// bpbs.scala:7:7, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
+  state_bank0_entry0_initialized:
+    assert property (@(posedge clock) disable iff (~hasBeenReset) 1'h1);	// bpbs.scala:7:7, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
+  state_bank1_entry0_initialized:
+    assert property (@(posedge clock) disable iff (~hasBeenReset) 1'h1);	// bpbs.scala:7:7, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
+  state_bank2_entry0_initialized:
+    assert property (@(posedge clock) disable iff (~hasBeenReset) 1'h1);	// bpbs.scala:7:7, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
+  state_bank3_entry0_initialized:
     assert property (@(posedge clock) disable iff (~hasBeenReset) 1'h1);	// bpbs.scala:7:7, src/main/scala/chisel3/ltl/LTL.scala:321:32, :333:34, :362:39, :431:59
   always @(posedge clock) begin	// bpbs.scala:7:7
     if (reset) begin	// bpbs.scala:7:7
@@ -145,14 +170,6 @@ module branchPredictionBuffer(	// bpbs.scala:7:7
       prediction <= 4'h0;	// bpbs.scala:26:27
     end
     else begin	// bpbs.scala:7:7
-      automatic logic [3:0][1:0] _GEN;	// bpbs.scala:31:47
-      automatic logic [3:0][1:0] _GEN_0;	// bpbs.scala:32:47
-      automatic logic [3:0][1:0] _GEN_1;	// bpbs.scala:33:47
-      automatic logic [3:0][1:0] _GEN_2;	// bpbs.scala:34:47
-      _GEN = {{state_bank3_3}, {state_bank3_2}, {state_bank3_1}, {state_bank3_0}};	// bpbs.scala:23:28, :31:47
-      _GEN_0 = {{state_bank2_3}, {state_bank2_2}, {state_bank2_1}, {state_bank2_0}};	// bpbs.scala:22:28, :32:47
-      _GEN_1 = {{state_bank1_3}, {state_bank1_2}, {state_bank1_1}, {state_bank1_0}};	// bpbs.scala:21:28, :33:47
-      _GEN_2 = {{state_bank0_3}, {state_bank0_2}, {state_bank0_1}, {state_bank0_0}};	// bpbs.scala:20:28, :34:47
       if (io_update) begin	// bpbs.scala:8:14
         automatic logic _GEN_3;	// bpbs.scala:41:30
         automatic logic _GEN_4;	// bpbs.scala:43:39
@@ -171,21 +188,17 @@ module branchPredictionBuffer(	// bpbs.scala:7:7
         _GEN_9 = _GEN_3 | _GEN_7;	// bpbs.scala:22:28, :41:{30,39}, :45:{36,45}, :49:45
         _GEN_10 = _GEN_3 | _GEN_7 | _GEN_8;	// bpbs.scala:23:28, :41:{30,39}, :45:{36,45}, :49:{36,45}, :54:52
         if (io_branch_result) begin	// bpbs.scala:8:14
-          automatic logic       _GEN_11;	// bpbs.scala:42:43
+          automatic logic       _GEN_11 = _GEN_2[io_buffer_addr] != 2'h3;	// bpbs.scala:34:47, :42:43
           automatic logic [1:0] _state_bank0_T;	// bpbs.scala:43:70
-          automatic logic       _GEN_12;	// bpbs.scala:46:43
+          automatic logic       _GEN_12 = _GEN_1[io_buffer_addr] != 2'h3;	// bpbs.scala:33:47, :42:43, :46:43
           automatic logic [1:0] _state_bank1_T;	// bpbs.scala:47:70
-          automatic logic       _GEN_13;	// bpbs.scala:50:43
+          automatic logic       _GEN_13 = _GEN_0[io_buffer_addr] != 2'h3;	// bpbs.scala:32:47, :42:43, :50:43
           automatic logic [1:0] _state_bank2_T;	// bpbs.scala:51:70
-          automatic logic       _GEN_14;	// bpbs.scala:54:43
+          automatic logic       _GEN_14 = _GEN[io_buffer_addr] != 2'h3;	// bpbs.scala:31:47, :42:43, :54:43
           automatic logic [1:0] _state_bank3_T;	// bpbs.scala:55:70
-          _GEN_11 = _GEN_2[io_buffer_addr] != 2'h3;	// bpbs.scala:34:47, :42:43
           _state_bank0_T = _GEN_2[io_buffer_addr] + 2'h1;	// bpbs.scala:7:7, :34:47, :42:43, :43:70
-          _GEN_12 = _GEN_1[io_buffer_addr] != 2'h3;	// bpbs.scala:33:47, :42:43, :46:43
           _state_bank1_T = _GEN_1[io_buffer_addr] + 2'h1;	// bpbs.scala:7:7, :33:47, :46:43, :47:70
-          _GEN_13 = _GEN_0[io_buffer_addr] != 2'h3;	// bpbs.scala:32:47, :42:43, :50:43
           _state_bank2_T = _GEN_0[io_buffer_addr] + 2'h1;	// bpbs.scala:7:7, :32:47, :50:43, :51:70
-          _GEN_14 = _GEN[io_buffer_addr] != 2'h3;	// bpbs.scala:31:47, :42:43, :54:43
           _state_bank3_T = _GEN[io_buffer_addr] + 2'h1;	// bpbs.scala:7:7, :31:47, :54:43, :55:70
           if (_GEN_3 & _GEN_11 & _GEN_4)	// bpbs.scala:20:28, :41:{30,39}, :42:{43,52}, :43:39
             state_bank0_0 <= _state_bank0_T;	// bpbs.scala:20:28, :43:70
@@ -320,7 +333,7 @@ module branchPredictionBuffer(	// bpbs.scala:7:7
            _GEN_1[io_inst_addr][1],
            _GEN_2[io_inst_addr][1]};	// bpbs.scala:26:27, :31:47, :32:47, :33:47, :34:47, :35:22
     end
-    r <= prediction;	// bpbs.scala:26:27, chisel/chiselfv/src/main/scala/chiselFv/Delay.scala:11:20
+    r <= prediction;	// bpbs.scala:26:27, log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/chiselfv/src/main/scala/chiselFv/Delay.scala:11:20
   end // always @(posedge)
   `ifdef ENABLE_INITIAL_REG_	// bpbs.scala:7:7
     `ifdef FIRRTL_BEFORE_INITIAL	// bpbs.scala:7:7
@@ -352,14 +365,14 @@ module branchPredictionBuffer(	// bpbs.scala:7:7
         state_bank3_2 = _RANDOM[1'h0][29:28];	// bpbs.scala:7:7, :20:28, :23:28
         state_bank3_3 = _RANDOM[1'h0][31:30];	// bpbs.scala:7:7, :20:28, :23:28
         prediction = _RANDOM[1'h1][3:0];	// bpbs.scala:7:7, :26:27
-        r = _RANDOM[1'h1][7:4];	// bpbs.scala:7:7, :26:27, chisel/chiselfv/src/main/scala/chiselFv/Delay.scala:11:20
+        r = _RANDOM[1'h1][7:4];	// bpbs.scala:7:7, :26:27, log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/chiselfv/src/main/scala/chiselFv/Delay.scala:11:20
       `endif // RANDOMIZE_REG_INIT
     end // initial
     `ifdef FIRRTL_AFTER_INITIAL	// bpbs.scala:7:7
       `FIRRTL_AFTER_INITIAL	// bpbs.scala:7:7
     `endif // FIRRTL_AFTER_INITIAL
   `endif // ENABLE_INITIAL_REG_
-  ResetCounter resetCounter (	// chisel/chiselfv/src/main/scala/chiselFv/Formal.scala:14:36
+  ResetCounter resetCounter (	// log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/chiselfv/src/main/scala/chiselFv/Formal.scala:14:36
     .clk            (clock),
     .reset          (reset),
     .timeSinceReset (/* unused */),
