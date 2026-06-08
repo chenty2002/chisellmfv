@@ -1,320 +1,433 @@
-# ChiselLMFV
+# ChiseLLMFV
 
-**LLM-driven five-stage formal verification workflow for Chisel hardware designs.**
+ChiseLLMFV is the open-source artifact for the ICCD paper:
 
-ChiselLMFV is a lightweight, modular tool that orchestrates a Large Language
-Model through a fixed five-stage formal verification pipeline on Chisel
-designs. Counterexamples are root-caused with the help of an independent
-Verilog causal-analysis engine, and the whole flow can also ingest plain
-Verilog by first converting it to Chisel.
+**ChiseLLMFV: Artifact-Grounded Source-Level Formal Verification for Chisel with LLMs**
 
----
+The project implements an LLM-assisted, artifact-grounded workflow for
+source-level formal verification of Chisel designs. The workflow edits and
+repairs the maintained Chisel source, while deterministic tools check the
+emitted SystemVerilog, JasperGold proof results, counterexample traces,
+causal-analysis evidence, and quality-audit records.
 
-## Features
+## Public Artifact Scope
 
-- **Five-stage formal verification workflow** with tool-use agent loop
-  1. `build_top_module` — generate / confirm `VerilogGenerator` entry
-  2. `write_assertions` — inject ChiselFV / Chisel-LTL assertions
-  3. `invoke_verification` — `make verilog` + JasperGold `prove -all`
-  4. `waveform_explanation` — analyse FST counterexample; receives a **prior
-     causal-analysis report** from `VerilogCausalAnalysis` as auxiliary evidence
-  5. `propose_bugfix` — emit a minimal, compilable fix
-- **Verilog → Chisel conversion workflow** driven by compile-error feedback
-- **Benchmarks out-of-the-box**
-  - `RTLLM`, `verilog-eval` — registered as git submodules
-  - `vis-verilog-models-1.3` — vendored in-tree
-- **Chisel build stack as submodules** — `chiselfv`, `pylibfst-cache`
-- **Causal root-cause analysis** via the `VerilogCausalAnalysis` submodule,
-  automatically invoked during the `waveform_explanation` stage
-- **JasperGold quality evaluation** for generated verification artefacts:
-  build/interface checks, assertion proof quality, assumption hygiene,
-  non-vacuity, mutation testing, stage5 repair regression, SEC regression,
-  and X-prop robustness
+The open-source experiment data used by the paper is organized only under the
+following directories:
 
----
-
-## Project layout
-
+```text
+log/vis_chisel_formal/main
+log/vis_chisel_formal/ablation
+log/vis_chisel_formal/quality-main
+log/vis_chisel_formal/quality-ablation
 ```
+
+These directories contain the paper-facing results. For the main system and
+for each ablation, the reported quality records are the best available records
+selected from five attempts for each benchmark, using the same best-of
+reporting rule as the paper. The tables in this README are computed from those
+public records.
+
+## Repository Layout
+
+```text
 chisellmfv/
-├── benchmark/
-│   ├── RTLLM/                     ← submodule
-│   ├── verilog-eval/              ← submodule
-│   └── vis-verilog-models-1.3/    ← vendored
-├── chisel/
-│   ├── build.sbt                  ← top-level sbt (aggregates chiselfv)
-│   ├── Makefile
-│   ├── chiselfv/                  ← submodule (ChiselFV assertion library)
-│   ├── pylibfst-cache/            ← submodule (FST waveform reader)
-│   └── extra_bench/
-│       ├── build.sbt              ← per-benchmark sbt config
-│       ├── Makefile
-│       └── <benchmark>/           ← generated at runtime (.gitignored)
-├── verilog/
-│   ├── ClockGate.v, LogPerfHelper.v, ResetCounter.sv, ...
-│   ├── setup.sh                   ← JasperGold driver
-│   ├── set_testtop.py             ← post-process emitted SystemVerilog
-│   └── extra_bench/<benchmark>/   ← generated at runtime
-├── verilog2chisel/
-│   ├── build.sbt                  ← sbt for LLM-emitted Chisel
-│   ├── Makefile
-│   ├── verilog/<benchmark>/       ← drop input Verilog here
-│   └── chisel/<benchmark>/        ← LLM output lands here
-├── VerilogCausalAnalysis/         ← submodule (causal-DAG root-cause engine)
-├── src/
-│   ├── core/                      ← formal-verification workflow
-│   │   └── jaspergold_quality.py  ← deterministic JasperGold quality runner
-│   ├── causal_analysis/           ← adapter to VerilogCausalAnalysis
-│   ├── utils/
-│   └── verilog2chisel/
-├── scripts/
-│   ├── run_vis_chisel_formal_experiment.py ← vis-chisel batch experiment runner
-│   ├── install_hdlConvertor.sh    ← source-install fallback for hdlConvertor
-│   └── reset_data.sh
-├── main.py                        ← unified CLI entry point
-├── init.sh                        ← environment bootstrap (uv-based)
-├── requirements.txt
-├── pyproject.toml                 ← uv project manifest
-├── .env.example                   ← template for API keys (copy → .env)
-├── LICENSE                        ← MIT
-└── README.md
+|-- benchmark/
+|   |-- vis-chisel/             # VIS-derived Chisel benchmark suite
+|   |-- RTLLM/                  # RTLLM benchmark submodule
+|   `-- verilog-eval/           # VerilogEval benchmark submodule
+|-- chisel/
+|   |-- build.sbt               # Chisel/sbt project used by the workflow
+|   |-- Makefile                # Chisel elaboration entry
+|   |-- chiselfv/               # ChiselFV assertion-library submodule
+|   |-- pylibfst-cache/         # optional FST reader source fallback
+|   `-- extra_bench/            # runtime benchmark workspace
+|-- verilog/
+|   |-- setup.sh                # JasperGold driver
+|   |-- set_testtop.py          # emitted SystemVerilog post-processing
+|   `-- extra_bench/            # generated formal backend workspace
+|-- verilog2chisel/
+|   |-- verilog/<target>/       # input Verilog for conversion
+|   |-- chisel/<target>/        # generated Chisel
+|   `-- generated/<target>/     # emitted Verilog from converted Chisel
+|-- VerilogCausalAnalysis/      # causal-DAG counterexample analyzer
+|-- src/
+|   |-- core/                   # formal workflow, LLM client, JasperGold runners
+|   |-- causal_analysis/        # bridge to VerilogCausalAnalysis
+|   |-- utils/                  # config, logging, file helpers
+|   `-- verilog2chisel/         # Verilog-to-Chisel workflow
+|-- log/vis_chisel_formal/
+|   |-- main/                   # public main-run five-stage artifacts
+|   |-- ablation/               # public ablation five-stage artifacts
+|   |-- quality-main/           # public best-of main quality records
+|   `-- quality-ablation/       # public best-of ablation quality records
+|-- main.py                     # CLI entry point: formal, quality, v2c
+|-- init.sh                     # environment bootstrap
+|-- pyproject.toml
+|-- requirements.txt
+|-- .env.example
+`-- README.md
 ```
 
----
+## Workflow Summary
 
-## Prerequisites
+ChiseLLMFV uses five stages:
 
-Required at runtime (install via your OS package manager, **not** through uv):
+| Stage | Purpose | Acceptance evidence |
+|---|---|---|
+| Harness construction | Emit the intended device under verification | Chisel build log and emitted SystemVerilog |
+| Assertion insertion | Add source-level properties | Emitted SystemVerilog with executable assertions |
+| Formal verification | Prove or refute properties | JasperGold report and counterexample trace |
+| Counterexample diagnosis | Classify and localize failures | Source, waveform, and causal-analysis evidence |
+| Repair regression | Patch and re-run target failures | Repair-regression summary |
 
-- **Git** with submodule support
-- **Java 11+ (JDK)** — used by Chisel/sbt. *Also* required if you need to
-  build `hdlConvertor` from source (see the fallback section below).
-  - macOS : `brew install openjdk@17`
-  - Debian: `sudo apt install openjdk-17-jdk`
-- **sbt** — Scala build tool, for Chisel compilation
-- **JasperGold** (Cadence), accessible as `jg` in `$PATH`, for the
-  `invoke_verification` stage
-- **GTKWave suite** providing `vcd2fst` (used by the JasperGold runner)
-- **[uv](https://docs.astral.sh/uv/)** for Python environment management
-  - `curl -LsSf https://astral.sh/uv/install.sh | sh`
+The deterministic quality audit checks build validity, assertion status,
+assumption health, non-vacuity, mutation sensitivity, repair regression,
+sequential equivalence, and X-propagation.
 
-**Optional** (only needed for *source* builds of the native Python
-extensions — the default pip-wheel path requires none of these):
+## Requirements
 
-- **make**, **cmake (≥ 3.20)**, **ninja**, **meson**, **C/C++ compiler**
+The Python package requires Python 3.10 or newer. The paper experiments used
+Ubuntu 20.04, OpenJDK 11, sbt 1.11.2, Chisel 6.7.0, Python 3.13, JasperGold
+Apps 2020.03, and GTKWave 3.4.0.
 
-`init.sh` starts with a **preflight step** that probes each of the above
-and reports what's missing before any installation is attempted.
+Install these tools before running the full workflow:
 
----
+- Git with submodule support.
+- OpenJDK 11 or newer.
+- sbt.
+- Cadence JasperGold, available as `jg` on `PATH`.
+- GTKWave utilities, especially `vcd2fst`.
+- `uv` for Python environment management.
 
-## Quick start
+Optional source-build tools are needed only when native Python wheels are not
+available:
+
+- `make`, `cmake`, `ninja`, `meson`, and a C/C++ compiler.
+- Graphviz and `hdlConvertor` for causal analysis.
+
+## Setup
 
 ```bash
-# 1. Clone + initialise
-git clone <this-repo> chisellmfv
+git clone <repo-url> chisellmfv
 cd chisellmfv
-bash init.sh          # submodules + uv venv + PyPI deps (pip-first)
 
-# 2. Activate venv (optional — `uv run` also works without activation)
-source .venv/bin/activate
+bash init.sh
 
-# 3. Configure LLM credentials
-#    Secrets live in a project-root `.env` file (git-ignored).
-#    `init.sh` creates one from `.env.example` on first run; edit it and
-#    set CHISELLMFV_LLM_API_KEY (and optionally embedding/reranker keys).
-#    Alternatively, export the variables in your shell:
-#
-#      export CHISELLMFV_LLM_API_KEY=sk-xxxxxx
-#
-#    See `.env.example` for all supported variables (incl. optional URL /
-#    model overrides like CHISELLMFV_LLM_URL, CHISELLMFV_LLM_MODEL).
-
-# 4. Run the full five-stage formal verification workflow
-python main.py formal --full --chisel-dir chisel/ --target <benchmark_name>
+cp -n .env.example .env
+$EDITOR .env
 ```
 
-### Installation policy
-
-`init.sh` uses a **pip-first, source-fallback** strategy:
-
-1. **Submodules** are initialised only one level deep (`git submodule update --init`).
-   Inner submodules used *only* for source builds (e.g. hdlConvertor's large
-   ANTLR4 test corpora) are **not** fetched by default.
-2. **Python packages** — including the two native extensions `pylibfst`
-   (FST waveform reader) and `hdlConvertor` (causal-analysis backend) — are
-   installed from PyPI wheels via `uv pip install -r requirements.txt`
-   (+ `hdlConvertor>=2.3` for the optional causal extra).
-3. If a wheel is unavailable for your platform and the pip install fails,
-   `init.sh` emits a **clear warning** pointing at the source-install
-   fallback; it does not abort.
-
-#### Source-install fallbacks (opt-in)
-
-Only run these if the default pip path failed or you are developing the
-respective library:
+Set at least:
 
 ```bash
-# Activate the project venv first:
+CHISELLMFV_LLM_API_KEY=<your-api-key>
+```
+
+Optional endpoint and model overrides:
+
+```bash
+CHISELLMFV_LLM_BASE_URL=<optional-api-base-url>
+CHISELLMFV_LLM_MODEL=<optional-model-name>
+CHISELLMFV_LLM_EXTRA_BODY=<optional-json-extra-body>
+```
+
+If a native wheel is unavailable, activate the environment and use the source
+fallbacks:
+
+```bash
 source .venv/bin/activate
 
-# Fallback 1: build pylibfst from the vendored submodule
-cd chisel/pylibfst-cache && make install && cd -
+cd chisel/pylibfst-cache
+make install
+cd -
 
-# Fallback 2: build hdlConvertor from source
-#   - fetches hdlConvertor's inner submodules
-#   - applies a portable <filesystem> header patch for modern Apple clang
-#   - builds with meson + ninja
-#
-# This wrapper is tracked by the main project; it materialises the
-# installer at VerilogCausalAnalysis/install_hdlConvertor.sh (inside the
-# submodule worktree) and dispatches to it.
 bash scripts/install_hdlConvertor.sh
 ```
 
-Both source-install paths require **Java 11+**, a **C/C++ compiler**, and
-the **cmake / ninja / meson** CLI tools on `$PATH`.
+## Running ChiseLLMFV
 
-### Typical invocations
+Use `.venv/bin/python` after setup, or activate the virtual environment and
+use `python`.
+
+### Single-target formal verification
+
+Run the full five-stage workflow:
 
 ```bash
-# Full workflow from scratch
-python main.py formal --full --target gigamax
-
-# Resume from a specific stage (e.g., after manually tweaking assertions)
-python main.py formal --full --start-stage write_assertions --target gigamax
-
-# Single stage
-python main.py formal --stage build_top_module   --target gigamax
-python main.py formal --stage write_assertions   --target gigamax
-python main.py formal --stage invoke_verification --target gigamax
-
-# Waveform analysis with causal-analysis prior (requires FST counterexample)
-python main.py formal --stage waveform_explanation \
-    --waveform chisel/extra_bench/gigamax/generated/Assertion_X.fst \
-    --target gigamax
-
-# Bug-fix proposal driven by the waveform_explanation report
-python main.py formal --stage propose_bugfix --target gigamax
-
-# Budget the total tokens across all API calls
-python main.py formal --full --target gigamax --max-tokens 20000000
+.venv/bin/python main.py formal --full --target gigamax
 ```
+
+Run one stage:
+
+```bash
+.venv/bin/python main.py formal --stage build_top_module --target gigamax
+.venv/bin/python main.py formal --stage write_assertions --target gigamax
+.venv/bin/python main.py formal --stage invoke_verification --target gigamax
+```
+
+Resume a full workflow from a later stage:
+
+```bash
+.venv/bin/python main.py formal \
+  --full \
+  --start-stage write_assertions \
+  --target gigamax
+```
+
+Run counterexample diagnosis from an existing FST trace:
+
+```bash
+.venv/bin/python main.py formal \
+  --stage waveform_explanation \
+  --target gigamax \
+  --waveform chisel/extra_bench/gigamax/generated/<counterexample>.fst
+```
+
+Run the repair stage:
+
+```bash
+.venv/bin/python main.py formal \
+  --stage propose_bugfix \
+  --target gigamax \
+  --max-repair-rounds 3
+```
+
+### Run the public 50-target benchmark list
+
+The public benchmark selection is recorded in
+`log/vis_chisel_formal/main/selected_benchmarks.txt`. To run the same target
+set with the full workflow:
+
+```bash
+TARGETS="$(paste -sd, log/vis_chisel_formal/main/selected_benchmarks.txt)"
+.venv/bin/python main.py formal --full --targets "$TARGETS"
+```
+
+To run one stage over the same target set:
+
+```bash
+TARGETS="$(paste -sd, log/vis_chisel_formal/main/selected_benchmarks.txt)"
+.venv/bin/python main.py formal \
+  --stage write_assertions \
+  --targets "$TARGETS"
+```
+
+The four public ablation directories use the same 50-target benchmark list:
+
+```text
+log/vis_chisel_formal/ablation/no_assertion_presence_gate
+log/vis_chisel_formal/ablation/no_causal_prior
+log/vis_chisel_formal/ablation/no_repeated_waveform_guard
+log/vis_chisel_formal/ablation/no_waveform_notebook
+```
+
+These ablation directories store the paper-facing artifacts for the four
+control-removal variants. The quality records in
+`log/vis_chisel_formal/quality-ablation/<variant>/reports/*/quality_record.json`
+are the selected best-of-five records used in the paper.
 
 ### JasperGold quality evaluation
 
-The `quality` command runs a deterministic, non-LLM evaluation flow over an
-emitted Verilog/SystemVerilog candidate. It writes Tcl scripts, JasperGold
-logs, CSV/native reports, mutation artefacts, and a combined JSON record under
-`reports/jg/<case_id>/`.
+Run the deterministic quality evaluator on the checked-in counter smoke case:
 
 ```bash
-# Counter smoke benchmark with the default checked-in setup.
 .venv/bin/python main.py quality --counter --stages build,assertions
+```
 
-# Full quality smoke on counter. Keep --max-mutants small for quick checks.
-.venv/bin/python main.py quality --counter --all --max-mutants 1
+Run all quality dimensions on the counter smoke case:
 
-# Include stage5 repair regression as a metric for known failing properties.
-.venv/bin/python main.py quality --counter \
-    --stages repair_regression \
-    --repair-target-properties Counter.assert_out0_toggles
-
-# Evaluate a custom generated candidate.
+```bash
 .venv/bin/python main.py quality \
-    --case-id my_case \
-    --workdir verilog/extra_bench/my_case \
-    --dut-sv TestTop.sv \
-    --extra-sv ResetCounter.sv \
-    --top MyTop \
-    --clock clock \
-    --reset reset \
-    --expected-inputs clock,reset \
-    --expected-outputs io_out
+  --counter \
+  --all \
+  --max-mutants 1
 ```
 
-Supported stages are `build`, `assertions`, `assumptions`, `non_vacuity`,
-`mutation`, `repair_regression`, `sec`, and `xprop`. The
-`repair_regression` stage re-proves target assertions after a stage5 patch and
-records whether their counterexamples persist; it does not export new
-waveforms. The counter smoke baseline is expected to
-enumerate 27 assertions, with 9 `proven` and 18 `cex` results under a short
-proof budget; identical SEC proves the three counter outputs equivalent, and
-X-prop reports all three outputs as non-X-propagatable.
-
-### One-click run for all 50 vis-chisel benchmarks
+Evaluate a custom emitted SystemVerilog candidate:
 
 ```bash
-# From repo root; rerunnable with the same run directory name
-python scripts/run_vis_chisel_formal_experiment.py --run-name vischisel-50 --force
-
-# Rerun only selected benchmarks inside an existing run directory.
-# This refreshes those benchmark workspaces and overwrites their per-stage results.
-python scripts/run_vis_chisel_formal_experiment.py \
-    --run-name vischisel-50 \
-    --rerun-targets arbiter_arbiter,gcd
+.venv/bin/python main.py quality \
+  --case-id my_case \
+  --candidate-id run_001 \
+  --workdir verilog/extra_bench/my_case \
+  --dut-sv TestTop.sv \
+  --extra-sv ResetCounter.sv \
+  --top MyTop \
+  --clock clock \
+  --reset reset \
+  --expected-inputs clock,reset \
+  --expected-outputs io_out \
+  --trace-signals io_out \
+  --stages build,assertions,assumptions,non_vacuity,mutation,repair_regression,sec,xprop \
+  --max-mutants 3 \
+  --jg-timeout 240
 ```
 
-This command runs the full formal workflow on the script's curated 50-benchmark
-set (`--selection-mode curated --count 50` by default) and writes results to:
-`log/vis_chisel_formal/vischisel-50/`.
+The output record is written under:
 
-### Verilog → Chisel conversion
+```text
+reports/jg/<case-id>/quality_record.json
+```
+
+### Verilog-to-Chisel conversion
+
+Place Verilog inputs under `verilog2chisel/verilog/<target>/`:
 
 ```bash
-# 1. Drop source files into verilog2chisel/verilog/<benchmark>/
+mkdir -p verilog2chisel/verilog/mydesign
 cp my_design.v verilog2chisel/verilog/mydesign/
-
-# 2. Convert (with up to 5 compile-error feedback iterations)
-python main.py v2c --target mydesign
-
-# 3. Output:
-#    - Chisel source : verilog2chisel/chisel/mydesign/*.scala
-#    - Emitted Verilog: verilog2chisel/generated/mydesign/*.v
-#    - Auto-mirrored to chisel/extra_bench/mydesign/ on success,
-#      ready for the formal workflow above.
 ```
 
----
-
-## Five-stage workflow details
-
-| Stage | Purpose | LLM tools | Output |
-|-------|---------|-----------|--------|
-| 1. build_top_module | Generate / confirm `object VerilogGenerator` | `confirm_existing_harness`, `write_file`, `read_files`, `reset_stage` | Compilable harness |
-| 2. write_assertions | Add safety/liveness properties | `write_assertions`, `read_files` | Source with assertions |
-| 3. invoke_verification | `make verilog` → JasperGold `prove -all -bg` | *(automatic, no LLM)* | FST counterexamples |
-| 4. waveform_explanation | Trace FST + **consult causal-analysis report** + produce markdown analysis | 6× `waveform_*`, `read_files`, `write_report` | `counterexample_analysis.md` |
-| 5. propose_bugfix | Apply minimal patch | `write_fix`, `read_files` | Fixed Chisel source + `bugfix_report.md` |
-
-### Causal analysis integration
-
-When the `waveform_explanation` stage starts, the workflow automatically
-invokes `VerilogCausalAnalysis/analyze.py` (as a subprocess) on the
-counterexample FST plus the per-benchmark Verilog sources. The resulting
-causal-DAG summary and candidate root-cause list are injected into the LLM
-user prompt as **prior evidence**. The LLM is instructed to verify — not
-blindly trust — that evidence against the waveform and source code.
-
-Causal-analysis artefacts are persisted under:
-
-```
-log/causal_analysis/<benchmark>/
-├── causal_graph.json
-├── causal_graph.dot
-└── causal_graph.png      # or .svg / .pdf
-```
-
----
-
-## Environment reset
+Convert with compile-error feedback:
 
 ```bash
-bash scripts/reset_data.sh        # clears logs / analysis artefacts
+.venv/bin/python main.py v2c \
+  --target mydesign \
+  --max-iterations 5
 ```
 
----
+Successful conversion writes:
 
-## License
+```text
+verilog2chisel/chisel/mydesign/
+verilog2chisel/generated/mydesign/
+chisel/extra_bench/mydesign/
+```
 
-MIT — see [`LICENSE`](./LICENSE).
+The converted target can then be checked by the formal workflow:
+
+```bash
+.venv/bin/python main.py formal --full --target mydesign
+```
+
+## Public Experiment Data
+
+The public experiment data is intentionally compact and paper-facing:
+
+| Directory | Contents |
+|---|---|
+| `log/vis_chisel_formal/main` | Main-run benchmark list, configuration, and five-stage artifacts |
+| `log/vis_chisel_formal/ablation` | Four ablation benchmark lists, configurations, and five-stage artifacts |
+| `log/vis_chisel_formal/quality-main` | Best-of-five quality records for the full system |
+| `log/vis_chisel_formal/quality-ablation` | Best-of-five quality records for the four ablations |
+
+The main benchmark suite has 50 targets from 45 families. Each target has one
+Scala source file; the average size is 77.68 LOC, the median is 61.5 LOC, and
+the range is 19-222 LOC.
+
+### Main result
+
+The main quality table is computed from:
+
+```text
+log/vis_chisel_formal/quality-main/reports/*/quality_record.json
+```
+
+| Metric | Result |
+|---|---:|
+| Quality records | 50 / 50 |
+| Average overall score | 0.7310 |
+| Median overall score | 0.7773 |
+| Mean build score | 1.0000 |
+| Mean assertion score | 0.9674 |
+| Mean bug-detection score | 0.1705 |
+| Mean mutation score | 0.8067 |
+| Mean repair score | 0.6893 |
+| Mean non-vacuity rate | 0.9764 |
+| Mean SEC proven rate | 1.0000 |
+| Mean X-prop non-X rate | 0.9543 |
+| Generated assertions | 531 |
+| Proven assertions | 455 |
+| Assertions with counterexamples | 65 |
+| Benchmarks with at least one counterexample | 21 / 50 |
+| Benchmarks with no assertion counterexamples | 29 / 50 |
+| Repair-regression target assertions | 167 across 40 benchmarks |
+| Repair-target benchmarks with persistent CEX | 21 / 40 |
+| Repair-target benchmarks without persistent CEX | 19 / 40 |
+
+The overall score in each quality record is:
+
+```text
+overall = 0.15 * build_score
+        + 0.25 * assertion_score
+        + 0.20 * bug_detection_score
+        + 0.25 * mutation_score
+        + 0.15 * repair_score
+```
+
+Non-vacuity, sequential equivalence, and X-propagation are reported separately
+because they expose distinct artifact-quality risks.
+
+### Ablation result
+
+The ablation table is computed from:
+
+```text
+log/vis_chisel_formal/quality-ablation/<variant>/reports/*/quality_record.json
+```
+
+| Variant | Records | Avg. overall | Relative overall | Assertions | Bug detection | Mutation | Repair | Non-vacuity |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Full system | 50 / 50 | 0.7310 | 100.00% | 531 | 0.1705 | 0.8067 | 0.6893 | 0.9764 |
+| Without emitted-property validation | 50 / 50 | 0.6822 | 93.32% | 454 | 0.1789 | 0.7333 | 0.6495 | 0.8200 |
+| Without causal analysis | 50 / 50 | 0.6919 | 94.65% | 574 | 0.1448 | 0.7267 | 0.6892 | 0.8800 |
+| Without query-progress control | 50 / 50 | 0.7209 | 98.62% | 494 | 0.1204 | 0.8133 | 0.7464 | 0.8400 |
+| Without trace-evidence memory | 50 / 50 | 0.6749 | 92.33% | 551 | 0.1327 | 0.7467 | 0.6239 | 0.8800 |
+
+All four ablations have complete 50-target quality records and lower aggregate
+quality than the full system under the paper's best-of-five reporting rule.
+
+### Recompute the README summary from public records
+
+The following command recomputes the aggregate scores from the public quality
+records only:
+
+```bash
+.venv/bin/python - <<'PY'
+import json
+import statistics
+from pathlib import Path
+
+root = Path("log/vis_chisel_formal")
+
+def records(path):
+    return [
+        json.loads(p.read_text())
+        for p in sorted((root / path / "reports").glob("*/quality_record.json"))
+    ]
+
+def summarize(path):
+    rows = records(path)
+    scores = [r["scores"] for r in rows]
+    assertions = [r["assertions"] for r in rows]
+    return {
+        "records": len(rows),
+        "avg_overall": sum(s["overall"] for s in scores) / len(scores),
+        "median_overall": statistics.median(s["overall"] for s in scores),
+        "assertions": sum(a["count"] for a in assertions),
+        "proven": sum(a["proven"] for a in assertions),
+        "cex": sum(a["cex"] for a in assertions),
+    }
+
+for name, path in [
+    ("main", "quality-main"),
+    ("no_assertion_presence_gate", "quality-ablation/no_assertion_presence_gate"),
+    ("no_causal_prior", "quality-ablation/no_causal_prior"),
+    ("no_repeated_waveform_guard", "quality-ablation/no_repeated_waveform_guard"),
+    ("no_waveform_notebook", "quality-ablation/no_waveform_notebook"),
+]:
+    print(name, summarize(path))
+PY
+```
+
+## Cleaning Generated State
+
+Remove generated runtime artifacts:
+
+```bash
+bash scripts/reset_data.sh
+```
+
+This deletes `log/`. Do not run it if you need to preserve the public
+experiment artifacts in this checkout.
