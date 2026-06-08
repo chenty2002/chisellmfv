@@ -28,6 +28,14 @@ selected from five attempts for each benchmark, using the same best-of
 reporting rule as the paper. The tables in this README are computed from those
 public records.
 
+The demonstrating example mentioned in the paper is `ArbiterLE`, and its results
+by stage are located at 
+`log/vis_chisel_formal/main/results/by_stage/01_build_top_module/arbiter_arbiter_le`
+`log/vis_chisel_formal/main/results/by_stage/02_write_assertions/arbiter_arbiter_le`
+`log/vis_chisel_formal/main/results/by_stage/03_invoke_verification/arbiter_arbiter_le`
+`log/vis_chisel_formal/main/results/by_stage/04_waveform_explanation/arbiter_arbiter_le`
+`log/vis_chisel_formal/main/results/by_stage/05_propose_bugfix/arbiter_arbiter_le`.
+
 ## Repository Layout
 
 ```text
