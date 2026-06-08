@@ -1,0 +1,1983 @@
+{
+  "ablation_modes": [],
+  "original_query": "Analyze the counterexample waveform to identify the bug. Trace signal values and identify the root cause. Use the causal analysis report as prior evidence when available.",
+  "stage": "waveform_explanation",
+  "stage_result": {
+    "counterexample_path": null,
+    "error_type": "dut_bug",
+    "files_modified": [],
+    "iterations": [
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\nclass iqc extends Module with Formal {\n  val io = IO(new Bundle {\n    val iqLoads = Input(UInt(2.W))\n    val exeReady = Input(UInt(2.W))\n    val opsReady = Input(UInt(3.W))\n    val flush = Input(UInt(3.W))\n    val load0 = Output(UInt(2.W))\n    val load1 = Output(UInt(2.W))\n    val load2 = Output(UInt(2.W))\n    val issue0 = Output(UInt(3.W))\n    val issue1 = Output(UInt(3.W))\n    val valid = Output(UInt(3.W))\n  })\n\n  // Internal registers\n  val valid = RegInit(0.U(3.W))\n  val qAge = RegInit(0.U(3.W))\n\n  // Connect valid output\n  io.valid := valid\n\n  // Loading instructions to queue slots:\n  // The lowest-indexed free entries are preferred.\n  // Dispatch port 0 has precedence over dispatch port 1.\n  val load0_0 = ~valid(0) & io.iqLoads(0)\n  val load0_1 = ~valid(0) & ~io.iqLoads(0) & io.iqLoads(1)\n  io.load0 := Cat(load0_1, load0_0)\n\n  val load1_0 = ~valid(1) & valid(0) & io.iqLoads(0)\n  val load1_1 = ~valid(1) & io.iqLoads(1) & ~(load0_1 | load1_0)\n  io.load1 := Cat(load1_1, load1_0)\n\n  val load2_0 = ~valid(2) & valid(1) & valid(0) & io.iqLoads(0)\n  val load2_1 = ~valid(2) & io.iqLoads(1) & ~(load2_0 | load0_1 | load1_1)\n  io.load2 := Cat(load2_1, load2_0)\n\n  // Issuing instructions to the execution units.\n  // Execution unit 0 has precedence over execution unit 1.\n  // Older instructions are issued first.\n  val issue0_0 = io.exeReady(0) & io.opsReady(0) & valid(0) &\n    (qAge(0) | ~io.opsReady(1)) & (qAge(1) | ~io.opsReady(2))\n  val issue0_1 = io.exeReady(0) & io.opsReady(1) & valid(1) &\n    (~qAge(0) | ~io.opsReady(0)) & (qAge(2) | ~io.opsReady(2))\n  val issue0_2 = io.exeReady(0) & io.opsReady(2) & valid(2) &\n    (~qAge(1) | ~io.opsReady(0)) & (qAge(2) | ~io.opsReady(1))\n  io.issue0 := Cat(issue0_2, issue0_1, issue0_0)\n\n  val issue1_0 = io.exeReady(1) & io.opsReady(0) & valid(0) &\n    (qAge(0) | ~io.opsReady(1) | issue0_1) &\n    (qAge(1) | ~io.opsReady(2) | issue0_2) & ~issue0_0\n  val issue1_1 = io.exeReady(1) & io.opsReady(1) & valid(1) &\n    (~qAge(0) | ~io.opsReady(0) | issue0_0) &\n    (qAge(2) | ~io.opsReady(2) | issue0_2) & ~issue0_1\n  val issue1_2 = io.exeReady(1) & io.opsReady(2) & valid(2) &\n    (~qAge(1) | ~io.opsReady(0) | issue0_0) &\n    (qAge(2) | ~io.opsReady(1) | issue0_1) & ~issue0_2\n  io.issue1 := Cat(issue1_2, issue1_1, issue1_0)\n\n  // Next values of the valid bits\n  val nv0 = ~io.flush(0) & (valid(0) & ~(issue0_0 | issue1_0) | io.load0.orR)\n  val nv1 = ~io.flush(1) & (valid(1) & ~(issue0_1 | issue1_1) | io.load1.orR)\n  val nv2 = ~io.flush(2) & (valid(2) & ~(issue0_2 | issue1_2) | io.load2.orR)\n\n  // Sequential logic - reconstruct entire register values\n  valid := Cat(nv2, nv1, nv0)\n  qAge := Cat(\n    nv1 & (~nv2 | qAge(2) | ~valid(2)),  // qAge[2]\n    nv0 & (~nv2 | qAge(1) | ~valid(2)),  // qAge[1]\n    nv0 & (~nv1 | qAge(0) | ~valid(1))   // qAge[0]\n  )\n\n  // ========== FORMAL ASSERTIONS ==========\n\n  // --- SAFETY: Issue invariants ---\n\n  // At most one slot issues per execution unit per cycle\n  assertOneHot0(io.issue0, \"issue0_onehot0\")\n  assertOneHot0(io.issue1, \"issue1_onehot0\")\n\n  // A slot must never issue to both execution units simultaneously\n  fvAssert(!(issue0_0 && issue1_0), \"slot0_no_dual_issue\")\n  fvAssert(!(issue0_1 && issue1_1), \"slot1_no_dual_issue\")\n  fvAssert(!(issue0_2 && issue1_2), \"slot2_no_dual_issue\")\n\n  // Issue qualification: only valid slots may be issued\n  fvAssert(!issue0_0 || valid(0), \"issue0_0_requires_valid\")\n  fvAssert(!issue0_1 || valid(1), \"issue0_1_requires_valid\")\n  fvAssert(!issue0_2 || valid(2), \"issue0_2_requires_valid\")\n  fvAssert(!issue1_0 || valid(0), \"issue1_0_requires_valid\")\n  fvAssert(!issue1_1 || valid(1), \"issue1_1_requires_valid\")\n  fvAssert(!issue1_2 || valid(2), \"issue1_2_requires_valid\")\n\n  // --- SAFETY: Load invariants ---\n\n  // At most one dispatch port loads into a given slot per cycle\n  assertOneHot0(io.load0, \"load0_onehot0\")\n  assertOneHot0(io.load1, \"load1_onehot0\")\n  assertOneHot0(io.load2, \"load2_onehot0\")\n\n  // Load to a slot requires the slot to be currently invalid\n  fvAssert(!io.load0(0) || !valid(0), \"load0_req_not_valid\")\n  fvAssert(!io.load0(1) || !valid(0), \"load1_req_not_valid\")\n  fvAssert(!io.load1(0) || !valid(1), \"load1_0_req_not_valid\")\n  fvAssert(!io.load1(1) || !valid(1), \"load1_1_req_not_valid\")\n  fvAssert(!io.load2(0) || !valid(2), \"load2_0_req_not_valid\")\n  fvAssert(!io.load2(1) || !valid(2), \"load2_1_req_not_valid\")\n\n  // --- SAFETY: A slot should not be loaded and issued in the same cycle ---\n  fvAssert(!(io.load0.orR && (issue0_0 || issue1_0)), \"slot0_no_load_issue_conflict\")\n  fvAssert(!(io.load1.orR && (issue0_1 || issue1_1)), \"slot1_no_load_issue_conflict\")\n  fvAssert(!(io.load2.orR && (issue0_2 || issue1_2)), \"slot2_no_load_issue_conflict\")\n\n  // --- SAFETY: Flush must clear the valid bit ---\n  fvAssert(!io.flush(0) || !nv0, \"flush0_clears_valid\")\n  fvAssert(!io.flush(1) || !nv1, \"flush1_clears_valid\")\n  fvAssert(!io.flush(2) || !nv2, \"flush2_clears_valid\")\n\n  // --- STRUCTURAL: Valid bits should be at-most-one-hot ---\n  // (entries fill from the bottom, so in practice at most 3 entries but never\n  //  more than the load/dispatch bandwidth allows)\n  assertOneHot0(valid, \"valid_onehot0\")\n\n  // --- LIVENESS: Ready instructions eventually issue ---\n  // If a slot is valid and its operands are ready and the execution unit is\n  // ready, then the instruction must issue within a bounded number of cycles.\n  astRelaxedLiveness(\n    valid(0) && io.opsReady(0) && io.exeReady.orR,\n    issue0_0 || issue1_0, 5,\n    \"slot0_issue_liveness\"\n  )\n  astRelaxedLiveness(\n    valid(1) && io.opsReady(1) && io.exeReady.orR,\n    issue0_1 || issue1_1, 5,\n    \"slot1_issue_liveness\"\n  )\n  astRelaxedLiveness(\n    valid(2) && io.opsReady(2) && io.exeReady.orR,\n    issue0_2 || issue1_2, 5,\n    \"slot2_issue_liveness\"\n  )\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new iqc(), args)\n}\n",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/ibuf/iqc.scala",
+                "original_chars": 5954,
+                "original_lines": 152,
+                "returned_chars": 5954,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          },
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "iqc.scala"
+              ],
+              "reason": "Read the main source file to understand the design and find the assertion"
+            },
+            "id": "call_00_RbCnMR1UR9kZV0PPUDaz4467",
+            "name": "read_files"
+          },
+          {
+            "arguments": {
+              "max_results": 100,
+              "pattern": "*"
+            },
+            "id": "call_01_wOTE5AOzrBnQKFC2vk6A2551",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 1
+      },
+      {
+        "action_results": [
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "files": [
+              {
+                "content": "1: package llmverify\n2: \n3: import chisel3._\n4: import chisel3.util._\n5: import chiselFv._\n6: \n7: class iqc extends Module with Formal {\n8:   val io = IO(new Bundle {\n9:     val iqLoads = Input(UInt(2.W))\n10:     val exeReady = Input(UInt(2.W))\n11:     val opsReady = Input(UInt(3.W))\n12:     val flush = Input(UInt(3.W))\n13:     val load0 = Output(UInt(2.W))\n14:     val load1 = Output(UInt(2.W))\n15:     val load2 = Output(UInt(2.W))\n16:     val issue0 = Output(UInt(3.W))\n17:     val issue1 = Output(UInt(3.W))\n18:     val valid = Output(UInt(3.W))\n19:   })\n20: \n21:   // Internal registers\n22:   val valid = RegInit(0.U(3.W))\n23:   val qAge = RegInit(0.U(3.W))\n24: \n25:   // Connect valid output\n26:   io.valid := valid\n27: \n28:   // Loading instructions to queue slots:\n29:   // The lowest-indexed free entries are preferred.\n30:   // Dispatch port 0 has precedence over dispatch port 1.\n31:   val load0_0 = ~valid(0) & io.iqLoads(0)\n32:   val load0_1 = ~valid(0) & ~io.iqLoads(0) & io.iqLoads(1)\n33:   io.load0 := Cat(load0_1, load0_0)\n34: \n35:   val load1_0 = ~valid(1) & valid(0) & io.iqLoads(0)\n36:   val load1_1 = ~valid(1) & io.iqLoads(1) & ~(load0_1 | load1_0)\n37:   io.load1 := Cat(load1_1, load1_0)\n38: \n39:   val load2_0 = ~valid(2) & valid(1) & valid(0) & io.iqLoads(0)\n40:   val load2_1 = ~valid(2) & io.iqLoads(1) & ~(load2_0 | load0_1 | load1_1)\n41:   io.load2 := Cat(load2_1, load2_0)\n42: \n43:   // Issuing instructions to the execution units.\n44:   // Execution unit 0 has precedence over execution unit 1.\n45:   // Older instructions are issued first.\n46:   val issue0_0 = io.exeReady(0) & io.opsReady(0) & valid(0) &\n47:     (qAge(0) | ~io.opsReady(1)) & (qAge(1) | ~io.opsReady(2))\n48:   val issue0_1 = io.exeReady(0) & io.opsReady(1) & valid(1) &\n49:     (~qAge(0) | ~io.opsReady(0)) & (qAge(2) | ~io.opsReady(2))\n50:   val issue0_2 = io.exeReady(0) & io.opsReady(2) & valid(2) &",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/ibuf/iqc.scala",
+                "line_end": 50,
+                "line_start": 1,
+                "original_chars": 5954,
+                "original_lines": 152,
+                "returned_chars": 1904,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 100,
+              "pattern": "*"
+            },
+            "id": "call_00_YXFKClRiru1Mgp4ail4X5527",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "file_paths": [
+                "iqc.scala"
+              ],
+              "line_end": 50,
+              "line_start": 1,
+              "reason": "Read the beginning of source to understand module structure"
+            },
+            "id": "call_01_lO7XGiqKW7q2wsTyjLas4392",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 2
+      },
+      {
+        "action_results": [
+          {
+            "count": 68,
+            "signals": [
+              {
+                "handle": 1,
+                "length": 1,
+                "name": "iqc.resetCounter.reset"
+              },
+              {
+                "handle": 2,
+                "length": 32,
+                "name": "iqc.resetCounter.timeSinceReset [31:0]"
+              },
+              {
+                "handle": 3,
+                "length": 1,
+                "name": "iqc.resetCounter.notChaos"
+              },
+              {
+                "handle": 4,
+                "length": 32,
+                "name": "iqc.resetCounter.count [31:0]"
+              },
+              {
+                "handle": 5,
+                "length": 1,
+                "name": "iqc.resetCounter.flag"
+              },
+              {
+                "handle": 6,
+                "length": 1,
+                "name": "iqc.resetCounter.clk"
+              },
+              {
+                "handle": 7,
+                "length": 1,
+                "name": "iqc.:jasper_formal_reset"
+              },
+              {
+                "handle": 8,
+                "length": 1,
+                "name": "iqc.reset"
+              },
+              {
+                "handle": 9,
+                "length": 2,
+                "name": "iqc.io_iqLoads [1:0]"
+              },
+              {
+                "handle": 10,
+                "length": 2,
+                "name": "iqc.io_exeReady [1:0]"
+              },
+              {
+                "handle": 11,
+                "length": 3,
+                "name": "iqc.io_opsReady [2:0]"
+              },
+              {
+                "handle": 12,
+                "length": 3,
+                "name": "iqc.io_flush [2:0]"
+              },
+              {
+                "handle": 13,
+                "length": 2,
+                "name": "iqc.io_load0 [1:0]"
+              },
+              {
+                "handle": 14,
+                "length": 2,
+                "name": "iqc.io_load1 [1:0]"
+              },
+              {
+                "handle": 15,
+                "length": 2,
+                "name": "iqc.io_load2 [1:0]"
+              },
+              {
+                "handle": 16,
+                "length": 3,
+                "name": "iqc.io_issue0 [2:0]"
+              },
+              {
+                "handle": 17,
+                "length": 3,
+                "name": "iqc.io_issue1 [2:0]"
+              },
+              {
+                "handle": 18,
+                "length": 3,
+                "name": "iqc.io_valid [2:0]"
+              },
+              {
+                "handle": 19,
+                "length": 1,
+                "name": "iqc._resetCounter_notChaos"
+              },
+              {
+                "handle": 20,
+                "length": 3,
+                "name": "iqc.valid [2:0]"
+              },
+              {
+                "handle": 21,
+                "length": 3,
+                "name": "iqc.qAge [2:0]"
+              },
+              {
+                "handle": 22,
+                "length": 1,
+                "name": "iqc.load0_0"
+              },
+              {
+                "handle": 23,
+                "length": 1,
+                "name": "iqc.load0_1"
+              },
+              {
+                "handle": 24,
+                "length": 2,
+                "name": "iqc.io_load0_0 [1:0]"
+              },
+              {
+                "handle": 25,
+                "length": 1,
+                "name": "iqc.load1_0"
+              },
+              {
+                "handle": 26,
+                "length": 1,
+                "name": "iqc.load1_1"
+              },
+              {
+                "handle": 27,
+                "length": 2,
+                "name": "iqc.io_load1_0 [1:0]"
+              },
+              {
+                "handle": 28,
+                "length": 1,
+                "name": "iqc.load2_0"
+              },
+              {
+                "handle": 29,
+                "length": 1,
+                "name": "iqc.load2_1"
+              },
+              {
+                "handle": 30,
+                "length": 2,
+                "name": "iqc.io_load2_0 [1:0]"
+              },
+              {
+                "handle": 31,
+                "length": 1,
+                "name": "iqc.issue0_0"
+              },
+              {
+                "handle": 32,
+                "length": 1,
+                "name": "iqc.issue0_1"
+              },
+              {
+                "handle": 33,
+                "length": 1,
+                "name": "iqc.issue0_2"
+              },
+              {
+                "handle": 34,
+                "length": 1,
+                "name": "iqc.issue1_0"
+              },
+              {
+                "handle": 35,
+                "length": 1,
+                "name": "iqc.issue1_1"
+              },
+              {
+                "handle": 36,
+                "length": 1,
+                "name": "iqc.issue1_2"
+              },
+              {
+                "handle": 37,
+                "length": 1,
+                "name": "iqc._nv0_T_3"
+              },
+              {
+                "handle": 38,
+                "length": 1,
+                "name": "iqc.nv0"
+              },
+              {
+                "handle": 39,
+                "length": 1,
+                "name": "iqc._nv1_T_3"
+              },
+              {
+                "handle": 40,
+                "length": 1,
+                "name": "iqc.nv1"
+              },
+              {
+                "handle": 41,
+                "length": 1,
+                "name": "iqc._nv2_T_3"
+              },
+              {
+                "handle": 42,
+                "length": 1,
+                "name": "iqc.nv2"
+              },
+              {
+                "handle": 43,
+                "length": 2,
+                "name": "iqc._GEN [1:0]"
+              },
+              {
+                "handle": 44,
+                "length": 1,
+                "name": "iqc.hasBeenResetReg"
+              },
+              {
+                "handle": 45,
+                "length": 1,
+                "name": "iqc.hasBeenReset"
+              },
+              {
+                "handle": 46,
+                "length": 2,
+                "name": "iqc._GEN_0 [1:0]"
+              },
+              {
+                "handle": 47,
+                "length": 2,
+                "name": "iqc._GEN_1 [1:0]"
+              },
+              {
+                "handle": 48,
+                "length": 2,
+                "name": "iqc._GEN_2 [1:0]"
+              },
+              {
+                "handle": 49,
+                "length": 2,
+                "name": "iqc._GEN_3 [1:0]"
+              },
+              {
+                "handle": 50,
+                "length": 2,
+                "name": "iqc._GEN_4 [1:0]"
+              },
+              {
+                "handle": 51,
+                "length": 1,
+                "name": "iqc.pending"
+              },
+              {
+                "handle": 52,
+                "length": 3,
+                "name": "iqc.timer [2:0]"
+              },
+              {
+                "handle": 53,
+                "length": 1,
+                "name": "iqc.nextPending"
+              },
+              {
+                "handle": 54,
+                "length": 1,
+                "name": "iqc._nextTimer_T_1"
+              },
+              {
+                "handle": 55,
+                "length": 3,
+                "name": "iqc._nextTimer_T_2 [2:0]"
+              },
+              {
+                "handle": 56,
+                "length": 1,
+                "name": "iqc.pending_1"
+              },
+              {
+                "handle": 57,
+                "length": 3,
+                "name": "iqc.timer_1 [2:0]"
+              },
+              {
+                "handle": 58,
+                "length": 1,
+                "name": "iqc.nextPending_1"
+              },
+              {
+                "handle": 59,
+                "length": 1,
+                "name": "iqc._nextTimer_T_5"
+              },
+              {
+                "handle": 60,
+                "length": 3,
+                "name": "iqc._nextTimer_T_6 [2:0]"
+              },
+              {
+                "handle": 61,
+                "length": 1,
+                "name": "iqc.pending_2"
+              },
+              {
+                "handle": 62,
+                "length": 3,
+                "name": "iqc.timer_2 [2:0]"
+              },
+              {
+                "handle": 63,
+                "length": 1,
+                "name": "iqc.nextPending_2"
+              },
+              {
+                "handle": 64,
+                "length": 1,
+                "name": "iqc._nextTimer_T_9"
+              },
+              {
+                "handle": 65,
+                "length": 3,
+                "name": "iqc._nextTimer_T_10 [2:0]"
+              },
+              {
+                "handle": 66,
+                "length": 1,
+                "name": "iqc.issue0_onehot0"
+              },
+              {
+                "handle": 67,
+                "length": 1,
+                "name": "iqc.:jasper_formal_clock"
+              },
+              {
+                "handle": 68,
+                "length": 1,
+                "name": "iqc.clock"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 5,
+            "signals": [
+              {
+                "handle": 16,
+                "length": 3,
+                "name": "iqc.io_issue0 [2:0]"
+              },
+              {
+                "handle": 31,
+                "length": 1,
+                "name": "iqc.issue0_0"
+              },
+              {
+                "handle": 32,
+                "length": 1,
+                "name": "iqc.issue0_1"
+              },
+              {
+                "handle": 33,
+                "length": 1,
+                "name": "iqc.issue0_2"
+              },
+              {
+                "handle": 66,
+                "length": 1,
+                "name": "iqc.issue0_onehot0"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 1,
+            "signals": [
+              {
+                "handle": 66,
+                "length": 1,
+                "name": "iqc.issue0_onehot0"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 100,
+              "pattern": "iqc"
+            },
+            "id": "call_00_VLc2QV71QC01ECp3Ibfs1011",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "max_results": 100,
+              "pattern": "issue0"
+            },
+            "id": "call_01_eEysNS7ngf07qKOJxDEE5009",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "max_results": 100,
+              "pattern": "onehot"
+            },
+            "id": "call_02_S9TnxKxqmtJ2dQ77BsyV7395",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 3
+      },
+      {
+        "action_results": [
+          {
+            "active_signals": [
+              {
+                "length": 32,
+                "name": "iqc.resetCounter.timeSinceReset [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "iqc.resetCounter.notChaos",
+                "value": "1"
+              },
+              {
+                "length": 32,
+                "name": "iqc.resetCounter.count [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "iqc.resetCounter.flag",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_iqLoads [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_exeReady [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 3,
+                "name": "iqc.io_opsReady [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_load2 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 3,
+                "name": "iqc.io_issue0 [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 3,
+                "name": "iqc.io_valid [2:0]",
+                "value": "011"
+              },
+              {
+                "length": 1,
+                "name": "iqc._resetCounter_notChaos",
+                "value": "1"
+              },
+              {
+                "length": 3,
+                "name": "iqc.valid [2:0]",
+                "value": "011"
+              },
+              {
+                "length": 3,
+                "name": "iqc.qAge [2:0]",
+                "value": "111"
+              },
+              {
+                "length": 1,
+                "name": "iqc.load2_1",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_load2_0 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "iqc.issue0_0",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc._nv0_T_3",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc.nv1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc.nv2",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc._GEN [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 1,
+                "name": "iqc.hasBeenResetReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc.hasBeenReset",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc._GEN_3 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "iqc._GEN_4 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 3,
+                "name": "iqc._nextTimer_T_2 [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 3,
+                "name": "iqc._nextTimer_T_6 [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 3,
+                "name": "iqc._nextTimer_T_10 [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 1,
+                "name": "iqc.issue0_onehot0",
+                "value": "1"
+              }
+            ],
+            "count": 28,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 20,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "iqc.issue0_onehot0",
+            "signal_name": "iqc.issue0_onehot0",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "000"
+              },
+              {
+                "time": 10,
+                "value": "001"
+              },
+              {
+                "time": 20,
+                "value": "110"
+              }
+            ],
+            "length": 3,
+            "resolved_name": "iqc.io_issue0 [2:0]",
+            "signal_name": "iqc.io_issue0 [2:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 100,
+              "time": 15
+            },
+            "id": "call_00_6awax7r6loQP3YrZL8S99781",
+            "name": "waveform_get_active_signals"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.issue0_onehot0",
+              "start_time": 0
+            },
+            "id": "call_01_Xn6NrzQyAo3rm8OoC4Q92638",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.io_issue0 [2:0]",
+              "start_time": 0
+            },
+            "id": "call_02_FKkBmKt9NjgZvtqDhGUp1321",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 4
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "time": 20,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "iqc.issue0_0",
+            "signal_name": "iqc.issue0_0",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 20,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "iqc.issue0_1",
+            "signal_name": "iqc.issue0_1",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 20,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "iqc.issue0_2",
+            "signal_name": "iqc.issue0_2",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "000"
+              },
+              {
+                "time": 10,
+                "value": "011"
+              },
+              {
+                "time": 20,
+                "value": "110"
+              }
+            ],
+            "length": 3,
+            "resolved_name": "iqc.valid [2:0]",
+            "signal_name": "iqc.valid [2:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "000"
+              },
+              {
+                "time": 10,
+                "value": "111"
+              },
+              {
+                "time": 20,
+                "value": "100"
+              }
+            ],
+            "length": 3,
+            "resolved_name": "iqc.qAge [2:0]",
+            "signal_name": "iqc.qAge [2:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "000"
+              },
+              {
+                "time": 10,
+                "value": "001"
+              },
+              {
+                "time": 20,
+                "value": "111"
+              }
+            ],
+            "length": 3,
+            "resolved_name": "iqc.io_opsReady [2:0]",
+            "signal_name": "iqc.io_opsReady [2:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 10,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "iqc.io_exeReady [1:0]",
+            "signal_name": "iqc.io_exeReady [1:0]",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.issue0_0",
+              "start_time": 0
+            },
+            "id": "call_00_r0irtYLpYLKaO9u2wZ7Y3530",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.issue0_1",
+              "start_time": 0
+            },
+            "id": "call_01_i7BSJb5AJqpi6vZ0vOg81543",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.issue0_2",
+              "start_time": 0
+            },
+            "id": "call_02_6dwTKK6A74LmORrPwjOY8425",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.valid [2:0]",
+              "start_time": 0
+            },
+            "id": "call_03_K5bdcqIvKpQgtnKphPiO8497",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.qAge [2:0]",
+              "start_time": 0
+            },
+            "id": "call_04_zZFs2oyesdzHNthR3TZZ4269",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.io_opsReady [2:0]",
+              "start_time": 0
+            },
+            "id": "call_05_OuugHEiaWHrvreJHGRO53138",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.io_exeReady [1:0]",
+              "start_time": 0
+            },
+            "id": "call_06_dj6d35kXEzeVX6S8HotQ3307",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 5
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\nclass iqc extends Module with Formal {\n  val io = IO(new Bundle {\n    val iqLoads = Input(UInt(2.W))\n    val exeReady = Input(UInt(2.W))\n    val opsReady = Input(UInt(3.W))\n    val flush = Input(UInt(3.W))\n    val load0 = Output(UInt(2.W))\n    val load1 = Output(UInt(2.W))\n    val load2 = Output(UInt(2.W))\n    val issue0 = Output(UInt(3.W))\n    val issue1 = Output(UInt(3.W))\n    val valid = Output(UInt(3.W))\n  })\n\n  // Internal registers\n  val valid = RegInit(0.U(3.W))\n  val qAge = RegInit(0.U(3.W))\n\n  // Connect valid output\n  io.valid := valid\n\n  // Loading instructions to queue slots:\n  // The lowest-indexed free entries are preferred.\n  // Dispatch port 0 has precedence over dispatch port 1.\n  val load0_0 = ~valid(0) & io.iqLoads(0)\n  val load0_1 = ~valid(0) & ~io.iqLoads(0) & io.iqLoads(1)\n  io.load0 := Cat(load0_1, load0_0)\n\n  val load1_0 = ~valid(1) & valid(0) & io.iqLoads(0)\n  val load1_1 = ~valid(1) & io.iqLoads(1) & ~(load0_1 | load1_0)\n  io.load1 := Cat(load1_1, load1_0)\n\n  val load2_0 = ~valid(2) & valid(1) & valid(0) & io.iqLoads(0)\n  val load2_1 = ~valid(2) & io.iqLoads(1) & ~(load2_0 | load0_1 | load1_1)\n  io.load2 := Cat(load2_1, load2_0)\n\n  // Issuing instructions to the execution units.\n  // Execution unit 0 has precedence over execution unit 1.\n  // Older instructions are issued first.\n  val issue0_0 = io.exeReady(0) & io.opsReady(0) & valid(0) &\n    (qAge(0) | ~io.opsReady(1)) & (qAge(1) | ~io.opsReady(2))\n  val issue0_1 = io.exeReady(0) & io.opsReady(1) & valid(1) &\n    (~qAge(0) | ~io.opsReady(0)) & (qAge(2) | ~io.opsReady(2))\n  val issue0_2 = io.exeReady(0) & io.opsReady(2) & valid(2) &\n    (~qAge(1) | ~io.opsReady(0)) & (qAge(2) | ~io.opsReady(1))\n  io.issue0 := Cat(issue0_2, issue0_1, issue0_0)\n\n  val issue1_0 = io.exeReady(1) & io.opsReady(0) & valid(0) &\n    (qAge(0) | ~io.opsReady(1) | issue0_1) &\n    (qAge(1) | ~io.opsReady(2) | issue0_2) & ~issue0_0\n  val issue1_1 = io.exeReady(1) & io.opsReady(1) & valid(1) &\n    (~qAge(0) | ~io.opsReady(0) | issue0_0) &\n    (qAge(2) | ~io.opsReady(2) | issue0_2) & ~issue0_1\n  val issue1_2 = io.exeReady(1) & io.opsReady(2) & valid(2) &\n    (~qAge(1) | ~io.opsReady(0) | issue0_0) &\n    (qAge(2) | ~io.opsReady(1) | issue0_1) & ~issue0_2\n  io.issue1 := Cat(issue1_2, issue1_1, issue1_0)\n\n  // Next values of the valid bits\n  val nv0 = ~io.flush(0) & (valid(0) & ~(issue0_0 | issue1_0) | io.load0.orR)\n  val nv1 = ~io.flush(1) & (valid(1) & ~(issue0_1 | issue1_1) | io.load1.orR)\n  val nv2 = ~io.flush(2) & (valid(2) & ~(issue0_2 | issue1_2) | io.load2.orR)\n\n  // Sequential logic - reconstruct entire register values\n  valid := Cat(nv2, nv1, nv0)\n  qAge := Cat(\n    nv1 & (~nv2 | qAge(2) | ~valid(2)),  // qAge[2]\n    nv0 & (~nv2 | qAge(1) | ~valid(2)),  // qAge[1]\n    nv0 & (~nv1 | qAge(0) | ~valid(1))   // qAge[0]\n  )\n\n  // ========== FORMAL ASSERTIONS ==========\n\n  // --- SAFETY: Issue invariants ---\n\n  // At most one slot issues per execution unit per cycle\n  assertOneHot0(io.issue0, \"issue0_onehot0\")\n  assertOneHot0(io.issue1, \"issue1_onehot0\")\n\n  // A slot must never issue to both execution units simultaneously\n  fvAssert(!(issue0_0 && issue1_0), \"slot0_no_dual_issue\")\n  fvAssert(!(issue0_1 && issue1_1), \"slot1_no_dual_issue\")\n  fvAssert(!(issue0_2 && issue1_2), \"slot2_no_dual_issue\")\n\n  // Issue qualification: only valid slots may be issued\n  fvAssert(!issue0_0 || valid(0), \"issue0_0_requires_valid\")\n  fvAssert(!issue0_1 || valid(1), \"issue0_1_requires_valid\")\n  fvAssert(!issue0_2 || valid(2), \"issue0_2_requires_valid\")\n  fvAssert(!issue1_0 || valid(0), \"issue1_0_requires_valid\")\n  fvAssert(!issue1_1 || valid(1), \"issue1_1_requires_valid\")\n  fvAssert(!issue1_2 || valid(2), \"issue1_2_requires_valid\")\n\n  // --- SAFETY: Load invariants ---\n\n  // At most one dispatch port loads into a given slot per cycle\n  assertOneHot0(io.load0, \"load0_onehot0\")\n  assertOneHot0(io.load1, \"load1_onehot0\")\n  assertOneHot0(io.load2, \"load2_onehot0\")\n\n  // Load to a slot requires the slot to be currently invalid\n  fvAssert(!io.load0(0) || !valid(0), \"load0_req_not_valid\")\n  fvAssert(!io.load0(1) || !valid(0), \"load1_req_not_valid\")\n  fvAssert(!io.load1(0) || !valid(1), \"load1_0_req_not_valid\")\n  fvAssert(!io.load1(1) || !valid(1), \"load1_1_req_not_valid\")\n  fvAssert(!io.load2(0) || !valid(2), \"load2_0_req_not_valid\")\n  fvAssert(!io.load2(1) || !valid(2), \"load2_1_req_not_valid\")\n\n  // --- SAFETY: A slot should not be loaded and issued in the same cycle ---\n  fvAssert(!(io.load0.orR && (issue0_0 || issue1_0)), \"slot0_no_load_issue_conflict\")\n  fvAssert(!(io.load1.orR && (issue0_1 || issue1_1)), \"slot1_no_load_issue_conflict\")\n  fvAssert(!(io.load2.orR && (issue0_2 || issue1_2)), \"slot2_no_load_issue_conflict\")\n\n  // --- SAFETY: Flush must clear the valid bit ---\n  fvAssert(!io.flush(0) || !nv0, \"flush0_clears_valid\")\n  fvAssert(!io.flush(1) || !nv1, \"flush1_clears_valid\")\n  fvAssert(!io.flush(2) || !nv2, \"flush2_clears_valid\")\n\n  // --- STRUCTURAL: Valid bits should be at-most-one-hot ---\n  // (entries fill from the bottom, so in practice at most 3 entries but never\n  //  more than the load/dispatch bandwidth allows)\n  assertOneHot0(valid, \"valid_onehot0\")\n\n  // --- LIVENESS: Ready instructions eventually issue ---\n  // If a slot is valid and its operands are ready and the execution unit is\n  // ready, then the instruction must issue within a bounded number of cycles.\n  astRelaxedLiveness(\n    valid(0) && io.opsReady(0) && io.exeReady.orR,\n    issue0_0 || issue1_0, 5,\n    \"slot0_issue_liveness\"\n  )\n  astRelaxedLiveness(\n    valid(1) && io.opsReady(1) && io.exeReady.orR,\n    issue0_1 || issue1_1, 5,\n    \"slot1_issue_liveness\"\n  )\n  astRelaxedLiveness(\n    valid(2) && io.opsReady(2) && io.exeReady.orR,\n    issue0_2 || issue1_2, 5,\n    \"slot2_issue_liveness\"\n  )\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new iqc(), args)\n}\n",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/ibuf/iqc.scala",
+                "original_chars": 5954,
+                "original_lines": 152,
+                "returned_chars": 5954,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "iqc.scala"
+              ],
+              "reason": "Read iqc.scala to understand the issue logic and one-hot assertion"
+            },
+            "id": "call_00_BJZZNlGQATMIzJKdLcxv8400",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 6
+      },
+      {
+        "action_results": [
+          {
+            "active_signals": [
+              {
+                "length": 32,
+                "name": "iqc.resetCounter.timeSinceReset [31:0]",
+                "value": "00000000000000000000000000000010"
+              },
+              {
+                "length": 1,
+                "name": "iqc.resetCounter.notChaos",
+                "value": "1"
+              },
+              {
+                "length": 32,
+                "name": "iqc.resetCounter.count [31:0]",
+                "value": "00000000000000000000000000000010"
+              },
+              {
+                "length": 1,
+                "name": "iqc.resetCounter.flag",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc.resetCounter.clk",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_iqLoads [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_exeReady [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 3,
+                "name": "iqc.io_opsReady [2:0]",
+                "value": "111"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_load0 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 3,
+                "name": "iqc.io_issue0 [2:0]",
+                "value": "110"
+              },
+              {
+                "length": 3,
+                "name": "iqc.io_valid [2:0]",
+                "value": "110"
+              },
+              {
+                "length": 1,
+                "name": "iqc._resetCounter_notChaos",
+                "value": "1"
+              },
+              {
+                "length": 3,
+                "name": "iqc.valid [2:0]",
+                "value": "110"
+              },
+              {
+                "length": 3,
+                "name": "iqc.qAge [2:0]",
+                "value": "100"
+              },
+              {
+                "length": 1,
+                "name": "iqc.load0_1",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_load0_0 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "iqc.issue0_1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc.issue0_2",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc.nv0",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc._nv1_T_3",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc._nv2_T_3",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc._GEN [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "iqc.hasBeenResetReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc.hasBeenReset",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc._GEN_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "iqc._GEN_4 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 3,
+                "name": "iqc._nextTimer_T_2 [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 3,
+                "name": "iqc._nextTimer_T_6 [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 3,
+                "name": "iqc._nextTimer_T_10 [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 1,
+                "name": "iqc.:jasper_formal_clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc.clock",
+                "value": "1"
+              }
+            ],
+            "count": 31,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          },
+          {
+            "active_signals": [
+              {
+                "length": 32,
+                "name": "iqc.resetCounter.timeSinceReset [31:0]",
+                "value": "00000000000000000000000000000010"
+              },
+              {
+                "length": 1,
+                "name": "iqc.resetCounter.notChaos",
+                "value": "1"
+              },
+              {
+                "length": 32,
+                "name": "iqc.resetCounter.count [31:0]",
+                "value": "00000000000000000000000000000010"
+              },
+              {
+                "length": 1,
+                "name": "iqc.resetCounter.flag",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_iqLoads [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_exeReady [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 3,
+                "name": "iqc.io_opsReady [2:0]",
+                "value": "111"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_load0 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 3,
+                "name": "iqc.io_issue0 [2:0]",
+                "value": "110"
+              },
+              {
+                "length": 3,
+                "name": "iqc.io_valid [2:0]",
+                "value": "110"
+              },
+              {
+                "length": 1,
+                "name": "iqc._resetCounter_notChaos",
+                "value": "1"
+              },
+              {
+                "length": 3,
+                "name": "iqc.valid [2:0]",
+                "value": "110"
+              },
+              {
+                "length": 3,
+                "name": "iqc.qAge [2:0]",
+                "value": "100"
+              },
+              {
+                "length": 1,
+                "name": "iqc.load0_1",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc.io_load0_0 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "iqc.issue0_1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc.issue0_2",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc.nv0",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc._nv1_T_3",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc._nv2_T_3",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc._GEN [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 1,
+                "name": "iqc.hasBeenResetReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "iqc.hasBeenReset",
+                "value": "1"
+              },
+              {
+                "length": 2,
+                "name": "iqc._GEN_1 [1:0]",
+                "value": "01"
+              },
+              {
+                "length": 2,
+                "name": "iqc._GEN_4 [1:0]",
+                "value": "10"
+              },
+              {
+                "length": 3,
+                "name": "iqc._nextTimer_T_2 [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 3,
+                "name": "iqc._nextTimer_T_6 [2:0]",
+                "value": "001"
+              },
+              {
+                "length": 3,
+                "name": "iqc._nextTimer_T_10 [2:0]",
+                "value": "001"
+              }
+            ],
+            "count": 28,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 100,
+              "time": 20
+            },
+            "id": "call_00_mkrjajeGh0h8c4wvSU976841",
+            "name": "waveform_get_active_signals"
+          },
+          {
+            "arguments": {
+              "max_results": 100,
+              "time": 25
+            },
+            "id": "call_01_Sqt5uovubUAXQfMzUfx32917",
+            "name": "waveform_get_active_signals"
+          }
+        ],
+        "iteration": 7
+      },
+      {
+        "action_results": [
+          {
+            "error": "Causal analysis JSON is not available for this waveform",
+            "success": false,
+            "type": "causal_get_roots"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "limit": 10
+            },
+            "id": "call_00_5cAcUTQxO0PcMYPYKiJD1764",
+            "name": "causal_get_roots"
+          }
+        ],
+        "iteration": 8
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "01"
+              },
+              {
+                "time": 10,
+                "value": "00"
+              },
+              {
+                "time": 20,
+                "value": "10"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "iqc.io_load0 [1:0]",
+            "signal_name": "iqc.io_load0 [1:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "10"
+              },
+              {
+                "time": 10,
+                "value": "00"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "iqc.io_load1 [1:0]",
+            "signal_name": "iqc.io_load1 [1:0]",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 10,
+                "value": "10"
+              },
+              {
+                "time": 20,
+                "value": "00"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "iqc.io_load2 [1:0]",
+            "signal_name": "iqc.io_load2 [1:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "11"
+              },
+              {
+                "time": 10,
+                "value": "10"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "iqc.io_iqLoads [1:0]",
+            "signal_name": "iqc.io_iqLoads [1:0]",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 10,
+                "value": "0"
+              },
+              {
+                "time": 20,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "iqc.nv0",
+            "signal_name": "iqc.nv0",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 20,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "iqc._nv1_T_3",
+            "signal_name": "iqc._nv1_T_3",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 20,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "iqc._nv2_T_3",
+            "signal_name": "iqc._nv2_T_3",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.io_load0 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_00_E42jutRNLnbCel5qcKjC5234",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.io_load1 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_01_8VMWA3CTjRqKqV4IFpgb1923",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.io_load2 [1:0]",
+              "start_time": 0
+            },
+            "id": "call_02_4nLJhvJ8sIzEOUHSnoOX7003",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.io_iqLoads [1:0]",
+              "start_time": 0
+            },
+            "id": "call_03_ZspeCXT0mrc12gFFuFwk2221",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.nv0",
+              "start_time": 0
+            },
+            "id": "call_04_tBEgziV09H0jxhwL5UqU1624",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc._nv1_T_3",
+              "start_time": 0
+            },
+            "id": "call_05_0ejYE2P0R7Y5uvuD8wnk3578",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc._nv2_T_3",
+              "start_time": 0
+            },
+            "id": "call_06_ItWtipvxJbavv9AZGOHE5078",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 9
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "000"
+              },
+              {
+                "time": 10,
+                "value": "011"
+              },
+              {
+                "time": 20,
+                "value": "110"
+              }
+            ],
+            "length": 3,
+            "resolved_name": "iqc.valid [2:0]",
+            "signal_name": "iqc.valid [2:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "000"
+              },
+              {
+                "time": 10,
+                "value": "111"
+              },
+              {
+                "time": 20,
+                "value": "100"
+              }
+            ],
+            "length": 3,
+            "resolved_name": "iqc.qAge [2:0]",
+            "signal_name": "iqc.qAge [2:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "000"
+              },
+              {
+                "time": 10,
+                "value": "001"
+              },
+              {
+                "time": 20,
+                "value": "110"
+              }
+            ],
+            "length": 3,
+            "resolved_name": "iqc.io_issue0 [2:0]",
+            "signal_name": "iqc.io_issue0 [2:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "000"
+              },
+              {
+                "time": 10,
+                "value": "011"
+              },
+              {
+                "time": 20,
+                "value": "110"
+              }
+            ],
+            "length": 3,
+            "resolved_name": "iqc.io_valid [2:0]",
+            "signal_name": "iqc.io_valid [2:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "000"
+              },
+              {
+                "time": 10,
+                "value": "001"
+              },
+              {
+                "time": 20,
+                "value": "111"
+              }
+            ],
+            "length": 3,
+            "resolved_name": "iqc.io_opsReady [2:0]",
+            "signal_name": "iqc.io_opsReady [2:0]",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "00"
+              },
+              {
+                "time": 10,
+                "value": "01"
+              }
+            ],
+            "length": 2,
+            "resolved_name": "iqc.io_exeReady [1:0]",
+            "signal_name": "iqc.io_exeReady [1:0]",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.valid [2:0]",
+              "start_time": 0
+            },
+            "id": "call_00_EKFTdMlwGlAx1tdcuf2s2648",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.qAge [2:0]",
+              "start_time": 0
+            },
+            "id": "call_01_h2CwOistKNMCHAgI6skH1077",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.io_issue0 [2:0]",
+              "start_time": 0
+            },
+            "id": "call_02_rx502cox8dGbwQSuBDsq3507",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.io_valid [2:0]",
+              "start_time": 0
+            },
+            "id": "call_03_ffaN5AwPolmFLgCXHbnV1560",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.io_opsReady [2:0]",
+              "start_time": 0
+            },
+            "id": "call_04_UChlpIu2jeCG79cwpB6K6789",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.io_exeReady [1:0]",
+              "start_time": 0
+            },
+            "id": "call_05_4KoyRPzlVONZTDDrhYNc1970",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 10
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\nclass iqc extends Module with Formal {\n  val io = IO(new Bundle {\n    val iqLoads = Input(UInt(2.W))\n    val exeReady = Input(UInt(2.W))\n    val opsReady = Input(UInt(3.W))\n    val flush = Input(UInt(3.W))\n    val load0 = Output(UInt(2.W))\n    val load1 = Output(UInt(2.W))\n    val load2 = Output(UInt(2.W))\n    val issue0 = Output(UInt(3.W))\n    val issue1 = Output(UInt(3.W))\n    val valid = Output(UInt(3.W))\n  })\n\n  // Internal registers\n  val valid = RegInit(0.U(3.W))\n  val qAge = RegInit(0.U(3.W))\n\n  // Connect valid output\n  io.valid := valid\n\n  // Loading instructions to queue slots:\n  // The lowest-indexed free entries are preferred.\n  // Dispatch port 0 has precedence over dispatch port 1.\n  val load0_0 = ~valid(0) & io.iqLoads(0)\n  val load0_1 = ~valid(0) & ~io.iqLoads(0) & io.iqLoads(1)\n  io.load0 := Cat(load0_1, load0_0)\n\n  val load1_0 = ~valid(1) & valid(0) & io.iqLoads(0)\n  val load1_1 = ~valid(1) & io.iqLoads(1) & ~(load0_1 | load1_0)\n  io.load1 := Cat(load1_1, load1_0)\n\n  val load2_0 = ~valid(2) & valid(1) & valid(0) & io.iqLoads(0)\n  val load2_1 = ~valid(2) & io.iqLoads(1) & ~(load2_0 | load0_1 | load1_1)\n  io.load2 := Cat(load2_1, load2_0)\n\n  // Issuing instructions to the execution units.\n  // Execution unit 0 has precedence over execution unit 1.\n  // Older instructions are issued first.\n  val issue0_0 = io.exeReady(0) & io.opsReady(0) & valid(0) &\n    (qAge(0) | ~io.opsReady(1)) & (qAge(1) | ~io.opsReady(2))\n  val issue0_1 = io.exeReady(0) & io.opsReady(1) & valid(1) &\n    (~qAge(0) | ~io.opsReady(0)) & (qAge(2) | ~io.opsReady(2))\n  val issue0_2 = io.exeReady(0) & io.opsReady(2) & valid(2) &\n    (~qAge(1) | ~io.opsReady(0)) & (qAge(2) | ~io.opsReady(1))\n  io.issue0 := Cat(issue0_2, issue0_1, issue0_0)\n\n  val issue1_0 = io.exeReady(1) & io.opsReady(0) & valid(0) &\n    (qAge(0) | ~io.opsReady(1) | issue0_1) &\n    (qAge(1) | ~io.opsReady(2) | issue0_2) & ~issue0_0\n  val issue1_1 = io.exeReady(1) & io.opsReady(1) & valid(1) &\n    (~qAge(0) | ~io.opsReady(0) | issue0_0) &\n    (qAge(2) | ~io.opsReady(2) | issue0_2) & ~issue0_1\n  val issue1_2 = io.exeReady(1) & io.opsReady(2) & valid(2) &\n    (~qAge(1) | ~io.opsReady(0) | issue0_0) &\n    (qAge(2) | ~io.opsReady(1) | issue0_1) & ~issue0_2\n  io.issue1 := Cat(issue1_2, issue1_1, issue1_0)\n\n  // Next values of the valid bits\n  val nv0 = ~io.flush(0) & (valid(0) & ~(issue0_0 | issue1_0) | io.load0.orR)\n  val nv1 = ~io.flush(1) & (valid(1) & ~(issue0_1 | issue1_1) | io.load1.orR)\n  val nv2 = ~io.flush(2) & (valid(2) & ~(issue0_2 | issue1_2) | io.load2.orR)\n\n  // Sequential logic - reconstruct entire register values\n  valid := Cat(nv2, nv1, nv0)\n  qAge := Cat(\n    nv1 & (~nv2 | qAge(2) | ~valid(2)),  // qAge[2]\n    nv0 & (~nv2 | qAge(1) | ~valid(2)),  // qAge[1]\n    nv0 & (~nv1 | qAge(0) | ~valid(1))   // qAge[0]\n  )\n\n  // ========== FORMAL ASSERTIONS ==========\n\n  // --- SAFETY: Issue invariants ---\n\n  // At most one slot issues per execution unit per cycle\n  assertOneHot0(io.issue0, \"issue0_onehot0\")\n  assertOneHot0(io.issue1, \"issue1_onehot0\")\n\n  // A slot must never issue to both execution units simultaneously\n  fvAssert(!(issue0_0 && issue1_0), \"slot0_no_dual_issue\")\n  fvAssert(!(issue0_1 && issue1_1), \"slot1_no_dual_issue\")\n  fvAssert(!(issue0_2 && issue1_2), \"slot2_no_dual_issue\")\n\n  // Issue qualification: only valid slots may be issued\n  fvAssert(!issue0_0 || valid(0), \"issue0_0_requires_valid\")\n  fvAssert(!issue0_1 || valid(1), \"issue0_1_requires_valid\")\n  fvAssert(!issue0_2 || valid(2), \"issue0_2_requires_valid\")\n  fvAssert(!issue1_0 || valid(0), \"issue1_0_requires_valid\")\n  fvAssert(!issue1_1 || valid(1), \"issue1_1_requires_valid\")\n  fvAssert(!issue1_2 || valid(2), \"issue1_2_requires_valid\")\n\n  // --- SAFETY: Load invariants ---\n\n  // At most one dispatch port loads into a given slot per cycle\n  assertOneHot0(io.load0, \"load0_onehot0\")\n  assertOneHot0(io.load1, \"load1_onehot0\")\n  assertOneHot0(io.load2, \"load2_onehot0\")\n\n  // Load to a slot requires the slot to be currently invalid\n  fvAssert(!io.load0(0) || !valid(0), \"load0_req_not_valid\")\n  fvAssert(!io.load0(1) || !valid(0), \"load1_req_not_valid\")\n  fvAssert(!io.load1(0) || !valid(1), \"load1_0_req_not_valid\")\n  fvAssert(!io.load1(1) || !valid(1), \"load1_1_req_not_valid\")\n  fvAssert(!io.load2(0) || !valid(2), \"load2_0_req_not_valid\")\n  fvAssert(!io.load2(1) || !valid(2), \"load2_1_req_not_valid\")\n\n  // --- SAFETY: A slot should not be loaded and issued in the same cycle ---\n  fvAssert(!(io.load0.orR && (issue0_0 || issue1_0)), \"slot0_no_load_issue_conflict\")\n  fvAssert(!(io.load1.orR && (issue0_1 || issue1_1)), \"slot1_no_load_issue_conflict\")\n  fvAssert(!(io.load2.orR && (issue0_2 || issue1_2)), \"slot2_no_load_issue_conflict\")\n\n  // --- SAFETY: Flush must clear the valid bit ---\n  fvAssert(!io.flush(0) || !nv0, \"flush0_clears_valid\")\n  fvAssert(!io.flush(1) || !nv1, \"flush1_clears_valid\")\n  fvAssert(!io.flush(2) || !nv2, \"flush2_clears_valid\")\n\n  // --- STRUCTURAL: Valid bits should be at-most-one-hot ---\n  // (entries fill from the bottom, so in practice at most 3 entries but never\n  //  more than the load/dispatch bandwidth allows)\n  assertOneHot0(valid, \"valid_onehot0\")\n\n  // --- LIVENESS: Ready instructions eventually issue ---\n  // If a slot is valid and its operands are ready and the execution unit is\n  // ready, then the instruction must issue within a bounded number of cycles.\n  astRelaxedLiveness(\n    valid(0) && io.opsReady(0) && io.exeReady.orR,\n    issue0_0 || issue1_0, 5,\n    \"slot0_issue_liveness\"\n  )\n  astRelaxedLiveness(\n    valid(1) && io.opsReady(1) && io.exeReady.orR,\n    issue0_1 || issue1_1, 5,\n    \"slot1_issue_liveness\"\n  )\n  astRelaxedLiveness(\n    valid(2) && io.opsReady(2) && io.exeReady.orR,\n    issue0_2 || issue1_2, 5,\n    \"slot2_issue_liveness\"\n  )\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new iqc(), args)\n}\n",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/ibuf/iqc.scala",
+                "original_chars": 5954,
+                "original_lines": 152,
+                "returned_chars": 5954,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "iqc.scala"
+              ],
+              "reason": "Read the full source code for the iqc module to understand the issue logic"
+            },
+            "id": "call_00_YXRHBNEXILixFPTIqAfC0536",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 11
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "time": 20,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "iqc.issue0_0",
+            "signal_name": "iqc.issue0_0",
+            "success": true,
+            "total_changes": 3,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 20,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "iqc.issue0_1",
+            "signal_name": "iqc.issue0_1",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 20,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "iqc.issue0_2",
+            "signal_name": "iqc.issue0_2",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "count": 5,
+            "failed_count": 0,
+            "resolved_count": 5,
+            "results": [
+              {
+                "signal_name": "iqc.io_opsReady [2:0]",
+                "time": 20,
+                "value": "111"
+              },
+              {
+                "signal_name": "iqc.qAge [2:0]",
+                "time": 20,
+                "value": "100"
+              },
+              {
+                "signal_name": "iqc.valid [2:0]",
+                "time": 20,
+                "value": "110"
+              },
+              {
+                "signal_name": "iqc.io_exeReady [1:0]",
+                "time": 20,
+                "value": "01"
+              },
+              {
+                "signal_name": "iqc.io_issue0 [2:0]",
+                "time": 20,
+                "value": "110"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.issue0_0",
+              "start_time": 0
+            },
+            "id": "call_00_ZTGh5PlsIAYElHlekRrb9140",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.issue0_1",
+              "start_time": 0
+            },
+            "id": "call_01_64WIDrf80lFZNrTSKZnR2923",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 30,
+              "signal_name": "iqc.issue0_2",
+              "start_time": 0
+            },
+            "id": "call_02_GQBBggOnmSEHj75OcfEx6969",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "iqc.io_opsReady [2:0]",
+                "iqc.qAge [2:0]",
+                "iqc.valid [2:0]",
+                "iqc.io_exeReady [1:0]",
+                "iqc.io_issue0 [2:0]"
+              ],
+              "times": [
+                20,
+                20,
+                20,
+                20,
+                20
+              ]
+            },
+            "id": "call_03_hurfOSCYw5HNjWzDclib9237",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 12
+      },
+      {
+        "action_results": [
+          {
+            "file_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/ibuf/counterexample_analysis.md",
+            "success": true,
+            "type": "write_report"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "content": "# Counterexample Analysis Report: iqc.issue0_onehot0\n\n## 1. Verification Environment\n\n- **Top Module:** `iqc` (Issue Queue Controller)\n- **Source File:** `iqc.scala`\n- **Generated Verilog Directory:** `chisel/extra_bench/ibuf/generated/`\n- **Design Under Test:** A 3-entry issue queue that manages instruction dispatch from two load ports to two execution units. It tracks valid bits and age bits (qAge) to implement oldest-first arbitration.\n\n### Key Components and Connections\n\n| Component | Type | Description |\n|-----------|------|-------------|\n| `valid` | 3-bit Reg | Tracks which queue slots hold valid instructions |\n| `qAge` | 3-bit Reg | Age comparison matrix: qAge[0]=entry0>entry1, qAge[1]=entry0>entry2, qAge[2]=entry1>entry2 |\n| `io.iqLoads[1:0]` | Input | Dispatch port loads (port 0, port 1) |\n| `io.exeReady[1:0]` | Input | Execution unit ready signals |\n| `io.opsReady[2:0]` | Input | Operand-ready signals for each queue entry |\n| `io.issue0[2:0]` | Output | Issue signals for execution unit 0 (one-hot expected) |\n| `io.issue1[2:0]` | Output | Issue signals for execution unit 1 (one-hot expected) |\n\n## 2. Violated Assertion\n\n- **Assertion Name:** `issue0_onehot0` (from waveform filename `iqc.issue0_onehot0.fst`)\n- **File Location:** `iqc.scala`, line 118\n- **Code Snippet:**\n\n```scala\nassertOneHot0(io.issue0, \"issue0_onehot0\")\n```\n\n- **Property Description:** The `io.issue0` output must have at most one bit set (i.e., it must be one-hot or zero) on any cycle. This ensures that only one instruction is issued to execution unit 0 per cycle.\n\n## 3. Waveform Information\n\n- **Waveform File:** `verilog/extra_bench/ibuf/iqc.issue0_onehot0.fst`\n- **Time Range:** 0–30 ns (3 cycles)\n- **Failure Point:** Time = 20 ns (positive clock edge of cycle 2)\n\n### Critical Signal Values at Time 20 ns\n\n| Signal | Value | Description |\n|--------|-------|-------------|\n| `iqc.io_issue0 [2:0]` | `110` ✗ | **Two bits set** (entries 1 and 2) — violates one-hot |\n| `iqc.issue0_0` | `0` | Entry 0 not issuing (not valid) |\n| `iqc.issue0_1` | `1` | Entry 1 issuing |\n| `iqc.issue0_2` | `1` | Entry 2 issuing (should NOT issue when entry 1 is older) |\n| `iqc.valid [2:0]` | `110` | Entries 1 and 2 are valid |\n| `iqc.qAge [2:0]` | `100` | qAge[2]=1 → entry 1 is older than entry 2 |\n| `iqc.io_opsReady [2:0]` | `111` | All entries have ready operands |\n| `iqc.io_exeReady [1:0]` | `01` | Execution unit 0 is ready |\n\n### Signal Timeline\n\n| Time | io_issue0 | valid | qAge | opsReady | exeReady | Event |\n|------|-----------|-------|------|----------|----------|-------|\n| 0 ns | 000 | 000 | 000 | 000 | 00 | Initial/reset state |\n| 10 ns | 001 | 011 | 111 | 001 | 01 | Entry 0 loaded, issues; entries 0,1 loaded |\n| 20 ns | **110** ✗ | 110 | 100 | 111 | 01 | **Both entries 1 and 2 issue simultaneously** |\n\n## 4. Root Cause Analysis\n\n### Buggy Location\n\n- **File:** `iqc.scala`\n- **Line:** 96\n- **Module:** `iqc`\n- **Buggy Expression:** `issue0_2` qualification logic\n\n### Bug Description\n\nThe `issue0_2` signal (determining whether queue entry 2 issues to execution unit 0) contains a **typo in the age-comparison logic**.\n\nThe current (buggy) code at line 96:\n\n```scala\nval issue0_2 = io.exeReady(0) & io.opsReady(2) & valid(2) &\n    (~qAge(1) | ~io.opsReady(0)) & (qAge(2) | ~io.opsReady(1))\n                                              ^^^^^^^^\n                                              BUG: should be ~qAge(2)\n```\n\nThe correct logic should be:\n\n```scala\nval issue0_2 = io.exeReady(0) & io.opsReady(2) & valid(2) &\n    (~qAge(1) | ~io.opsReady(0)) & (~qAge(2) | ~io.opsReady(1))\n                                              ^^^^^^^^^\n                                              FIX: negate qAge(2)\n```\n\n### Why This Is a Bug\n\nThe age arbitration for issue0 works as follows:\n\n- **qAge[2]=1** means **entry 1 is older than entry 2**\n- When entry 1 is older AND ready, it should issue, and entry 2 should **not** issue to the same port\n- The condition for issue0_2 should allow entry 2 to issue only if **entry 2 is NOT younger than entry 1** (i.e., `~qAge(2)`) **OR** entry 1 is not ready (`~io.opsReady(1)`)\n\n### Comparison with Correct Conditions\n\n| Signal | Current Condition | Correct Condition |\n|--------|-------------------|-------------------|\n| `issue0_0` | `(qAge(0) \\| ~io.opsReady(1)) & (qAge(1) \\| ~io.opsReady(2))` | ✅ Correct |\n| `issue0_1` | `(~qAge(0) \\| ~io.opsReady(0)) & (qAge(2) \\| ~io.opsReady(2))` | ✅ Correct |\n| `issue0_2` | `(~qAge(1) \\| ~io.opsReady(0)) & (qAge(2) \\| ~io.opsReady(1))` | ❌ **Should be `~qAge(2)`** |\n\n### Concrete Waveform Evidence\n\nAt time 20 ns:\n- `qAge[2]=1` → entry 1 is older than entry 2\n- `io.opsReady[1]=1` → entry 1 is ready\n- With correct `(~qAge(2) | ~io.opsReady(1)) = (~1 | ~1) = (0 | 0) = 0`, issue0_2 would be **blocked**\n- With buggy `(qAge(2) | ~io.opsReady(1)) = (1 | ~1) = (1 | 0) = 1`, issue0_2 is incorrectly **allowed**\n\nThis causes both `issue0_1` and `issue0_2` to be `1` simultaneously, producing `io_issue0 = 110`, which directly violates the `assertOneHot0(io.issue0, \"issue0_onehot0\")` assertion.\n\n### Error Classification\n\n**Category: Bug in the Original Design (DUT Bug)**\n\nThe assertion is correct — `io.issue0` should indeed be one-hot to ensure only one instruction issues per execution unit per cycle. The age-comparison logic in `issue0_2` uses `qAge(2)` instead of `~qAge(2)`, which is a typo/bug that breaks the oldest-first arbitration. The setup and assertion are both valid.\n",
+              "error_type": "dut_bug",
+              "stage_complete": true
+            },
+            "id": "call_00_aUaFG0fCc6gwmXgoaIIN9768",
+            "name": "write_report"
+          }
+        ],
+        "iteration": 13
+      }
+    ],
+    "root_cause": null,
+    "success": true,
+    "summary": "",
+    "verification_passed": true
+  },
+  "success": true
+}

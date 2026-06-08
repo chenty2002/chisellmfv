@@ -1,0 +1,2968 @@
+{
+  "ablation_modes": [
+    "no_repeated_waveform_guard"
+  ],
+  "original_query": "Analyze the counterexample waveform to identify the bug. Trace signal values and identify the root cause. Use the causal analysis report as prior evidence when available.",
+  "stage": "waveform_explanation",
+  "stage_result": {
+    "counterexample_path": null,
+    "error_type": "assertion_error",
+    "files_modified": [],
+    "iterations": [
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\nclass ABypassCtrl extends Module with Formal {\n  val io = IO(new Bundle {\n    // Clocks & Stalls\n    val Phi1 = Input(Bool())\n    val Stall_s1 = Input(Bool())\n    val IStall_s1 = Input(Bool())\n    val MemStall_s1 = Input(Bool())\n\n    // Boosting information\n    val ABoosted_s1e = Input(Bool())\n    val BBoosted_s1e = Input(Bool())\n    val ABoostValid_v1e = Input(Bool())\n    val BBoostValid_v1e = Input(Bool())\n\n    // Instruction WB cancel\n    val AKill_s1e = Input(Bool())\n    val AIgnore_s2e = Input(Bool())\n    val BKill_s1e = Input(Bool())\n    val BIgnore_s2e = Input(Bool())\n    val ANoDest_s1e = Input(Bool())\n    val BNoDest_s1e = Input(Bool())\n    val ADestIsZero_v1e = Input(Bool())\n    val BDestIsZero_v1e = Input(Bool())\n\n    val ASBypBmem_s1e = Input(Bool())\n    val ATBypBmem_s1e = Input(Bool())\n    val BIsLoad_s1e = Input(Bool())\n\n    // Branches & Exceptions\n    val Commit_s1e = Input(Bool())\n    val Squash_s1e = Input(Bool())\n    val Except_s1w = Input(Bool())\n\n    // Outputs\n    val Alpha1_s1m = Output(Bool())\n    val Beta1_s1m = Output(Bool())\n    val Delta2_q2 = Output(Bool())\n    val ASBypassLoad_s1e = Output(Bool())\n    val ASBypassData_s1e = Output(Bool())\n    val ATBypassLoad_s1e = Output(Bool())\n    val ATBypassData_s1e = Output(Bool())\n\n    val ABoosted_s2e = Output(Bool())\n    val ABoosted_s2m = Output(Bool())\n    val AValid_s1e = Output(Bool())\n    val AValid_s2e = Output(Bool())\n    val AValid_s2m = Output(Bool())\n    val AValid_s1w = Output(Bool())\n    val BBoosted_s2e = Output(Bool())\n    val BBoosted_s2m = Output(Bool())\n    val BValid_s2e = Output(Bool())\n    val BValid_s2m = Output(Bool())\n  })\n\n  // Internal signals\n  val Phi2 = ~io.Phi1\n\n  // Delayed version of Stall\n  val IStall_s2 = RegInit(false.B)\n  val MemStall_s2 = RegInit(false.B)\n\n  // Kill Chain registers\n  val AValid_s2e = RegInit(false.B)\n  val AValid_s1m = RegInit(false.B)\n  val AValid_s2m = RegInit(false.B)\n  val AValid_s1w = RegInit(false.B)\n\n  val BValid_s2e = RegInit(false.B)\n  val BValid_s1m = RegInit(false.B)\n  val BValid_s2m = RegInit(false.B)\n\n  val ABoosted_s2e = RegInit(false.B)\n  val ABoosted_s1m = RegInit(false.B)\n  val ABoosted_s2m = RegInit(false.B)\n\n  val ABoostValid_s2e = RegInit(false.B)\n  val ABoostValid_s1m = RegInit(false.B)\n  val ABoostValid_s2m = RegInit(false.B)\n\n  val BBoostValid_s2e = RegInit(false.B)\n  val BBoostValid_s1m = RegInit(false.B)\n  val BBoostValid_s2m = RegInit(false.B)\n\n  val BBoosted_s2e = RegInit(false.B)\n  val BBoosted_s1m = RegInit(false.B)\n  val BBoosted_s2m = RegInit(false.B)\n\n  val BIsLoad_s2e = RegInit(false.B)\n  val BIsLoad_s1m = RegInit(false.B)\n  val BIsLoad_s2m = RegInit(false.B)\n  val BIsLoad_s1w = RegInit(false.B)\n\n  // Control Logic\n  // Qualify the clocks\n  val Delta2_q2_wire = (~IStall_s2 | MemStall_s2) & Phi2\n  io.Delta2_q2 := Delta2_q2_wire\n\n  // Bypass control logic\n  io.ASBypassLoad_s1e := io.ASBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n  io.ATBypassLoad_s1e := io.ATBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n  io.ASBypassData_s1e := ~(io.ASBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n  io.ATBypassData_s1e := ~(io.ATBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n\n  // Delay IStall\n  when(io.Phi1) {\n    IStall_s2 := io.IStall_s1\n    MemStall_s2 := io.MemStall_s1\n  }\n\n  // Random Logic\n  io.AValid_s1e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n\n  when(io.Phi1 & ~io.Stall_s1) {\n    AValid_s2e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n    AValid_s2m := AValid_s1m & ~io.Except_s1w\n\n    // Boost logic\n    ABoosted_s2e := io.ABoosted_s1e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n    ABoostValid_s2e := io.ABoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n    ABoosted_s2m := ABoosted_s2e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n    ABoostValid_s2m := ABoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n  }\n\n  when(Phi2) {\n    AValid_s1m := AValid_s2e & ~io.AIgnore_s2e\n    AValid_s1w := AValid_s2m\n    ABoosted_s1m := ABoosted_s2e\n    ABoostValid_s1m := ABoostValid_s2e\n  }\n\n  when(io.Phi1 & ~io.Stall_s1) {\n    BValid_s2e := ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w)\n    BValid_s2m := BValid_s1m & ~io.Except_s1w\n\n    // Boost logic for B\n    BBoosted_s2e := io.BBoosted_s1e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n    BBoostValid_s2e := io.BBoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n    BBoosted_s2m := BBoosted_s2e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n    BBoostValid_s2m := BBoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n\n    // Keep track of which B-side instrs are loads\n    BIsLoad_s2e := io.BIsLoad_s1e\n    BIsLoad_s2m := BIsLoad_s1m\n  }\n\n  when(Phi2) {\n    BValid_s1m := BValid_s2e & ~io.BIgnore_s2e\n    BBoosted_s1m := BBoosted_s2e\n    BBoostValid_s1m := BBoostValid_s2e\n    BIsLoad_s1m := BIsLoad_s2e\n    BIsLoad_s1w := BIsLoad_s2m\n  }\n\n  // Don't toggle datapath latches if instruction was killed\n  io.Alpha1_s1m := AValid_s1m & ~io.Stall_s1\n  io.Beta1_s1m := BValid_s1m & ~io.Stall_s1\n\n  // Connect outputs\n  io.ABoosted_s2e := ABoosted_s2e\n  io.ABoosted_s2m := ABoosted_s2m\n  io.AValid_s2e := AValid_s2e\n  io.AValid_s2m := AValid_s2m\n  io.AValid_s1w := AValid_s1w\n  io.BBoosted_s2e := BBoosted_s2e\n  io.BBoosted_s2m := BBoosted_s2m\n  io.BValid_s2e := BValid_s2e\n  io.BValid_s2m := BValid_s2m\n\n  // ============================================================\n  // FORMAL ASSERTIONS\n  // ============================================================\n\n  // ---- SAFETY: Bypass mutual exclusion ----\n\n  // ASBypassLoad_s1e and ASBypassData_s1e must never both be true\n  fvAssert(!(io.ASBypassLoad_s1e & io.ASBypassData_s1e),\n    \"ASBypassLoad_and_ASBypassData_mutex\")\n\n  // ATBypassLoad_s1e and ATBypassData_s1e must never both be true\n  fvAssert(!(io.ATBypassLoad_s1e & io.ATBypassData_s1e),\n    \"ATBypassLoad_and_ATBypassData_mutex\")\n\n  // When not killed, exactly one of ASBypassLoad/ASBypassData is true (XOR relationship)\n  fvAssert(io.AKill_s1e | (io.ASBypassLoad_s1e ^ io.ASBypassData_s1e),\n    \"ASBypass_exactly_one_when_not_killed\")\n\n  // When not killed, exactly one of ATBypassLoad/ATBypassData is true\n  fvAssert(io.AKill_s1e | (io.ATBypassLoad_s1e ^ io.ATBypassData_s1e),\n    \"ATBypass_exactly_one_when_not_killed\")\n\n  // ---- SAFETY: Pipeline validity definition ----\n\n  // AValid_s1e must equal ~(AKill_s1e | ANoDest_s1e | Except_s1w)\n  fvAssert(io.AValid_s1e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n    \"AValid_s1e_definition\")\n\n  // ---- SAFETY: Pipeline register stability during stalls ----\n\n  // When stalled on Phi1, AValid_s2e must hold its value (register does not update)\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2e,\n    \"AValid_s2e_stable_during_stall\")\n\n  // When stalled on Phi1, AValid_s2m must hold its value\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2m,\n    \"AValid_s2m_stable_during_stall\")\n\n  // ---- SAFETY: Pipeline stage update correctness ----\n\n  // On Phi2, AValid_s1m must equal (AValid_s2e & ~AIgnore_s2e)\n  assertImplies(Phi2,\n    AValid_s1m === (AValid_s2e & ~io.AIgnore_s2e),\n    \"AValid_s1m_Phi2_update\")\n\n  // On Phi2, AValid_s1w must equal AValid_s2m\n  assertImplies(Phi2,\n    AValid_s1w === AValid_s2m,\n    \"AValid_s1w_Phi2_update\")\n\n  // On Phi1 & ~Stall, AValid_s2e must equal ~(AKill | ANoDest | Except)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    AValid_s2e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n    \"AValid_s2e_Phi1_update\")\n\n  // On Phi1 & ~Stall, AValid_s2m must equal (AValid_s1m & ~Except_s1w)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    AValid_s2m === (AValid_s1m & ~io.Except_s1w),\n    \"AValid_s2m_Phi1_update\")\n\n  // On Phi2, BValid_s1m must equal (BValid_s2e & ~BIgnore_s2e)\n  assertImplies(Phi2,\n    BValid_s1m === (BValid_s2e & ~io.BIgnore_s2e),\n    \"BValid_s1m_Phi2_update\")\n\n  // On Phi1 & ~Stall, BValid_s2e must equal ~(BKill | BNoDest | Except)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    BValid_s2e === ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w),\n    \"BValid_s2e_Phi1_update\")\n\n  // On Phi1 & ~Stall, BValid_s2m must equal (BValid_s1m & ~Except_s1w)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    BValid_s2m === (BValid_s1m & ~io.Except_s1w),\n    \"BValid_s2m_Phi1_update\")\n\n  // ---- LIVENESS: Pipeline progress ----\n\n  // A-side pipeline: When a valid instruction enters (AValid_s1e, not stalled),\n  // it must reach AValid_s1w within 10 cycles, or be canceled (kill/except/squash).\n  // Pipeline depth is 4 register stages (s1e→s2e→s1m→s2m→s1w); bound of 10 is generous.\n  astRelaxedLiveness(\n    io.AValid_s1e & ~io.Stall_s1,\n    io.AValid_s1w | io.AKill_s1e | io.Except_s1w | io.Squash_s1e,\n    10,\n    \"A_pipeline_progress\"\n  )\n\n  // B-side pipeline: When a valid instruction enters, it must reach BValid_s2m\n  // within 10 cycles, or be canceled.\n  // B pipeline depth is 3 register stages; bound of 10 is generous.\n  astRelaxedLiveness(\n    ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w) & ~io.Stall_s1,\n    io.BValid_s2m | io.BKill_s1e | io.Except_s1w | io.Squash_s1e,\n    10,\n    \"B_pipeline_progress\"\n  )\n\n  // ---- LIVENESS: Pipeline must not get stuck ----\n  // Timer-based: if AValid_s1e is true continuously for >20 cycles without\n  // AValid_s1w being asserted or a pipeline-clearing event, the pipeline is stuck.\n  assertLivenessTimer(\n    io.AValid_s1e,\n    io.AValid_s1w | io.Except_s1w | io.Squash_s1e,\n    20,\n    \"A_pipeline_not_stuck\"\n  )\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new ABypassCtrl(), args)\n}\n",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.scala",
+                "original_chars": 9480,
+                "original_lines": 286,
+                "returned_chars": 9480,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "ABypassCtrl.scala"
+              ],
+              "reason": "Read the full source file to understand the design and find the assertion"
+            },
+            "id": "call_00_YH6Ka7NCmmjzEJ02QsiI4801",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 1
+      },
+      {
+        "action_results": [
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 100,
+              "pattern": "*"
+            },
+            "id": "call_00_knqrEjQ0ul3c5Kr0k8s75433",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 2
+      },
+      {
+        "action_results": [
+          {
+            "count": 101,
+            "signals": [
+              {
+                "handle": 1,
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.reset"
+              },
+              {
+                "handle": 2,
+                "length": 32,
+                "name": "ABypassCtrl.resetCounter.timeSinceReset [31:0]"
+              },
+              {
+                "handle": 3,
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.notChaos"
+              },
+              {
+                "handle": 4,
+                "length": 32,
+                "name": "ABypassCtrl.resetCounter.count [31:0]"
+              },
+              {
+                "handle": 5,
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.flag"
+              },
+              {
+                "handle": 6,
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.clk"
+              },
+              {
+                "handle": 7,
+                "length": 1,
+                "name": "ABypassCtrl.:jasper_formal_reset"
+              },
+              {
+                "handle": 8,
+                "length": 1,
+                "name": "ABypassCtrl.reset"
+              },
+              {
+                "handle": 9,
+                "length": 1,
+                "name": "ABypassCtrl.io_Phi1"
+              },
+              {
+                "handle": 10,
+                "length": 1,
+                "name": "ABypassCtrl.io_Stall_s1"
+              },
+              {
+                "handle": 11,
+                "length": 1,
+                "name": "ABypassCtrl.io_IStall_s1"
+              },
+              {
+                "handle": 12,
+                "length": 1,
+                "name": "ABypassCtrl.io_MemStall_s1"
+              },
+              {
+                "handle": 13,
+                "length": 1,
+                "name": "ABypassCtrl.io_ABoosted_s1e"
+              },
+              {
+                "handle": 14,
+                "length": 1,
+                "name": "ABypassCtrl.io_BBoosted_s1e"
+              },
+              {
+                "handle": 15,
+                "length": 1,
+                "name": "ABypassCtrl.io_ABoostValid_v1e"
+              },
+              {
+                "handle": 16,
+                "length": 1,
+                "name": "ABypassCtrl.io_BBoostValid_v1e"
+              },
+              {
+                "handle": 17,
+                "length": 1,
+                "name": "ABypassCtrl.io_AKill_s1e"
+              },
+              {
+                "handle": 18,
+                "length": 1,
+                "name": "ABypassCtrl.io_AIgnore_s2e"
+              },
+              {
+                "handle": 19,
+                "length": 1,
+                "name": "ABypassCtrl.io_BKill_s1e"
+              },
+              {
+                "handle": 20,
+                "length": 1,
+                "name": "ABypassCtrl.io_BIgnore_s2e"
+              },
+              {
+                "handle": 21,
+                "length": 1,
+                "name": "ABypassCtrl.io_ANoDest_s1e"
+              },
+              {
+                "handle": 22,
+                "length": 1,
+                "name": "ABypassCtrl.io_BNoDest_s1e"
+              },
+              {
+                "handle": 23,
+                "length": 1,
+                "name": "ABypassCtrl.io_ADestIsZero_v1e"
+              },
+              {
+                "handle": 24,
+                "length": 1,
+                "name": "ABypassCtrl.io_BDestIsZero_v1e"
+              },
+              {
+                "handle": 25,
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypBmem_s1e"
+              },
+              {
+                "handle": 26,
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypBmem_s1e"
+              },
+              {
+                "handle": 27,
+                "length": 1,
+                "name": "ABypassCtrl.io_BIsLoad_s1e"
+              },
+              {
+                "handle": 28,
+                "length": 1,
+                "name": "ABypassCtrl.io_Commit_s1e"
+              },
+              {
+                "handle": 29,
+                "length": 1,
+                "name": "ABypassCtrl.io_Squash_s1e"
+              },
+              {
+                "handle": 30,
+                "length": 1,
+                "name": "ABypassCtrl.io_Except_s1w"
+              },
+              {
+                "handle": 31,
+                "length": 1,
+                "name": "ABypassCtrl.io_Alpha1_s1m"
+              },
+              {
+                "handle": 32,
+                "length": 1,
+                "name": "ABypassCtrl.io_Beta1_s1m"
+              },
+              {
+                "handle": 33,
+                "length": 1,
+                "name": "ABypassCtrl.io_Delta2_q2"
+              },
+              {
+                "handle": 34,
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassLoad_s1e"
+              },
+              {
+                "handle": 35,
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassData_s1e"
+              },
+              {
+                "handle": 36,
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassLoad_s1e"
+              },
+              {
+                "handle": 37,
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassData_s1e"
+              },
+              {
+                "handle": 38,
+                "length": 1,
+                "name": "ABypassCtrl.io_ABoosted_s2e"
+              },
+              {
+                "handle": 39,
+                "length": 1,
+                "name": "ABypassCtrl.io_ABoosted_s2m"
+              },
+              {
+                "handle": 40,
+                "length": 1,
+                "name": "ABypassCtrl.io_AValid_s1e"
+              },
+              {
+                "handle": 41,
+                "length": 1,
+                "name": "ABypassCtrl.io_AValid_s2e"
+              },
+              {
+                "handle": 42,
+                "length": 1,
+                "name": "ABypassCtrl.io_AValid_s2m"
+              },
+              {
+                "handle": 43,
+                "length": 1,
+                "name": "ABypassCtrl.io_AValid_s1w"
+              },
+              {
+                "handle": 44,
+                "length": 1,
+                "name": "ABypassCtrl.io_BBoosted_s2e"
+              },
+              {
+                "handle": 45,
+                "length": 1,
+                "name": "ABypassCtrl.io_BBoosted_s2m"
+              },
+              {
+                "handle": 46,
+                "length": 1,
+                "name": "ABypassCtrl.io_BValid_s2e"
+              },
+              {
+                "handle": 47,
+                "length": 1,
+                "name": "ABypassCtrl.io_BValid_s2m"
+              },
+              {
+                "handle": 48,
+                "length": 1,
+                "name": "ABypassCtrl._resetCounter_notChaos"
+              },
+              {
+                "handle": 49,
+                "length": 1,
+                "name": "ABypassCtrl.IStall_s2"
+              },
+              {
+                "handle": 50,
+                "length": 1,
+                "name": "ABypassCtrl.MemStall_s2"
+              },
+              {
+                "handle": 51,
+                "length": 1,
+                "name": "ABypassCtrl.AValid_s2e"
+              },
+              {
+                "handle": 52,
+                "length": 1,
+                "name": "ABypassCtrl.AValid_s1m"
+              },
+              {
+                "handle": 53,
+                "length": 1,
+                "name": "ABypassCtrl.AValid_s2m"
+              },
+              {
+                "handle": 54,
+                "length": 1,
+                "name": "ABypassCtrl.AValid_s1w"
+              },
+              {
+                "handle": 55,
+                "length": 1,
+                "name": "ABypassCtrl.BValid_s2e"
+              },
+              {
+                "handle": 56,
+                "length": 1,
+                "name": "ABypassCtrl.BValid_s1m"
+              },
+              {
+                "handle": 57,
+                "length": 1,
+                "name": "ABypassCtrl.BValid_s2m"
+              },
+              {
+                "handle": 58,
+                "length": 1,
+                "name": "ABypassCtrl.ABoosted_s2e"
+              },
+              {
+                "handle": 59,
+                "length": 1,
+                "name": "ABypassCtrl.ABoosted_s2m"
+              },
+              {
+                "handle": 60,
+                "length": 1,
+                "name": "ABypassCtrl.BBoosted_s2e"
+              },
+              {
+                "handle": 61,
+                "length": 1,
+                "name": "ABypassCtrl.BBoosted_s2m"
+              },
+              {
+                "handle": 62,
+                "length": 1,
+                "name": "ABypassCtrl.BIsLoad_s2e"
+              },
+              {
+                "handle": 63,
+                "length": 1,
+                "name": "ABypassCtrl.BIsLoad_s1m"
+              },
+              {
+                "handle": 64,
+                "length": 1,
+                "name": "ABypassCtrl.BIsLoad_s2m"
+              },
+              {
+                "handle": 65,
+                "length": 1,
+                "name": "ABypassCtrl.BIsLoad_s1w"
+              },
+              {
+                "handle": 66,
+                "length": 1,
+                "name": "ABypassCtrl._io_ASBypassData_s1e_T"
+              },
+              {
+                "handle": 67,
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassLoad_s1e_0"
+              },
+              {
+                "handle": 68,
+                "length": 1,
+                "name": "ABypassCtrl._io_ATBypassData_s1e_T"
+              },
+              {
+                "handle": 69,
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassLoad_s1e_0"
+              },
+              {
+                "handle": 70,
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassData_s1e_0"
+              },
+              {
+                "handle": 71,
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassData_s1e_0"
+              },
+              {
+                "handle": 72,
+                "length": 1,
+                "name": "ABypassCtrl._AValid_s2e_T"
+              },
+              {
+                "handle": 73,
+                "length": 1,
+                "name": "ABypassCtrl._io_AValid_s1e_T_1"
+              },
+              {
+                "handle": 74,
+                "length": 1,
+                "name": "ABypassCtrl._GEN"
+              },
+              {
+                "handle": 75,
+                "length": 1,
+                "name": "ABypassCtrl.hasBeenResetReg"
+              },
+              {
+                "handle": 76,
+                "length": 1,
+                "name": "ABypassCtrl.hasBeenReset"
+              },
+              {
+                "handle": 77,
+                "length": 1,
+                "name": "ABypassCtrl._GEN_0"
+              },
+              {
+                "handle": 78,
+                "length": 1,
+                "name": "ABypassCtrl._GEN_1"
+              },
+              {
+                "handle": 79,
+                "length": 1,
+                "name": "ABypassCtrl.r"
+              },
+              {
+                "handle": 80,
+                "length": 1,
+                "name": "ABypassCtrl.r_1"
+              },
+              {
+                "handle": 81,
+                "length": 1,
+                "name": "ABypassCtrl._GEN_2"
+              },
+              {
+                "handle": 82,
+                "length": 1,
+                "name": "ABypassCtrl._GEN_3"
+              },
+              {
+                "handle": 83,
+                "length": 1,
+                "name": "ABypassCtrl.pending"
+              },
+              {
+                "handle": 84,
+                "length": 4,
+                "name": "ABypassCtrl.timer [3:0]"
+              },
+              {
+                "handle": 85,
+                "length": 1,
+                "name": "ABypassCtrl.nextPending"
+              },
+              {
+                "handle": 86,
+                "length": 1,
+                "name": "ABypassCtrl._nextTimer_T_1"
+              },
+              {
+                "handle": 87,
+                "length": 4,
+                "name": "ABypassCtrl._nextTimer_T_2 [3:0]"
+              },
+              {
+                "handle": 88,
+                "length": 1,
+                "name": "ABypassCtrl._GEN_4"
+              },
+              {
+                "handle": 89,
+                "length": 1,
+                "name": "ABypassCtrl.pending_1"
+              },
+              {
+                "handle": 90,
+                "length": 4,
+                "name": "ABypassCtrl.timer_1 [3:0]"
+              },
+              {
+                "handle": 91,
+                "length": 1,
+                "name": "ABypassCtrl.nextPending_1"
+              },
+              {
+                "handle": 92,
+                "length": 1,
+                "name": "ABypassCtrl._nextTimer_T_5"
+              },
+              {
+                "handle": 93,
+                "length": 4,
+                "name": "ABypassCtrl._nextTimer_T_6 [3:0]"
+              },
+              {
+                "handle": 94,
+                "length": 5,
+                "name": "ABypassCtrl.timer_2 [4:0]"
+              },
+              {
+                "handle": 95,
+                "length": 1,
+                "name": "ABypassCtrl._nextTimer_T_9"
+              },
+              {
+                "handle": 96,
+                "length": 5,
+                "name": "ABypassCtrl._nextTimer_T_10 [4:0]"
+              },
+              {
+                "handle": 97,
+                "length": 1,
+                "name": "ABypassCtrl._ABoosted_s2m_T"
+              },
+              {
+                "handle": 98,
+                "length": 1,
+                "name": "ABypassCtrl._BBoosted_s2m_T"
+              },
+              {
+                "handle": 99,
+                "length": 1,
+                "name": "ABypassCtrl.AValid_s2e_stable_during_stall"
+              },
+              {
+                "handle": 100,
+                "length": 1,
+                "name": "ABypassCtrl.:jasper_formal_clock"
+              }
+            ],
+            "success": true,
+            "truncated": true,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 100,
+              "pattern": "."
+            },
+            "id": "call_00_oVsaCIhL2pS18LQW3LfW2220",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 3
+      },
+      {
+        "action_results": [
+          {
+            "active_signals": [
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.notChaos",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.flag",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.clk",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_Phi1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypBmem_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypBmem_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_BIsLoad_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassData_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassData_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_AValid_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._resetCounter_notChaos",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassData_s1e_0",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassData_s1e_0",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._GEN",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.hasBeenResetReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.hasBeenReset",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.nextPending",
+                "value": "1"
+              },
+              {
+                "length": 4,
+                "name": "ABypassCtrl._nextTimer_T_2 [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.nextPending_1",
+                "value": "1"
+              },
+              {
+                "length": 4,
+                "name": "ABypassCtrl._nextTimer_T_6 [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 5,
+                "name": "ABypassCtrl._nextTimer_T_10 [4:0]",
+                "value": "00001"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.AValid_s2e_stable_during_stall",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.:jasper_formal_clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.clock",
+                "value": "1"
+              }
+            ],
+            "count": 24,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 100,
+              "time": 0
+            },
+            "id": "call_00_JfHFk7ncRXKN09O6Fo2E6502",
+            "name": "waveform_get_active_signals"
+          }
+        ],
+        "iteration": 4
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 10,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.AValid_s2e_stable_during_stall",
+            "signal_name": "ABypassCtrl.AValid_s2e_stable_during_stall",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_Phi1",
+            "signal_name": "ABypassCtrl.io_Phi1",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_Stall_s1",
+            "signal_name": "ABypassCtrl.io_Stall_s1",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.AValid_s2e",
+            "signal_name": "ABypassCtrl.AValid_s2e",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_AValid_s2e",
+            "signal_name": "ABypassCtrl.io_AValid_s2e",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 20,
+              "signal_name": "ABypassCtrl.AValid_s2e_stable_during_stall",
+              "start_time": 0
+            },
+            "id": "call_00_Btn1ubsdNPAUIb3y9SNi9586",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 20,
+              "signal_name": "ABypassCtrl.io_Phi1",
+              "start_time": 0
+            },
+            "id": "call_01_cJrsT2l2tOY6K3rQKYja0798",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 20,
+              "signal_name": "ABypassCtrl.io_Stall_s1",
+              "start_time": 0
+            },
+            "id": "call_02_DjOrRclihR5un0AyZWPE9192",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 20,
+              "signal_name": "ABypassCtrl.AValid_s2e",
+              "start_time": 0
+            },
+            "id": "call_03_EbUNajI63YnbbPMHdrXP7776",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 20,
+              "signal_name": "ABypassCtrl.io_AValid_s2e",
+              "start_time": 0
+            },
+            "id": "call_04_SUolKOMl5VNkTdCPc3c50102",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 5
+      },
+      {
+        "action_results": [
+          {
+            "active_signals": [
+              {
+                "length": 32,
+                "name": "ABypassCtrl.resetCounter.timeSinceReset [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.notChaos",
+                "value": "1"
+              },
+              {
+                "length": 32,
+                "name": "ABypassCtrl.resetCounter.count [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.flag",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.clk",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_Phi1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_Stall_s1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypBmem_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypBmem_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_BIsLoad_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassData_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassData_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_AValid_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_AValid_s2e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_BValid_s2e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._resetCounter_notChaos",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.AValid_s2e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.BValid_s2e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.BIsLoad_s2e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassData_s1e_0",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassData_s1e_0",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.hasBeenResetReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.hasBeenReset",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._GEN_1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.pending",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.nextPending",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._nextTimer_T_1",
+                "value": "1"
+              },
+              {
+                "length": 4,
+                "name": "ABypassCtrl._nextTimer_T_2 [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.pending_1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.nextPending_1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._nextTimer_T_5",
+                "value": "1"
+              },
+              {
+                "length": 4,
+                "name": "ABypassCtrl._nextTimer_T_6 [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 5,
+                "name": "ABypassCtrl.timer_2 [4:0]",
+                "value": "00001"
+              },
+              {
+                "length": 5,
+                "name": "ABypassCtrl._nextTimer_T_10 [4:0]",
+                "value": "00010"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.:jasper_formal_clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.clock",
+                "value": "1"
+              }
+            ],
+            "count": 36,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 100,
+              "time": 10
+            },
+            "id": "call_00_AHj6Hz4WZ7dzKihNBHus5107",
+            "name": "waveform_get_active_signals"
+          }
+        ],
+        "iteration": 6
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_AKill_s1e",
+            "signal_name": "ABypassCtrl.io_AKill_s1e",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_ANoDest_s1e",
+            "signal_name": "ABypassCtrl.io_ANoDest_s1e",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_Except_s1w",
+            "signal_name": "ABypassCtrl.io_Except_s1w",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_AValid_s1e",
+            "signal_name": "ABypassCtrl.io_AValid_s1e",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._AValid_s2e_T",
+            "signal_name": "ABypassCtrl._AValid_s2e_T",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 10,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._GEN",
+            "signal_name": "ABypassCtrl._GEN",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "end_time": 20,
+              "signal_name": "ABypassCtrl.io_AKill_s1e",
+              "start_time": 0
+            },
+            "id": "call_00_zVZrVxlKGDuuQgLgVcov6640",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 20,
+              "signal_name": "ABypassCtrl.io_ANoDest_s1e",
+              "start_time": 0
+            },
+            "id": "call_01_WUGrDaP0r9eYdYJGL3Gp8263",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 20,
+              "signal_name": "ABypassCtrl.io_Except_s1w",
+              "start_time": 0
+            },
+            "id": "call_02_642EWg4Vkk7CniI06Kvk6843",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 20,
+              "signal_name": "ABypassCtrl.io_AValid_s1e",
+              "start_time": 0
+            },
+            "id": "call_03_eyo7qHamJ4YmEPh26idQ8957",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 20,
+              "signal_name": "ABypassCtrl._AValid_s2e_T",
+              "start_time": 0
+            },
+            "id": "call_04_s4HBBRSKynutqjj6FZPU4616",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "end_time": 20,
+              "signal_name": "ABypassCtrl._GEN",
+              "start_time": 0
+            },
+            "id": "call_05_sJ91jE6eGFwzER7MwTC27002",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 7
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\nclass ABypassCtrl extends Module with Formal {\n  val io = IO(new Bundle {\n    // Clocks & Stalls\n    val Phi1 = Input(Bool())\n    val Stall_s1 = Input(Bool())\n    val IStall_s1 = Input(Bool())\n    val MemStall_s1 = Input(Bool())\n\n    // Boosting information\n    val ABoosted_s1e = Input(Bool())\n    val BBoosted_s1e = Input(Bool())\n    val ABoostValid_v1e = Input(Bool())\n    val BBoostValid_v1e = Input(Bool())\n\n    // Instruction WB cancel\n    val AKill_s1e = Input(Bool())\n    val AIgnore_s2e = Input(Bool())\n    val BKill_s1e = Input(Bool())\n    val BIgnore_s2e = Input(Bool())\n    val ANoDest_s1e = Input(Bool())\n    val BNoDest_s1e = Input(Bool())\n    val ADestIsZero_v1e = Input(Bool())\n    val BDestIsZero_v1e = Input(Bool())\n\n    val ASBypBmem_s1e = Input(Bool())\n    val ATBypBmem_s1e = Input(Bool())\n    val BIsLoad_s1e = Input(Bool())\n\n    // Branches & Exceptions\n    val Commit_s1e = Input(Bool())\n    val Squash_s1e = Input(Bool())\n    val Except_s1w = Input(Bool())\n\n    // Outputs\n    val Alpha1_s1m = Output(Bool())\n    val Beta1_s1m = Output(Bool())\n    val Delta2_q2 = Output(Bool())\n    val ASBypassLoad_s1e = Output(Bool())\n    val ASBypassData_s1e = Output(Bool())\n    val ATBypassLoad_s1e = Output(Bool())\n    val ATBypassData_s1e = Output(Bool())\n\n    val ABoosted_s2e = Output(Bool())\n    val ABoosted_s2m = Output(Bool())\n    val AValid_s1e = Output(Bool())\n    val AValid_s2e = Output(Bool())\n    val AValid_s2m = Output(Bool())\n    val AValid_s1w = Output(Bool())\n    val BBoosted_s2e = Output(Bool())\n    val BBoosted_s2m = Output(Bool())\n    val BValid_s2e = Output(Bool())\n    val BValid_s2m = Output(Bool())\n  })\n\n  // Internal signals\n  val Phi2 = ~io.Phi1\n\n  // Delayed version of Stall\n  val IStall_s2 = RegInit(false.B)\n  val MemStall_s2 = RegInit(false.B)\n\n  // Kill Chain registers\n  val AValid_s2e = RegInit(false.B)\n  val AValid_s1m = RegInit(false.B)\n  val AValid_s2m = RegInit(false.B)\n  val AValid_s1w = RegInit(false.B)\n\n  val BValid_s2e = RegInit(false.B)\n  val BValid_s1m = RegInit(false.B)\n  val BValid_s2m = RegInit(false.B)\n\n  val ABoosted_s2e = RegInit(false.B)\n  val ABoosted_s1m = RegInit(false.B)\n  val ABoosted_s2m = RegInit(false.B)\n\n  val ABoostValid_s2e = RegInit(false.B)\n  val ABoostValid_s1m = RegInit(false.B)\n  val ABoostValid_s2m = RegInit(false.B)\n\n  val BBoostValid_s2e = RegInit(false.B)\n  val BBoostValid_s1m = RegInit(false.B)\n  val BBoostValid_s2m = RegInit(false.B)\n\n  val BBoosted_s2e = RegInit(false.B)\n  val BBoosted_s1m = RegInit(false.B)\n  val BBoosted_s2m = RegInit(false.B)\n\n  val BIsLoad_s2e = RegInit(false.B)\n  val BIsLoad_s1m = RegInit(false.B)\n  val BIsLoad_s2m = RegInit(false.B)\n  val BIsLoad_s1w = RegInit(false.B)\n\n  // Control Logic\n  // Qualify the clocks\n  val Delta2_q2_wire = (~IStall_s2 | MemStall_s2) & Phi2\n  io.Delta2_q2 := Delta2_q2_wire\n\n  // Bypass control logic\n  io.ASBypassLoad_s1e := io.ASBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n  io.ATBypassLoad_s1e := io.ATBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n  io.ASBypassData_s1e := ~(io.ASBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n  io.ATBypassData_s1e := ~(io.ATBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n\n  // Delay IStall\n  when(io.Phi1) {\n    IStall_s2 := io.IStall_s1\n    MemStall_s2 := io.MemStall_s1\n  }\n\n  // Random Logic\n  io.AValid_s1e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n\n  when(io.Phi1 & ~io.Stall_s1) {\n    AValid_s2e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n    AValid_s2m := AValid_s1m & ~io.Except_s1w\n\n    // Boost logic\n    ABoosted_s2e := io.ABoosted_s1e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n    ABoostValid_s2e := io.ABoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n    ABoosted_s2m := ABoosted_s2e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n    ABoostValid_s2m := ABoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n  }\n\n  when(Phi2) {\n    AValid_s1m := AValid_s2e & ~io.AIgnore_s2e\n    AValid_s1w := AValid_s2m\n    ABoosted_s1m := ABoosted_s2e\n    ABoostValid_s1m := ABoostValid_s2e\n  }\n\n  when(io.Phi1 & ~io.Stall_s1) {\n    BValid_s2e := ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w)\n    BValid_s2m := BValid_s1m & ~io.Except_s1w\n\n    // Boost logic for B\n    BBoosted_s2e := io.BBoosted_s1e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n    BBoostValid_s2e := io.BBoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n    BBoosted_s2m := BBoosted_s2e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n    BBoostValid_s2m := BBoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n\n    // Keep track of which B-side instrs are loads\n    BIsLoad_s2e := io.BIsLoad_s1e\n    BIsLoad_s2m := BIsLoad_s1m\n  }\n\n  when(Phi2) {\n    BValid_s1m := BValid_s2e & ~io.BIgnore_s2e\n    BBoosted_s1m := BBoosted_s2e\n    BBoostValid_s1m := BBoostValid_s2e\n    BIsLoad_s1m := BIsLoad_s2e\n    BIsLoad_s1w := BIsLoad_s2m\n  }\n\n  // Don't toggle datapath latches if instruction was killed\n  io.Alpha1_s1m := AValid_s1m & ~io.Stall_s1\n  io.Beta1_s1m := BValid_s1m & ~io.Stall_s1\n\n  // Connect outputs\n  io.ABoosted_s2e := ABoosted_s2e\n  io.ABoosted_s2m := ABoosted_s2m\n  io.AValid_s2e := AValid_s2e\n  io.AValid_s2m := AValid_s2m\n  io.AValid_s1w := AValid_s1w\n  io.BBoosted_s2e := BBoosted_s2e\n  io.BBoosted_s2m := BBoosted_s2m\n  io.BValid_s2e := BValid_s2e\n  io.BValid_s2m := BValid_s2m\n\n  // ============================================================\n  // FORMAL ASSERTIONS\n  // ============================================================\n\n  // ---- SAFETY: Bypass mutual exclusion ----\n\n  // ASBypassLoad_s1e and ASBypassData_s1e must never both be true\n  fvAssert(!(io.ASBypassLoad_s1e & io.ASBypassData_s1e),\n    \"ASBypassLoad_and_ASBypassData_mutex\")\n\n  // ATBypassLoad_s1e and ATBypassData_s1e must never both be true\n  fvAssert(!(io.ATBypassLoad_s1e & io.ATBypassData_s1e),\n    \"ATBypassLoad_and_ATBypassData_mutex\")\n\n  // When not killed, exactly one of ASBypassLoad/ASBypassData is true (XOR relationship)\n  fvAssert(io.AKill_s1e | (io.ASBypassLoad_s1e ^ io.ASBypassData_s1e),\n    \"ASBypass_exactly_one_when_not_killed\")\n\n  // When not killed, exactly one of ATBypassLoad/ATBypassData is true\n  fvAssert(io.AKill_s1e | (io.ATBypassLoad_s1e ^ io.ATBypassData_s1e),\n    \"ATBypass_exactly_one_when_not_killed\")\n\n  // ---- SAFETY: Pipeline validity definition ----\n\n  // AValid_s1e must equal ~(AKill_s1e | ANoDest_s1e | Except_s1w)\n  fvAssert(io.AValid_s1e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n    \"AValid_s1e_definition\")\n\n  // ---- SAFETY: Pipeline register stability during stalls ----\n\n  // When stalled on Phi1, AValid_s2e must hold its value (register does not update)\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2e,\n    \"AValid_s2e_stable_during_stall\")\n\n  // When stalled on Phi1, AValid_s2m must hold its value\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2m,\n    \"AValid_s2m_stable_during_stall\")\n\n  // ---- SAFETY: Pipeline stage update correctness ----\n\n  // On Phi2, AValid_s1m must equal (AValid_s2e & ~AIgnore_s2e)\n  assertImplies(Phi2,\n    AValid_s1m === (AValid_s2e & ~io.AIgnore_s2e),\n    \"AValid_s1m_Phi2_update\")\n\n  // On Phi2, AValid_s1w must equal AValid_s2m\n  assertImplies(Phi2,\n    AValid_s1w === AValid_s2m,\n    \"AValid_s1w_Phi2_update\")\n\n  // On Phi1 & ~Stall, AValid_s2e must equal ~(AKill | ANoDest | Except)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    AValid_s2e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n    \"AValid_s2e_Phi1_update\")\n\n  // On Phi1 & ~Stall, AValid_s2m must equal (AValid_s1m & ~Except_s1w)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    AValid_s2m === (AValid_s1m & ~io.Except_s1w),\n    \"AValid_s2m_Phi1_update\")\n\n  // On Phi2, BValid_s1m must equal (BValid_s2e & ~BIgnore_s2e)\n  assertImplies(Phi2,\n    BValid_s1m === (BValid_s2e & ~io.BIgnore_s2e),\n    \"BValid_s1m_Phi2_update\")\n\n  // On Phi1 & ~Stall, BValid_s2e must equal ~(BKill | BNoDest | Except)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    BValid_s2e === ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w),\n    \"BValid_s2e_Phi1_update\")\n\n  // On Phi1 & ~Stall, BValid_s2m must equal (BValid_s1m & ~Except_s1w)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    BValid_s2m === (BValid_s1m & ~io.Except_s1w),\n    \"BValid_s2m_Phi1_update\")\n\n  // ---- LIVENESS: Pipeline progress ----\n\n  // A-side pipeline: When a valid instruction enters (AValid_s1e, not stalled),\n  // it must reach AValid_s1w within 10 cycles, or be canceled (kill/except/squash).\n  // Pipeline depth is 4 register stages (s1e→s2e→s1m→s2m→s1w); bound of 10 is generous.\n  astRelaxedLiveness(\n    io.AValid_s1e & ~io.Stall_s1,\n    io.AValid_s1w | io.AKill_s1e | io.Except_s1w | io.Squash_s1e,\n    10,\n    \"A_pipeline_progress\"\n  )\n\n  // B-side pipeline: When a valid instruction enters, it must reach BValid_s2m\n  // within 10 cycles, or be canceled.\n  // B pipeline depth is 3 register stages; bound of 10 is generous.\n  astRelaxedLiveness(\n    ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w) & ~io.Stall_s1,\n    io.BValid_s2m | io.BKill_s1e | io.Except_s1w | io.Squash_s1e,\n    10,\n    \"B_pipeline_progress\"\n  )\n\n  // ---- LIVENESS: Pipeline must not get stuck ----\n  // Timer-based: if AValid_s1e is true continuously for >20 cycles without\n  // AValid_s1w being asserted or a pipeline-clearing event, the pipeline is stuck.\n  assertLivenessTimer(\n    io.AValid_s1e,\n    io.AValid_s1w | io.Except_s1w | io.Squash_s1e,\n    20,\n    \"A_pipeline_not_stuck\"\n  )\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new ABypassCtrl(), args)\n}\n",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.scala",
+                "original_chars": 9480,
+                "original_lines": 286,
+                "returned_chars": 9480,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "ABypassCtrl.scala"
+              ],
+              "reason": "Read the full ABypassCtrl source to understand the assertion and logic"
+            },
+            "id": "call_00_g1P7EClNqqvcuZ7rayam3707",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 8
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": null,
+                "error": "Error reading file: File does not exist: log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/generated/ABypassCtrl.v",
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/generated/ABypassCtrl.v",
+                "success": false
+              }
+            ],
+            "success": false,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "generated/ABypassCtrl.v"
+              ],
+              "reason": "Read the generated Verilog to understand register implementation and clocking"
+            },
+            "id": "call_00_jW5kso2kBoeMXNadqISN2127",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 9
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": null,
+                "error": "Error reading file: Path is not a file: log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl",
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl",
+                "success": false
+              }
+            ],
+            "success": false,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "verilog/extra_bench/torch_regfile_ABypassCtrl"
+              ],
+              "reason": "Check what verilog files exist"
+            },
+            "id": "call_00_0BYaVoHYgLZSCtS4odJc9377",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 10
+      },
+      {
+        "action_results": [
+          {
+            "error": "Causal analysis JSON is not available for this waveform",
+            "success": false,
+            "type": "causal_get_roots"
+          },
+          {
+            "count": 10,
+            "failed_count": 0,
+            "resolved_count": 10,
+            "results": [
+              {
+                "signal_name": "ABypassCtrl.io_Phi1",
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "signal_name": "ABypassCtrl.io_Stall_s1",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "ABypassCtrl.AValid_s2e",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "ABypassCtrl.io_AValid_s2e",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "ABypassCtrl.io_AValid_s1e",
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "signal_name": "ABypassCtrl.io_AKill_s1e",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "ABypassCtrl.io_ANoDest_s1e",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "ABypassCtrl.io_Except_s1w",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "ABypassCtrl._AValid_s2e_T",
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "signal_name": "ABypassCtrl._GEN",
+                "time": 0,
+                "value": "1"
+              }
+            ],
+            "success": true,
+            "type": "waveform_get_signal_value"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "limit": 10
+            },
+            "id": "call_00_QDJ8l1PzVN8qeBtFGk5W6181",
+            "name": "causal_get_roots"
+          },
+          {
+            "arguments": {
+              "signal_names": [
+                "ABypassCtrl.io_Phi1",
+                "ABypassCtrl.io_Stall_s1",
+                "ABypassCtrl.AValid_s2e",
+                "ABypassCtrl.io_AValid_s2e",
+                "ABypassCtrl.io_AValid_s1e",
+                "ABypassCtrl.io_AKill_s1e",
+                "ABypassCtrl.io_ANoDest_s1e",
+                "ABypassCtrl.io_Except_s1w",
+                "ABypassCtrl._AValid_s2e_T",
+                "ABypassCtrl._GEN"
+              ],
+              "times": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            "id": "call_01_25ktL3hdL2Pd7rvOLys17133",
+            "name": "waveform_get_signal_value"
+          }
+        ],
+        "iteration": 11
+      },
+      {
+        "action_results": [
+          {
+            "count": 2,
+            "signals": [
+              {
+                "handle": 100,
+                "length": 1,
+                "name": "ABypassCtrl.:jasper_formal_clock"
+              },
+              {
+                "handle": 101,
+                "length": 1,
+                "name": "ABypassCtrl.clock"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 9,
+            "signals": [
+              {
+                "handle": 1,
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.reset"
+              },
+              {
+                "handle": 2,
+                "length": 32,
+                "name": "ABypassCtrl.resetCounter.timeSinceReset [31:0]"
+              },
+              {
+                "handle": 3,
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.notChaos"
+              },
+              {
+                "handle": 4,
+                "length": 32,
+                "name": "ABypassCtrl.resetCounter.count [31:0]"
+              },
+              {
+                "handle": 5,
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.flag"
+              },
+              {
+                "handle": 6,
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.clk"
+              },
+              {
+                "handle": 7,
+                "length": 1,
+                "name": "ABypassCtrl.:jasper_formal_reset"
+              },
+              {
+                "handle": 8,
+                "length": 1,
+                "name": "ABypassCtrl.reset"
+              },
+              {
+                "handle": 48,
+                "length": 1,
+                "name": "ABypassCtrl._resetCounter_notChaos"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "pattern": "clock"
+            },
+            "id": "call_00_mZzJozY0NBd7eBLpiGZM5142",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "pattern": "reset"
+            },
+            "id": "call_01_rDjWT3IhwgzRFNhCSGDV9573",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 12
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 5,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "time": 15,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.clock",
+            "signal_name": "ABypassCtrl.clock",
+            "success": true,
+            "total_changes": 4,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.reset",
+            "signal_name": "ABypassCtrl.reset",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_Phi1",
+            "signal_name": "ABypassCtrl.io_Phi1",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_Stall_s1",
+            "signal_name": "ABypassCtrl.io_Stall_s1",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.clock"
+            },
+            "id": "call_00_SnTfeysStn90X00vQEqz4378",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.reset"
+            },
+            "id": "call_01_wULl9QKWT1O7j3zJw7qY5055",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.io_Phi1"
+            },
+            "id": "call_02_QCH3IIap6QIUG2ulegUa1067",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.io_Stall_s1"
+            },
+            "id": "call_03_MlDA010yKcCEVmDbyOB39479",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 13
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\nclass ABypassCtrl extends Module with Formal {\n  val io = IO(new Bundle {\n    // Clocks & Stalls\n    val Phi1 = Input(Bool())\n    val Stall_s1 = Input(Bool())\n    val IStall_s1 = Input(Bool())\n    val MemStall_s1 = Input(Bool())\n\n    // Boosting information\n    val ABoosted_s1e = Input(Bool())\n    val BBoosted_s1e = Input(Bool())\n    val ABoostValid_v1e = Input(Bool())\n    val BBoostValid_v1e = Input(Bool())\n\n    // Instruction WB cancel\n    val AKill_s1e = Input(Bool())\n    val AIgnore_s2e = Input(Bool())\n    val BKill_s1e = Input(Bool())\n    val BIgnore_s2e = Input(Bool())\n    val ANoDest_s1e = Input(Bool())\n    val BNoDest_s1e = Input(Bool())\n    val ADestIsZero_v1e = Input(Bool())\n    val BDestIsZero_v1e = Input(Bool())\n\n    val ASBypBmem_s1e = Input(Bool())\n    val ATBypBmem_s1e = Input(Bool())\n    val BIsLoad_s1e = Input(Bool())\n\n    // Branches & Exceptions\n    val Commit_s1e = Input(Bool())\n    val Squash_s1e = Input(Bool())\n    val Except_s1w = Input(Bool())\n\n    // Outputs\n    val Alpha1_s1m = Output(Bool())\n    val Beta1_s1m = Output(Bool())\n    val Delta2_q2 = Output(Bool())\n    val ASBypassLoad_s1e = Output(Bool())\n    val ASBypassData_s1e = Output(Bool())\n    val ATBypassLoad_s1e = Output(Bool())\n    val ATBypassData_s1e = Output(Bool())\n\n    val ABoosted_s2e = Output(Bool())\n    val ABoosted_s2m = Output(Bool())\n    val AValid_s1e = Output(Bool())\n    val AValid_s2e = Output(Bool())\n    val AValid_s2m = Output(Bool())\n    val AValid_s1w = Output(Bool())\n    val BBoosted_s2e = Output(Bool())\n    val BBoosted_s2m = Output(Bool())\n    val BValid_s2e = Output(Bool())\n    val BValid_s2m = Output(Bool())\n  })\n\n  // Internal signals\n  val Phi2 = ~io.Phi1\n\n  // Delayed version of Stall\n  val IStall_s2 = RegInit(false.B)\n  val MemStall_s2 = RegInit(false.B)\n\n  // Kill Chain registers\n  val AValid_s2e = RegInit(false.B)\n  val AValid_s1m = RegInit(false.B)\n  val AValid_s2m = RegInit(false.B)\n  val AValid_s1w = RegInit(false.B)\n\n  val BValid_s2e = RegInit(false.B)\n  val BValid_s1m = RegInit(false.B)\n  val BValid_s2m = RegInit(false.B)\n\n  val ABoosted_s2e = RegInit(false.B)\n  val ABoosted_s1m = RegInit(false.B)\n  val ABoosted_s2m = RegInit(false.B)\n\n  val ABoostValid_s2e = RegInit(false.B)\n  val ABoostValid_s1m = RegInit(false.B)\n  val ABoostValid_s2m = RegInit(false.B)\n\n  val BBoostValid_s2e = RegInit(false.B)\n  val BBoostValid_s1m = RegInit(false.B)\n  val BBoostValid_s2m = RegInit(false.B)\n\n  val BBoosted_s2e = RegInit(false.B)\n  val BBoosted_s1m = RegInit(false.B)\n  val BBoosted_s2m = RegInit(false.B)\n\n  val BIsLoad_s2e = RegInit(false.B)\n  val BIsLoad_s1m = RegInit(false.B)\n  val BIsLoad_s2m = RegInit(false.B)\n  val BIsLoad_s1w = RegInit(false.B)\n\n  // Control Logic\n  // Qualify the clocks\n  val Delta2_q2_wire = (~IStall_s2 | MemStall_s2) & Phi2\n  io.Delta2_q2 := Delta2_q2_wire\n\n  // Bypass control logic\n  io.ASBypassLoad_s1e := io.ASBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n  io.ATBypassLoad_s1e := io.ATBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n  io.ASBypassData_s1e := ~(io.ASBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n  io.ATBypassData_s1e := ~(io.ATBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n\n  // Delay IStall\n  when(io.Phi1) {\n    IStall_s2 := io.IStall_s1\n    MemStall_s2 := io.MemStall_s1\n  }\n\n  // Random Logic\n  io.AValid_s1e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n\n  when(io.Phi1 & ~io.Stall_s1) {\n    AValid_s2e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n    AValid_s2m := AValid_s1m & ~io.Except_s1w\n\n    // Boost logic\n    ABoosted_s2e := io.ABoosted_s1e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n    ABoostValid_s2e := io.ABoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n    ABoosted_s2m := ABoosted_s2e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n    ABoostValid_s2m := ABoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n  }\n\n  when(Phi2) {\n    AValid_s1m := AValid_s2e & ~io.AIgnore_s2e\n    AValid_s1w := AValid_s2m\n    ABoosted_s1m := ABoosted_s2e\n    ABoostValid_s1m := ABoostValid_s2e\n  }\n\n  when(io.Phi1 & ~io.Stall_s1) {\n    BValid_s2e := ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w)\n    BValid_s2m := BValid_s1m & ~io.Except_s1w\n\n    // Boost logic for B\n    BBoosted_s2e := io.BBoosted_s1e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n    BBoostValid_s2e := io.BBoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n    BBoosted_s2m := BBoosted_s2e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n    BBoostValid_s2m := BBoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n\n    // Keep track of which B-side instrs are loads\n    BIsLoad_s2e := io.BIsLoad_s1e\n    BIsLoad_s2m := BIsLoad_s1m\n  }\n\n  when(Phi2) {\n    BValid_s1m := BValid_s2e & ~io.BIgnore_s2e\n    BBoosted_s1m := BBoosted_s2e\n    BBoostValid_s1m := BBoostValid_s2e\n    BIsLoad_s1m := BIsLoad_s2e\n    BIsLoad_s1w := BIsLoad_s2m\n  }\n\n  // Don't toggle datapath latches if instruction was killed\n  io.Alpha1_s1m := AValid_s1m & ~io.Stall_s1\n  io.Beta1_s1m := BValid_s1m & ~io.Stall_s1\n\n  // Connect outputs\n  io.ABoosted_s2e := ABoosted_s2e\n  io.ABoosted_s2m := ABoosted_s2m\n  io.AValid_s2e := AValid_s2e\n  io.AValid_s2m := AValid_s2m\n  io.AValid_s1w := AValid_s1w\n  io.BBoosted_s2e := BBoosted_s2e\n  io.BBoosted_s2m := BBoosted_s2m\n  io.BValid_s2e := BValid_s2e\n  io.BValid_s2m := BValid_s2m\n\n  // ============================================================\n  // FORMAL ASSERTIONS\n  // ============================================================\n\n  // ---- SAFETY: Bypass mutual exclusion ----\n\n  // ASBypassLoad_s1e and ASBypassData_s1e must never both be true\n  fvAssert(!(io.ASBypassLoad_s1e & io.ASBypassData_s1e),\n    \"ASBypassLoad_and_ASBypassData_mutex\")\n\n  // ATBypassLoad_s1e and ATBypassData_s1e must never both be true\n  fvAssert(!(io.ATBypassLoad_s1e & io.ATBypassData_s1e),\n    \"ATBypassLoad_and_ATBypassData_mutex\")\n\n  // When not killed, exactly one of ASBypassLoad/ASBypassData is true (XOR relationship)\n  fvAssert(io.AKill_s1e | (io.ASBypassLoad_s1e ^ io.ASBypassData_s1e),\n    \"ASBypass_exactly_one_when_not_killed\")\n\n  // When not killed, exactly one of ATBypassLoad/ATBypassData is true\n  fvAssert(io.AKill_s1e | (io.ATBypassLoad_s1e ^ io.ATBypassData_s1e),\n    \"ATBypass_exactly_one_when_not_killed\")\n\n  // ---- SAFETY: Pipeline validity definition ----\n\n  // AValid_s1e must equal ~(AKill_s1e | ANoDest_s1e | Except_s1w)\n  fvAssert(io.AValid_s1e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n    \"AValid_s1e_definition\")\n\n  // ---- SAFETY: Pipeline register stability during stalls ----\n\n  // When stalled on Phi1, AValid_s2e must hold its value (register does not update)\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2e,\n    \"AValid_s2e_stable_during_stall\")\n\n  // When stalled on Phi1, AValid_s2m must hold its value\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2m,\n    \"AValid_s2m_stable_during_stall\")\n\n  // ---- SAFETY: Pipeline stage update correctness ----\n\n  // On Phi2, AValid_s1m must equal (AValid_s2e & ~AIgnore_s2e)\n  assertImplies(Phi2,\n    AValid_s1m === (AValid_s2e & ~io.AIgnore_s2e),\n    \"AValid_s1m_Phi2_update\")\n\n  // On Phi2, AValid_s1w must equal AValid_s2m\n  assertImplies(Phi2,\n    AValid_s1w === AValid_s2m,\n    \"AValid_s1w_Phi2_update\")\n\n  // On Phi1 & ~Stall, AValid_s2e must equal ~(AKill | ANoDest | Except)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    AValid_s2e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n    \"AValid_s2e_Phi1_update\")\n\n  // On Phi1 & ~Stall, AValid_s2m must equal (AValid_s1m & ~Except_s1w)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    AValid_s2m === (AValid_s1m & ~io.Except_s1w),\n    \"AValid_s2m_Phi1_update\")\n\n  // On Phi2, BValid_s1m must equal (BValid_s2e & ~BIgnore_s2e)\n  assertImplies(Phi2,\n    BValid_s1m === (BValid_s2e & ~io.BIgnore_s2e),\n    \"BValid_s1m_Phi2_update\")\n\n  // On Phi1 & ~Stall, BValid_s2e must equal ~(BKill | BNoDest | Except)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    BValid_s2e === ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w),\n    \"BValid_s2e_Phi1_update\")\n\n  // On Phi1 & ~Stall, BValid_s2m must equal (BValid_s1m & ~Except_s1w)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    BValid_s2m === (BValid_s1m & ~io.Except_s1w),\n    \"BValid_s2m_Phi1_update\")\n\n  // ---- LIVENESS: Pipeline progress ----\n\n  // A-side pipeline: When a valid instruction enters (AValid_s1e, not stalled),\n  // it must reach AValid_s1w within 10 cycles, or be canceled (kill/except/squash).\n  // Pipeline depth is 4 register stages (s1e→s2e→s1m→s2m→s1w); bound of 10 is generous.\n  astRelaxedLiveness(\n    io.AValid_s1e & ~io.Stall_s1,\n    io.AValid_s1w | io.AKill_s1e | io.Except_s1w | io.Squash_s1e,\n    10,\n    \"A_pipeline_progress\"\n  )\n\n  // B-side pipeline: When a valid instruction enters, it must reach BValid_s2m\n  // within 10 cycles, or be canceled.\n  // B pipeline depth is 3 register stages; bound of 10 is generous.\n  astRelaxedLiveness(\n    ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w) & ~io.Stall_s1,\n    io.BValid_s2m | io.BKill_s1e | io.Except_s1w | io.Squash_s1e,\n    10,\n    \"B_pipeline_progress\"\n  )\n\n  // ---- LIVENESS: Pipeline must not get stuck ----\n  // Timer-based: if AValid_s1e is true continuously for >20 cycles without\n  // AValid_s1w being asserted or a pipeline-clearing event, the pipeline is stuck.\n  assertLivenessTimer(\n    io.AValid_s1e,\n    io.AValid_s1w | io.Except_s1w | io.Squash_s1e,\n    20,\n    \"A_pipeline_not_stuck\"\n  )\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new ABypassCtrl(), args)\n}\n",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.scala",
+                "original_chars": 9480,
+                "original_lines": 286,
+                "returned_chars": 9480,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "ABypassCtrl.scala"
+              ],
+              "reason": "Read the ABypassCtrl source to understand the assertion and logic"
+            },
+            "id": "call_00_g7ysbl2UDZTMBHw2YDfL0069",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 14
+      },
+      {
+        "action_results": [
+          {
+            "active_signals": [
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.notChaos",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.flag",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.clk",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_Phi1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypBmem_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypBmem_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_BIsLoad_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassData_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassData_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_AValid_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._resetCounter_notChaos",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassData_s1e_0",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassData_s1e_0",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._GEN",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.hasBeenResetReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.hasBeenReset",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.nextPending",
+                "value": "1"
+              },
+              {
+                "length": 4,
+                "name": "ABypassCtrl._nextTimer_T_2 [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.nextPending_1",
+                "value": "1"
+              },
+              {
+                "length": 4,
+                "name": "ABypassCtrl._nextTimer_T_6 [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 5,
+                "name": "ABypassCtrl._nextTimer_T_10 [4:0]",
+                "value": "00001"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.AValid_s2e_stable_during_stall",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.:jasper_formal_clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.clock",
+                "value": "1"
+              }
+            ],
+            "count": 24,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          },
+          {
+            "active_signals": [
+              {
+                "length": 32,
+                "name": "ABypassCtrl.resetCounter.timeSinceReset [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.notChaos",
+                "value": "1"
+              },
+              {
+                "length": 32,
+                "name": "ABypassCtrl.resetCounter.count [31:0]",
+                "value": "00000000000000000000000000000001"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.flag",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.resetCounter.clk",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_Phi1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_Stall_s1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypBmem_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypBmem_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_BIsLoad_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassData_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassData_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_AValid_s1e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_AValid_s2e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_BValid_s2e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._resetCounter_notChaos",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.AValid_s2e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.BValid_s2e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.BIsLoad_s2e",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ASBypassData_s1e_0",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.io_ATBypassData_s1e_0",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.hasBeenResetReg",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.hasBeenReset",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._GEN_1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.pending",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.nextPending",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._nextTimer_T_1",
+                "value": "1"
+              },
+              {
+                "length": 4,
+                "name": "ABypassCtrl._nextTimer_T_2 [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.pending_1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.nextPending_1",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl._nextTimer_T_5",
+                "value": "1"
+              },
+              {
+                "length": 4,
+                "name": "ABypassCtrl._nextTimer_T_6 [3:0]",
+                "value": "0001"
+              },
+              {
+                "length": 5,
+                "name": "ABypassCtrl.timer_2 [4:0]",
+                "value": "00001"
+              },
+              {
+                "length": 5,
+                "name": "ABypassCtrl._nextTimer_T_10 [4:0]",
+                "value": "00010"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.:jasper_formal_clock",
+                "value": "1"
+              },
+              {
+                "length": 1,
+                "name": "ABypassCtrl.clock",
+                "value": "1"
+              }
+            ],
+            "count": 36,
+            "success": true,
+            "truncated": false,
+            "type": "waveform_get_active_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_results": 80,
+              "time": 0
+            },
+            "id": "call_00_68MuGyARj5IgEkAtJi3x5975",
+            "name": "waveform_get_active_signals"
+          },
+          {
+            "arguments": {
+              "max_results": 80,
+              "time": 10
+            },
+            "id": "call_01_YFPvOGR7CEmskcE5Y0zw1119",
+            "name": "waveform_get_active_signals"
+          }
+        ],
+        "iteration": 15
+      },
+      {
+        "action_results": [
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 0,
+            "signals": [],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 5,
+            "signals": [
+              {
+                "handle": 10,
+                "length": 1,
+                "name": "ABypassCtrl.io_Stall_s1"
+              },
+              {
+                "handle": 11,
+                "length": 1,
+                "name": "ABypassCtrl.io_IStall_s1"
+              },
+              {
+                "handle": 12,
+                "length": 1,
+                "name": "ABypassCtrl.io_MemStall_s1"
+              },
+              {
+                "handle": 49,
+                "length": 1,
+                "name": "ABypassCtrl.IStall_s2"
+              },
+              {
+                "handle": 50,
+                "length": 1,
+                "name": "ABypassCtrl.MemStall_s2"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          },
+          {
+            "count": 6,
+            "signals": [
+              {
+                "handle": 74,
+                "length": 1,
+                "name": "ABypassCtrl._GEN"
+              },
+              {
+                "handle": 77,
+                "length": 1,
+                "name": "ABypassCtrl._GEN_0"
+              },
+              {
+                "handle": 78,
+                "length": 1,
+                "name": "ABypassCtrl._GEN_1"
+              },
+              {
+                "handle": 81,
+                "length": 1,
+                "name": "ABypassCtrl._GEN_2"
+              },
+              {
+                "handle": 82,
+                "length": 1,
+                "name": "ABypassCtrl._GEN_3"
+              },
+              {
+                "handle": 88,
+                "length": 1,
+                "name": "ABypassCtrl._GEN_4"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "pattern": "assume"
+            },
+            "id": "call_00_LJEDCpQc29ZA15kgOg6Y6187",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "pattern": "constraint"
+            },
+            "id": "call_01_7kPMQJbTjgecvXd6xvBP0487",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "pattern": "Stall"
+            },
+            "id": "call_02_4tTKvbXNzt9Sb4gToKAe8652",
+            "name": "waveform_find_signals"
+          },
+          {
+            "arguments": {
+              "pattern": "_GEN"
+            },
+            "id": "call_03_SsaRksMFJm6LrWOwqPCT1240",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 16
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 10,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._GEN",
+            "signal_name": "ABypassCtrl._GEN",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._GEN_0",
+            "signal_name": "ABypassCtrl._GEN_0",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._GEN_1",
+            "signal_name": "ABypassCtrl._GEN_1",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_Stall_s1",
+            "signal_name": "ABypassCtrl.io_Stall_s1",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_IStall_s1",
+            "signal_name": "ABypassCtrl.io_IStall_s1",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_MemStall_s1",
+            "signal_name": "ABypassCtrl.io_MemStall_s1",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.IStall_s2",
+            "signal_name": "ABypassCtrl.IStall_s2",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.MemStall_s2",
+            "signal_name": "ABypassCtrl.MemStall_s2",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl._GEN"
+            },
+            "id": "call_00_9iSd0TbT9PK79s8jecof4784",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl._GEN_0"
+            },
+            "id": "call_01_Ac9c2tUyNErCNRhIuKAF7250",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl._GEN_1"
+            },
+            "id": "call_02_rQrmZxsu0bpggy6HrS2j5940",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.io_Stall_s1"
+            },
+            "id": "call_03_d5bQEn9ftcXr48MJnV9c5890",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.io_IStall_s1"
+            },
+            "id": "call_04_JFxjdUQMT3dKj8vM6p3a1081",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.io_MemStall_s1"
+            },
+            "id": "call_05_9OmQlFLV3gT0LFeC5ni75230",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.IStall_s2"
+            },
+            "id": "call_06_tKFqmhN1EM4AQbw2G2pN6937",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.MemStall_s2"
+            },
+            "id": "call_07_CdnhkK1R04UVnB4129mn2807",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 17
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\nclass ABypassCtrl extends Module with Formal {\n  val io = IO(new Bundle {\n    // Clocks & Stalls\n    val Phi1 = Input(Bool())\n    val Stall_s1 = Input(Bool())\n    val IStall_s1 = Input(Bool())\n    val MemStall_s1 = Input(Bool())\n\n    // Boosting information\n    val ABoosted_s1e = Input(Bool())\n    val BBoosted_s1e = Input(Bool())\n    val ABoostValid_v1e = Input(Bool())\n    val BBoostValid_v1e = Input(Bool())\n\n    // Instruction WB cancel\n    val AKill_s1e = Input(Bool())\n    val AIgnore_s2e = Input(Bool())\n    val BKill_s1e = Input(Bool())\n    val BIgnore_s2e = Input(Bool())\n    val ANoDest_s1e = Input(Bool())\n    val BNoDest_s1e = Input(Bool())\n    val ADestIsZero_v1e = Input(Bool())\n    val BDestIsZero_v1e = Input(Bool())\n\n    val ASBypBmem_s1e = Input(Bool())\n    val ATBypBmem_s1e = Input(Bool())\n    val BIsLoad_s1e = Input(Bool())\n\n    // Branches & Exceptions\n    val Commit_s1e = Input(Bool())\n    val Squash_s1e = Input(Bool())\n    val Except_s1w = Input(Bool())\n\n    // Outputs\n    val Alpha1_s1m = Output(Bool())\n    val Beta1_s1m = Output(Bool())\n    val Delta2_q2 = Output(Bool())\n    val ASBypassLoad_s1e = Output(Bool())\n    val ASBypassData_s1e = Output(Bool())\n    val ATBypassLoad_s1e = Output(Bool())\n    val ATBypassData_s1e = Output(Bool())\n\n    val ABoosted_s2e = Output(Bool())\n    val ABoosted_s2m = Output(Bool())\n    val AValid_s1e = Output(Bool())\n    val AValid_s2e = Output(Bool())\n    val AValid_s2m = Output(Bool())\n    val AValid_s1w = Output(Bool())\n    val BBoosted_s2e = Output(Bool())\n    val BBoosted_s2m = Output(Bool())\n    val BValid_s2e = Output(Bool())\n    val BValid_s2m = Output(Bool())\n  })\n\n  // Internal signals\n  val Phi2 = ~io.Phi1\n\n  // Delayed version of Stall\n  val IStall_s2 = RegInit(false.B)\n  val MemStall_s2 = RegInit(false.B)\n\n  // Kill Chain registers\n  val AValid_s2e = RegInit(false.B)\n  val AValid_s1m = RegInit(false.B)\n  val AValid_s2m = RegInit(false.B)\n  val AValid_s1w = RegInit(false.B)\n\n  val BValid_s2e = RegInit(false.B)\n  val BValid_s1m = RegInit(false.B)\n  val BValid_s2m = RegInit(false.B)\n\n  val ABoosted_s2e = RegInit(false.B)\n  val ABoosted_s1m = RegInit(false.B)\n  val ABoosted_s2m = RegInit(false.B)\n\n  val ABoostValid_s2e = RegInit(false.B)\n  val ABoostValid_s1m = RegInit(false.B)\n  val ABoostValid_s2m = RegInit(false.B)\n\n  val BBoostValid_s2e = RegInit(false.B)\n  val BBoostValid_s1m = RegInit(false.B)\n  val BBoostValid_s2m = RegInit(false.B)\n\n  val BBoosted_s2e = RegInit(false.B)\n  val BBoosted_s1m = RegInit(false.B)\n  val BBoosted_s2m = RegInit(false.B)\n\n  val BIsLoad_s2e = RegInit(false.B)\n  val BIsLoad_s1m = RegInit(false.B)\n  val BIsLoad_s2m = RegInit(false.B)\n  val BIsLoad_s1w = RegInit(false.B)\n\n  // Control Logic\n  // Qualify the clocks\n  val Delta2_q2_wire = (~IStall_s2 | MemStall_s2) & Phi2\n  io.Delta2_q2 := Delta2_q2_wire\n\n  // Bypass control logic\n  io.ASBypassLoad_s1e := io.ASBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n  io.ATBypassLoad_s1e := io.ATBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n  io.ASBypassData_s1e := ~(io.ASBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n  io.ATBypassData_s1e := ~(io.ATBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n\n  // Delay IStall\n  when(io.Phi1) {\n    IStall_s2 := io.IStall_s1\n    MemStall_s2 := io.MemStall_s1\n  }\n\n  // Random Logic\n  io.AValid_s1e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n\n  when(io.Phi1 & ~io.Stall_s1) {\n    AValid_s2e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n    AValid_s2m := AValid_s1m & ~io.Except_s1w\n\n    // Boost logic\n    ABoosted_s2e := io.ABoosted_s1e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n    ABoostValid_s2e := io.ABoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n    ABoosted_s2m := ABoosted_s2e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n    ABoostValid_s2m := ABoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n  }\n\n  when(Phi2) {\n    AValid_s1m := AValid_s2e & ~io.AIgnore_s2e\n    AValid_s1w := AValid_s2m\n    ABoosted_s1m := ABoosted_s2e\n    ABoostValid_s1m := ABoostValid_s2e\n  }\n\n  when(io.Phi1 & ~io.Stall_s1) {\n    BValid_s2e := ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w)\n    BValid_s2m := BValid_s1m & ~io.Except_s1w\n\n    // Boost logic for B\n    BBoosted_s2e := io.BBoosted_s1e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n    BBoostValid_s2e := io.BBoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n    BBoosted_s2m := BBoosted_s2e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n    BBoostValid_s2m := BBoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n\n    // Keep track of which B-side instrs are loads\n    BIsLoad_s2e := io.BIsLoad_s1e\n    BIsLoad_s2m := BIsLoad_s1m\n  }\n\n  when(Phi2) {\n    BValid_s1m := BValid_s2e & ~io.BIgnore_s2e\n    BBoosted_s1m := BBoosted_s2e\n    BBoostValid_s1m := BBoostValid_s2e\n    BIsLoad_s1m := BIsLoad_s2e\n    BIsLoad_s1w := BIsLoad_s2m\n  }\n\n  // Don't toggle datapath latches if instruction was killed\n  io.Alpha1_s1m := AValid_s1m & ~io.Stall_s1\n  io.Beta1_s1m := BValid_s1m & ~io.Stall_s1\n\n  // Connect outputs\n  io.ABoosted_s2e := ABoosted_s2e\n  io.ABoosted_s2m := ABoosted_s2m\n  io.AValid_s2e := AValid_s2e\n  io.AValid_s2m := AValid_s2m\n  io.AValid_s1w := AValid_s1w\n  io.BBoosted_s2e := BBoosted_s2e\n  io.BBoosted_s2m := BBoosted_s2m\n  io.BValid_s2e := BValid_s2e\n  io.BValid_s2m := BValid_s2m\n\n  // ============================================================\n  // FORMAL ASSERTIONS\n  // ============================================================\n\n  // ---- SAFETY: Bypass mutual exclusion ----\n\n  // ASBypassLoad_s1e and ASBypassData_s1e must never both be true\n  fvAssert(!(io.ASBypassLoad_s1e & io.ASBypassData_s1e),\n    \"ASBypassLoad_and_ASBypassData_mutex\")\n\n  // ATBypassLoad_s1e and ATBypassData_s1e must never both be true\n  fvAssert(!(io.ATBypassLoad_s1e & io.ATBypassData_s1e),\n    \"ATBypassLoad_and_ATBypassData_mutex\")\n\n  // When not killed, exactly one of ASBypassLoad/ASBypassData is true (XOR relationship)\n  fvAssert(io.AKill_s1e | (io.ASBypassLoad_s1e ^ io.ASBypassData_s1e),\n    \"ASBypass_exactly_one_when_not_killed\")\n\n  // When not killed, exactly one of ATBypassLoad/ATBypassData is true\n  fvAssert(io.AKill_s1e | (io.ATBypassLoad_s1e ^ io.ATBypassData_s1e),\n    \"ATBypass_exactly_one_when_not_killed\")\n\n  // ---- SAFETY: Pipeline validity definition ----\n\n  // AValid_s1e must equal ~(AKill_s1e | ANoDest_s1e | Except_s1w)\n  fvAssert(io.AValid_s1e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n    \"AValid_s1e_definition\")\n\n  // ---- SAFETY: Pipeline register stability during stalls ----\n\n  // When stalled on Phi1, AValid_s2e must hold its value (register does not update)\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2e,\n    \"AValid_s2e_stable_during_stall\")\n\n  // When stalled on Phi1, AValid_s2m must hold its value\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2m,\n    \"AValid_s2m_stable_during_stall\")\n\n  // ---- SAFETY: Pipeline stage update correctness ----\n\n  // On Phi2, AValid_s1m must equal (AValid_s2e & ~AIgnore_s2e)\n  assertImplies(Phi2,\n    AValid_s1m === (AValid_s2e & ~io.AIgnore_s2e),\n    \"AValid_s1m_Phi2_update\")\n\n  // On Phi2, AValid_s1w must equal AValid_s2m\n  assertImplies(Phi2,\n    AValid_s1w === AValid_s2m,\n    \"AValid_s1w_Phi2_update\")\n\n  // On Phi1 & ~Stall, AValid_s2e must equal ~(AKill | ANoDest | Except)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    AValid_s2e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n    \"AValid_s2e_Phi1_update\")\n\n  // On Phi1 & ~Stall, AValid_s2m must equal (AValid_s1m & ~Except_s1w)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    AValid_s2m === (AValid_s1m & ~io.Except_s1w),\n    \"AValid_s2m_Phi1_update\")\n\n  // On Phi2, BValid_s1m must equal (BValid_s2e & ~BIgnore_s2e)\n  assertImplies(Phi2,\n    BValid_s1m === (BValid_s2e & ~io.BIgnore_s2e),\n    \"BValid_s1m_Phi2_update\")\n\n  // On Phi1 & ~Stall, BValid_s2e must equal ~(BKill | BNoDest | Except)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    BValid_s2e === ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w),\n    \"BValid_s2e_Phi1_update\")\n\n  // On Phi1 & ~Stall, BValid_s2m must equal (BValid_s1m & ~Except_s1w)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    BValid_s2m === (BValid_s1m & ~io.Except_s1w),\n    \"BValid_s2m_Phi1_update\")\n\n  // ---- LIVENESS: Pipeline progress ----\n\n  // A-side pipeline: When a valid instruction enters (AValid_s1e, not stalled),\n  // it must reach AValid_s1w within 10 cycles, or be canceled (kill/except/squash).\n  // Pipeline depth is 4 register stages (s1e→s2e→s1m→s2m→s1w); bound of 10 is generous.\n  astRelaxedLiveness(\n    io.AValid_s1e & ~io.Stall_s1,\n    io.AValid_s1w | io.AKill_s1e | io.Except_s1w | io.Squash_s1e,\n    10,\n    \"A_pipeline_progress\"\n  )\n\n  // B-side pipeline: When a valid instruction enters, it must reach BValid_s2m\n  // within 10 cycles, or be canceled.\n  // B pipeline depth is 3 register stages; bound of 10 is generous.\n  astRelaxedLiveness(\n    ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w) & ~io.Stall_s1,\n    io.BValid_s2m | io.BKill_s1e | io.Except_s1w | io.Squash_s1e,\n    10,\n    \"B_pipeline_progress\"\n  )\n\n  // ---- LIVENESS: Pipeline must not get stuck ----\n  // Timer-based: if AValid_s1e is true continuously for >20 cycles without\n  // AValid_s1w being asserted or a pipeline-clearing event, the pipeline is stuck.\n  assertLivenessTimer(\n    io.AValid_s1e,\n    io.AValid_s1w | io.Except_s1w | io.Squash_s1e,\n    20,\n    \"A_pipeline_not_stuck\"\n  )\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new ABypassCtrl(), args)\n}\n",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.scala",
+                "original_chars": 9480,
+                "original_lines": 286,
+                "returned_chars": 9480,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "ABypassCtrl.scala"
+              ],
+              "reason": "Read the full ABypassCtrl source to understand the assertion and register logic"
+            },
+            "id": "call_00_FGUHVXcg0A8Jwgi5CGj87413",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 18
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "1: package llmverify\n2: \n3: import chisel3._\n4: import chisel3.util._\n5: import chiselFv._\n6: \n7: class ABypassCtrl extends Module with Formal {\n8:   val io = IO(new Bundle {\n9:     // Clocks & Stalls\n10:     val Phi1 = Input(Bool())\n11:     val Stall_s1 = Input(Bool())\n12:     val IStall_s1 = Input(Bool())\n13:     val MemStall_s1 = Input(Bool())\n14: \n15:     // Boosting information\n16:     val ABoosted_s1e = Input(Bool())\n17:     val BBoosted_s1e = Input(Bool())\n18:     val ABoostValid_v1e = Input(Bool())\n19:     val BBoostValid_v1e = Input(Bool())\n20: \n21:     // Instruction WB cancel\n22:     val AKill_s1e = Input(Bool())\n23:     val AIgnore_s2e = Input(Bool())\n24:     val BKill_s1e = Input(Bool())\n25:     val BIgnore_s2e = Input(Bool())\n26:     val ANoDest_s1e = Input(Bool())\n27:     val BNoDest_s1e = Input(Bool())\n28:     val ADestIsZero_v1e = Input(Bool())\n29:     val BDestIsZero_v1e = Input(Bool())\n30: \n31:     val ASBypBmem_s1e = Input(Bool())\n32:     val ATBypBmem_s1e = Input(Bool())\n33:     val BIsLoad_s1e = Input(Bool())\n34: \n35:     // Branches & Exceptions\n36:     val Commit_s1e = Input(Bool())\n37:     val Squash_s1e = Input(Bool())\n38:     val Except_s1w = Input(Bool())\n39: \n40:     // Outputs\n41:     val Alpha1_s1m = Output(Bool())\n42:     val Beta1_s1m = Output(Bool())\n43:     val Delta2_q2 = Output(Bool())\n44:     val ASBypassLoad_s1e = Output(Bool())\n45:     val ASBypassData_s1e = Output(Bool())\n46:     val ATBypassLoad_s1e = Output(Bool())\n47:     val ATBypassData_s1e = Output(Bool())\n48: \n49:     val ABoosted_s2e = Output(Bool())\n50:     val ABoosted_s2m = Output(Bool())\n51:     val AValid_s1e = Output(Bool())\n52:     val AValid_s2e = Output(Bool())\n53:     val AValid_s2m = Output(Bool())\n54:     val AValid_s1w = Output(Bool())\n55:     val BBoosted_s2e = Output(Bool())\n56:     val BBoosted_s2m = Output(Bool())\n57:     val BValid_s2e = Output(Bool())\n58:     val BValid_s2m = Output(Bool())\n59:   })\n60: \n61:   // Internal signals\n62:   val Phi2 = ~io.Phi1\n63: \n64:   // Delayed version of Stall\n65:   val IStall_s2 = RegInit(false.B)\n66:   val MemStall_s2 = RegInit(false.B)\n67: \n68:   // Kill Chain registers\n69:   val AValid_s2e = RegInit(false.B)\n70:   val AValid_s1m = RegInit(false.B)\n71:   val AValid_s2m = RegInit(false.B)\n72:   val AValid_s1w = RegInit(false.B)\n73: \n74:   val BValid_s2e = RegInit(false.B)\n75:   val BValid_s1m = RegInit(false.B)\n76:   val BValid_s2m = RegInit(false.B)\n77: \n78:   val ABoosted_s2e = RegInit(false.B)\n79:   val ABoosted_s1m = RegInit(false.B)\n80:   val ABoosted_s2m = RegInit(false.B)\n81: \n82:   val ABoostValid_s2e = RegInit(false.B)\n83:   val ABoostValid_s1m = RegInit(false.B)\n84:   val ABoostValid_s2m = RegInit(false.B)\n85: \n86:   val BBoostValid_s2e = RegInit(false.B)\n87:   val BBoostValid_s1m = RegInit(false.B)\n88:   val BBoostValid_s2m = RegInit(false.B)\n89: \n90:   val BBoosted_s2e = RegInit(false.B)\n91:   val BBoosted_s1m = RegInit(false.B)\n92:   val BBoosted_s2m = RegInit(false.B)\n93: \n94:   val BIsLoad_s2e = RegInit(false.B)\n95:   val BIsLoad_s1m = RegInit(false.B)\n96:   val BIsLoad_s2m = RegInit(false.B)\n97:   val BIsLoad_s1w = RegInit(false.B)\n98: \n99:   // Control Logic\n100:   // Qualify the clocks\n101:   val Delta2_q2_wire = (~IStall_s2 | MemStall_s2) & Phi2\n102:   io.Delta2_q2 := Delta2_q2_wire\n103: \n104:   // Bypass control logic\n105:   io.ASBypassLoad_s1e := io.ASBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n106:   io.ATBypassLoad_s1e := io.ATBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n107:   io.ASBypassData_s1e := ~(io.ASBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n108:   io.ATBypassData_s1e := ~(io.ATBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n109: \n110:   // Delay IStall\n111:   when(io.Phi1) {\n112:     IStall_s2 := io.IStall_s1\n113:     MemStall_s2 := io.MemStall_s1\n114:   }\n115: \n116:   // Random Logic\n117:   io.AValid_s1e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n118: \n119:   when(io.Phi1 & ~io.Stall_s1) {\n120:     AValid_s2e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n121:     AValid_s2m := AValid_s1m & ~io.Except_s1w\n122: \n123:     // Boost logic\n124:     ABoosted_s2e := io.ABoosted_s1e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n125:     ABoostValid_s2e := io.ABoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n126:     ABoosted_s2m := ABoosted_s2e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n127:     ABoostValid_s2m := ABoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n128:   }\n129: \n130:   when(Phi2) {\n131:     AValid_s1m := AValid_s2e & ~io.AIgnore_s2e\n132:     AValid_s1w := AValid_s2m\n133:     ABoosted_s1m := ABoosted_s2e\n134:     ABoostValid_s1m := ABoostValid_s2e\n135:   }\n136: \n137:   when(io.Phi1 & ~io.Stall_s1) {\n138:     BValid_s2e := ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w)\n139:     BValid_s2m := BValid_s1m & ~io.Except_s1w\n140: \n141:     // Boost logic for B\n142:     BBoosted_s2e := io.BBoosted_s1e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n143:     BBoostValid_s2e := io.BBoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n144:     BBoosted_s2m := BBoosted_s2e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n145:     BBoostValid_s2m := BBoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n146: \n147:     // Keep track of which B-side instrs are loads\n148:     BIsLoad_s2e := io.BIsLoad_s1e\n149:     BIsLoad_s2m := BIsLoad_s1m\n150:   }\n151: \n152:   when(Phi2) {\n153:     BValid_s1m := BValid_s2e & ~io.BIgnore_s2e\n154:     BBoosted_s1m := BBoosted_s2e\n155:     BBoostValid_s1m := BBoostValid_s2e\n156:     BIsLoad_s1m := BIsLoad_s2e\n157:     BIsLoad_s1w := BIsLoad_s2m\n158:   }\n159: \n160:   // Don't toggle datapath latches if instruction was killed\n161:   io.Alpha1_s1m := AValid_s1m & ~io.Stall_s1\n162:   io.Beta1_s1m := BValid_s1m & ~io.Stall_s1\n163: \n164:   // Connect outputs\n165:   io.ABoosted_s2e := ABoosted_s2e\n166:   io.ABoosted_s2m := ABoosted_s2m\n167:   io.AValid_s2e := AValid_s2e\n168:   io.AValid_s2m := AValid_s2m\n169:   io.AValid_s1w := AValid_s1w\n170:   io.BBoosted_s2e := BBoosted_s2e\n171:   io.BBoosted_s2m := BBoosted_s2m\n172:   io.BValid_s2e := BValid_s2e\n173:   io.BValid_s2m := BValid_s2m\n174: \n175:   // ============================================================\n176:   // FORMAL ASSERTIONS\n177:   // ============================================================\n178: \n179:   // ---- SAFETY: Bypass mutual exclusion ----\n180: \n181:   // ASBypassLoad_s1e and ASBypassData_s1e must never both be true\n182:   fvAssert(!(io.ASBypassLoad_s1e & io.ASBypassData_s1e),\n183:     \"ASBypassLoad_and_ASBypassData_mutex\")\n184: \n185:   // ATBypassLoad_s1e and ATBypassData_s1e must never both be true\n186:   fvAssert(!(io.ATBypassLoad_s1e & io.ATBypassData_s1e),\n187:     \"ATBypassLoad_and_ATBypassData_mutex\")\n188: \n189:   // When not killed, exactly one of ASBypassLoad/ASBypassData is true (XOR relationship)\n190:   fvAssert(io.AKill_s1e | (io.ASBypassLoad_s1e ^ io.ASBypassData_s1e),\n191:     \"ASBypass_exactly_one_when_not_killed\")\n192: \n193:   // When not killed, exactly one of ATBypassLoad/ATBypassData is true\n194:   fvAssert(io.AKill_s1e | (io.ATBypassLoad_s1e ^ io.ATBypassData_s1e),\n195:     \"ATBypass_exactly_one_when_not_killed\")\n196: \n197:   // ---- SAFETY: Pipeline validity definition ----\n198: \n199:   // AValid_s1e must equal ~(AKill_s1e | ANoDest_s1e | Except_s1w)\n200:   fvAssert(io.AValid_s1e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n201:     \"AValid_s1e_definition\")\n202: \n203:   // ---- SAFETY: Pipeline register stability during stalls ----\n204: \n205:   // When stalled on Phi1, AValid_s2e must hold its value (register does not update)\n206:   assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2e,\n207:     \"AValid_s2e_stable_during_stall\")\n208: \n209:   // When stalled on Phi1, AValid_s2m must hold its value\n210:   assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2m,\n211:     \"AValid_s2m_stable_during_stall\")\n212: \n213:   // ---- SAFETY: Pipeline stage update correctness ----\n214: \n215:   // On Phi2, AValid_s1m must equal (AValid_s2e & ~AIgnore_s2e)\n216:   assertImplies(Phi2,\n217:     AValid_s1m === (AValid_s2e & ~io.AIgnore_s2e),\n218:     \"AValid_s1m_Phi2_update\")\n219: \n220:   // On Phi2, AValid_s1w must equal AValid_s2m\n221:   assertImplies(Phi2,\n222:     AValid_s1w === AValid_s2m,\n223:     \"AValid_s1w_Phi2_update\")\n224: \n225:   // On Phi1 & ~Stall, AValid_s2e must equal ~(AKill | ANoDest | Except)\n226:   assertImplies(io.Phi1 & ~io.Stall_s1,\n227:     AValid_s2e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n228:     \"AValid_s2e_Phi1_update\")\n229: \n230:   // On Phi1 & ~Stall, AValid_s2m must equal (AValid_s1m & ~Except_s1w)\n231:   assertImplies(io.Phi1 & ~io.Stall_s1,\n232:     AValid_s2m === (AValid_s1m & ~io.Except_s1w),\n233:     \"AValid_s2m_Phi1_update\")\n234: \n235:   // On Phi2, BValid_s1m must equal (BValid_s2e & ~BIgnore_s2e)\n236:   assertImplies(Phi2,\n237:     BValid_s1m === (BValid_s2e & ~io.BIgnore_s2e),\n238:     \"BValid_s1m_Phi2_update\")\n239: \n240:   // On Phi1 & ~Stall, BValid_s2e must equal ~(BKill | BNoDest | Except)\n241:   assertImplies(io.Phi1 & ~io.Stall_s1,\n242:     BValid_s2e === ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w),\n243:     \"BValid_s2e_Phi1_update\")\n244: \n245:   // On Phi1 & ~Stall, BValid_s2m must equal (BValid_s1m & ~Except_s1w)\n246:   assertImplies(io.Phi1 & ~io.Stall_s1,\n247:     BValid_s2m === (BValid_s1m & ~io.Except_s1w),\n248:     \"BValid_s2m_Phi1_update\")\n249: \n250:   // ---- LIVENESS: Pipeline progress ----\n251: \n252:   // A-side pipeline: When a valid instruction enters (AValid_s1e, not stalled),\n253:   // it must reach AValid_s1w within 10 cycles, or be canceled (kill/except/squash).\n254:   // Pipeline depth is 4 register stages (s1e→s2e→s1m→s2m→s1w); bound of 10 is generous.\n255:   astRelaxedLiveness(\n256:     io.AValid_s1e & ~io.Stall_s1,\n257:     io.AValid_s1w | io.AKill_s1e | io.Except_s1w | io.Squash_s1e,\n258:     10,\n259:     \"A_pipeline_progress\"\n260:   )\n261: \n262:   // B-side pipeline: When a valid instruction enters, it must reach BValid_s2m\n263:   // within 10 cycles, or be canceled.\n264:   // B pipeline depth is 3 register stages; bound of 10 is generous.\n265:   astRelaxedLiveness(\n266:     ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w) & ~io.Stall_s1,\n267:     io.BValid_s2m | io.BKill_s1e | io.Except_s1w | io.Squash_s1e,\n268:     10,\n269:     \"B_pipeline_progress\"\n270:   )\n271: \n272:   // ---- LIVENESS: Pipeline must not get stuck ----\n273:   // Timer-based: if AValid_s1e is true continuously for >20 cycles without\n274:   // AValid_s1w being asserted or a pipeline-clearing event, the pipeline is stuck.\n275:   assertLivenessTimer(\n276:     io.AValid_s1e,\n277:     io.AValid_s1w | io.Except_s1w | io.Squash_s1e,\n278:     20,\n279:     \"A_pipeline_not_stuck\"\n280:   )\n281: }\n282: \n283: object VerilogGenerator extends App {\n284:   emitVerilog(new ABypassCtrl(), args)\n285: }",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.scala",
+                "line_end": 286,
+                "line_start": 1,
+                "original_chars": 9480,
+                "original_lines": 286,
+                "returned_chars": 10796,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          },
+          {
+            "count": 1,
+            "signals": [
+              {
+                "handle": 99,
+                "length": 1,
+                "name": "ABypassCtrl.AValid_s2e_stable_during_stall"
+              }
+            ],
+            "success": true,
+            "truncated": false,
+            "type": "waveform_find_signals"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "ABypassCtrl.scala"
+              ],
+              "line_start": 1,
+              "reason": "Verify the assertStableWhen definition from imported library"
+            },
+            "id": "call_00_U3EJhkIG0iClW2vDOUt76099",
+            "name": "read_files"
+          },
+          {
+            "arguments": {
+              "pattern": "AValid_s2e_stable"
+            },
+            "id": "call_01_SibVcL2Itzx9avLTgd5t8715",
+            "name": "waveform_find_signals"
+          }
+        ],
+        "iteration": 19
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 10,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.AValid_s2e_stable_during_stall",
+            "signal_name": "ABypassCtrl.AValid_s2e_stable_during_stall",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.AValid_s2e",
+            "signal_name": "ABypassCtrl.AValid_s2e",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_AValid_s2e",
+            "signal_name": "ABypassCtrl.io_AValid_s2e",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_Phi1",
+            "signal_name": "ABypassCtrl.io_Phi1",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_Stall_s1",
+            "signal_name": "ABypassCtrl.io_Stall_s1",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 10,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._GEN",
+            "signal_name": "ABypassCtrl._GEN",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._GEN_1",
+            "signal_name": "ABypassCtrl._GEN_1",
+            "success": true,
+            "total_changes": 2,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.AValid_s2e_stable_during_stall"
+            },
+            "id": "call_00_tpJkCecpye1PzAfHbgL63510",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.AValid_s2e"
+            },
+            "id": "call_01_YdO7NAglEoeyPnm6Q3ik8090",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.io_AValid_s2e"
+            },
+            "id": "call_02_ISCQd3wm5PKt4Axe2l0O1650",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.io_Phi1"
+            },
+            "id": "call_03_hCjdAiachgHsRe2gCN8m8645",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.io_Stall_s1"
+            },
+            "id": "call_04_1T2EdRUc9nOdgkybzcvW2326",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl._GEN"
+            },
+            "id": "call_05_ZBTwnIQ5wEZY73HaZy3c2942",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl._GEN_1"
+            },
+            "id": "call_06_iywbrvtWVRIfRtllge8p4809",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 20
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": null,
+                "error": "Error reading file: File does not exist: log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/generated/ABypassCtrl.v",
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/generated/ABypassCtrl.v",
+                "success": false
+              }
+            ],
+            "success": false,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "generated/ABypassCtrl.v"
+              ],
+              "reason": "Read the generated Verilog to see the register implementation and assumptions"
+            },
+            "id": "call_00_cyhFbgRgUPbiQI87NsrK1482",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 21
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": null,
+                "error": "Error reading file: File does not exist: log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.v",
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.v",
+                "success": false
+              }
+            ],
+            "success": false,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.v"
+              ],
+              "reason": "Read the generated Verilog to understand register implementation"
+            },
+            "id": "call_00_M9hQ6N7NVTDOB8q9ybJo4494",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 22
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\nclass ABypassCtrl extends Module with Formal {\n  val io = IO(new Bundle {\n    // Clocks & Stalls\n    val Phi1 = Input(Bool())\n    val Stall_s1 = Input(Bool())\n    val IStall_s1 = Input(Bool())\n    val MemStall_s1 = Input(Bool())\n\n    // Boosting information\n    val ABoosted_s1e = Input(Bool())\n    val BBoosted_s1e = Input(Bool())\n    val ABoostValid_v1e = Input(Bool())\n    val BBoostValid_v1e = Input(Bool())\n\n    // Instruction WB cancel\n    val AKill_s1e = Input(Bool())\n    val AIgnore_s2e = Input(Bool())\n    val BKill_s1e = Input(Bool())\n    val BIgnore_s2e = Input(Bool())\n    val ANoDest_s1e = Input(Bool())\n    val BNoDest_s1e = Input(Bool())\n    val ADestIsZero_v1e = Input(Bool())\n    val BDestIsZero_v1e = Input(Bool())\n\n    val ASBypBmem_s1e = Input(Bool())\n    val ATBypBmem_s1e = Input(Bool())\n    val BIsLoad_s1e = Input(Bool())\n\n    // Branches & Exceptions\n    val Commit_s1e = Input(Bool())\n    val Squash_s1e = Input(Bool())\n    val Except_s1w = Input(Bool())\n\n    // Outputs\n    val Alpha1_s1m = Output(Bool())\n    val Beta1_s1m = Output(Bool())\n    val Delta2_q2 = Output(Bool())\n    val ASBypassLoad_s1e = Output(Bool())\n    val ASBypassData_s1e = Output(Bool())\n    val ATBypassLoad_s1e = Output(Bool())\n    val ATBypassData_s1e = Output(Bool())\n\n    val ABoosted_s2e = Output(Bool())\n    val ABoosted_s2m = Output(Bool())\n    val AValid_s1e = Output(Bool())\n    val AValid_s2e = Output(Bool())\n    val AValid_s2m = Output(Bool())\n    val AValid_s1w = Output(Bool())\n    val BBoosted_s2e = Output(Bool())\n    val BBoosted_s2m = Output(Bool())\n    val BValid_s2e = Output(Bool())\n    val BValid_s2m = Output(Bool())\n  })\n\n  // Internal signals\n  val Phi2 = ~io.Phi1\n\n  // Delayed version of Stall\n  val IStall_s2 = RegInit(false.B)\n  val MemStall_s2 = RegInit(false.B)\n\n  // Kill Chain registers\n  val AValid_s2e = RegInit(false.B)\n  val AValid_s1m = RegInit(false.B)\n  val AValid_s2m = RegInit(false.B)\n  val AValid_s1w = RegInit(false.B)\n\n  val BValid_s2e = RegInit(false.B)\n  val BValid_s1m = RegInit(false.B)\n  val BValid_s2m = RegInit(false.B)\n\n  val ABoosted_s2e = RegInit(false.B)\n  val ABoosted_s1m = RegInit(false.B)\n  val ABoosted_s2m = RegInit(false.B)\n\n  val ABoostValid_s2e = RegInit(false.B)\n  val ABoostValid_s1m = RegInit(false.B)\n  val ABoostValid_s2m = RegInit(false.B)\n\n  val BBoostValid_s2e = RegInit(false.B)\n  val BBoostValid_s1m = RegInit(false.B)\n  val BBoostValid_s2m = RegInit(false.B)\n\n  val BBoosted_s2e = RegInit(false.B)\n  val BBoosted_s1m = RegInit(false.B)\n  val BBoosted_s2m = RegInit(false.B)\n\n  val BIsLoad_s2e = RegInit(false.B)\n  val BIsLoad_s1m = RegInit(false.B)\n  val BIsLoad_s2m = RegInit(false.B)\n  val BIsLoad_s1w = RegInit(false.B)\n\n  // Control Logic\n  // Qualify the clocks\n  val Delta2_q2_wire = (~IStall_s2 | MemStall_s2) & Phi2\n  io.Delta2_q2 := Delta2_q2_wire\n\n  // Bypass control logic\n  io.ASBypassLoad_s1e := io.ASBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n  io.ATBypassLoad_s1e := io.ATBypBmem_s1e & BIsLoad_s1w & ~io.AKill_s1e\n  io.ASBypassData_s1e := ~(io.ASBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n  io.ATBypassData_s1e := ~(io.ATBypBmem_s1e & BIsLoad_s1w) & ~io.AKill_s1e\n\n  // Delay IStall\n  when(io.Phi1) {\n    IStall_s2 := io.IStall_s1\n    MemStall_s2 := io.MemStall_s1\n  }\n\n  // Random Logic\n  io.AValid_s1e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n\n  when(io.Phi1 & ~io.Stall_s1) {\n    AValid_s2e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n    AValid_s2m := AValid_s1m & ~io.Except_s1w\n\n    // Boost logic\n    ABoosted_s2e := io.ABoosted_s1e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n    ABoostValid_s2e := io.ABoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n    ABoosted_s2m := ABoosted_s2e ^ (io.Commit_s1e & io.ABoostValid_v1e)\n    ABoostValid_s2m := ABoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n  }\n\n  when(Phi2) {\n    AValid_s1m := AValid_s2e & ~io.AIgnore_s2e\n    AValid_s1w := AValid_s2m\n    ABoosted_s1m := ABoosted_s2e\n    ABoostValid_s1m := ABoostValid_s2e\n  }\n\n  when(io.Phi1 & ~io.Stall_s1) {\n    BValid_s2e := ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w)\n    BValid_s2m := BValid_s1m & ~io.Except_s1w\n\n    // Boost logic for B\n    BBoosted_s2e := io.BBoosted_s1e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n    BBoostValid_s2e := io.BBoostValid_v1e & ~(io.Commit_s1e | io.Squash_s1e)\n    BBoosted_s2m := BBoosted_s2e ^ (io.Commit_s1e & io.BBoostValid_v1e)\n    BBoostValid_s2m := BBoostValid_s1m & ~(io.Commit_s1e | io.Squash_s1e)\n\n    // Keep track of which B-side instrs are loads\n    BIsLoad_s2e := io.BIsLoad_s1e\n    BIsLoad_s2m := BIsLoad_s1m\n  }\n\n  when(Phi2) {\n    BValid_s1m := BValid_s2e & ~io.BIgnore_s2e\n    BBoosted_s1m := BBoosted_s2e\n    BBoostValid_s1m := BBoostValid_s2e\n    BIsLoad_s1m := BIsLoad_s2e\n    BIsLoad_s1w := BIsLoad_s2m\n  }\n\n  // Don't toggle datapath latches if instruction was killed\n  io.Alpha1_s1m := AValid_s1m & ~io.Stall_s1\n  io.Beta1_s1m := BValid_s1m & ~io.Stall_s1\n\n  // Connect outputs\n  io.ABoosted_s2e := ABoosted_s2e\n  io.ABoosted_s2m := ABoosted_s2m\n  io.AValid_s2e := AValid_s2e\n  io.AValid_s2m := AValid_s2m\n  io.AValid_s1w := AValid_s1w\n  io.BBoosted_s2e := BBoosted_s2e\n  io.BBoosted_s2m := BBoosted_s2m\n  io.BValid_s2e := BValid_s2e\n  io.BValid_s2m := BValid_s2m\n\n  // ============================================================\n  // FORMAL ASSERTIONS\n  // ============================================================\n\n  // ---- SAFETY: Bypass mutual exclusion ----\n\n  // ASBypassLoad_s1e and ASBypassData_s1e must never both be true\n  fvAssert(!(io.ASBypassLoad_s1e & io.ASBypassData_s1e),\n    \"ASBypassLoad_and_ASBypassData_mutex\")\n\n  // ATBypassLoad_s1e and ATBypassData_s1e must never both be true\n  fvAssert(!(io.ATBypassLoad_s1e & io.ATBypassData_s1e),\n    \"ATBypassLoad_and_ATBypassData_mutex\")\n\n  // When not killed, exactly one of ASBypassLoad/ASBypassData is true (XOR relationship)\n  fvAssert(io.AKill_s1e | (io.ASBypassLoad_s1e ^ io.ASBypassData_s1e),\n    \"ASBypass_exactly_one_when_not_killed\")\n\n  // When not killed, exactly one of ATBypassLoad/ATBypassData is true\n  fvAssert(io.AKill_s1e | (io.ATBypassLoad_s1e ^ io.ATBypassData_s1e),\n    \"ATBypass_exactly_one_when_not_killed\")\n\n  // ---- SAFETY: Pipeline validity definition ----\n\n  // AValid_s1e must equal ~(AKill_s1e | ANoDest_s1e | Except_s1w)\n  fvAssert(io.AValid_s1e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n    \"AValid_s1e_definition\")\n\n  // ---- SAFETY: Pipeline register stability during stalls ----\n\n  // When stalled on Phi1, AValid_s2e must hold its value (register does not update)\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2e,\n    \"AValid_s2e_stable_during_stall\")\n\n  // When stalled on Phi1, AValid_s2m must hold its value\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2m,\n    \"AValid_s2m_stable_during_stall\")\n\n  // ---- SAFETY: Pipeline stage update correctness ----\n\n  // On Phi2, AValid_s1m must equal (AValid_s2e & ~AIgnore_s2e)\n  assertImplies(Phi2,\n    AValid_s1m === (AValid_s2e & ~io.AIgnore_s2e),\n    \"AValid_s1m_Phi2_update\")\n\n  // On Phi2, AValid_s1w must equal AValid_s2m\n  assertImplies(Phi2,\n    AValid_s1w === AValid_s2m,\n    \"AValid_s1w_Phi2_update\")\n\n  // On Phi1 & ~Stall, AValid_s2e must equal ~(AKill | ANoDest | Except)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    AValid_s2e === ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w),\n    \"AValid_s2e_Phi1_update\")\n\n  // On Phi1 & ~Stall, AValid_s2m must equal (AValid_s1m & ~Except_s1w)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    AValid_s2m === (AValid_s1m & ~io.Except_s1w),\n    \"AValid_s2m_Phi1_update\")\n\n  // On Phi2, BValid_s1m must equal (BValid_s2e & ~BIgnore_s2e)\n  assertImplies(Phi2,\n    BValid_s1m === (BValid_s2e & ~io.BIgnore_s2e),\n    \"BValid_s1m_Phi2_update\")\n\n  // On Phi1 & ~Stall, BValid_s2e must equal ~(BKill | BNoDest | Except)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    BValid_s2e === ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w),\n    \"BValid_s2e_Phi1_update\")\n\n  // On Phi1 & ~Stall, BValid_s2m must equal (BValid_s1m & ~Except_s1w)\n  assertImplies(io.Phi1 & ~io.Stall_s1,\n    BValid_s2m === (BValid_s1m & ~io.Except_s1w),\n    \"BValid_s2m_Phi1_update\")\n\n  // ---- LIVENESS: Pipeline progress ----\n\n  // A-side pipeline: When a valid instruction enters (AValid_s1e, not stalled),\n  // it must reach AValid_s1w within 10 cycles, or be canceled (kill/except/squash).\n  // Pipeline depth is 4 register stages (s1e→s2e→s1m→s2m→s1w); bound of 10 is generous.\n  astRelaxedLiveness(\n    io.AValid_s1e & ~io.Stall_s1,\n    io.AValid_s1w | io.AKill_s1e | io.Except_s1w | io.Squash_s1e,\n    10,\n    \"A_pipeline_progress\"\n  )\n\n  // B-side pipeline: When a valid instruction enters, it must reach BValid_s2m\n  // within 10 cycles, or be canceled.\n  // B pipeline depth is 3 register stages; bound of 10 is generous.\n  astRelaxedLiveness(\n    ~(io.BKill_s1e | io.BNoDest_s1e | io.Except_s1w) & ~io.Stall_s1,\n    io.BValid_s2m | io.BKill_s1e | io.Except_s1w | io.Squash_s1e,\n    10,\n    \"B_pipeline_progress\"\n  )\n\n  // ---- LIVENESS: Pipeline must not get stuck ----\n  // Timer-based: if AValid_s1e is true continuously for >20 cycles without\n  // AValid_s1w being asserted or a pipeline-clearing event, the pipeline is stuck.\n  assertLivenessTimer(\n    io.AValid_s1e,\n    io.AValid_s1w | io.Except_s1w | io.Squash_s1e,\n    20,\n    \"A_pipeline_not_stuck\"\n  )\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new ABypassCtrl(), args)\n}\n",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.scala",
+                "original_chars": 9480,
+                "original_lines": 286,
+                "returned_chars": 9480,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "ABypassCtrl.scala"
+              ],
+              "reason": "Read the full source file to understand the assertion, register logic, and constraints"
+            },
+            "id": "call_00_ppWculxlTQdp0hjBiCnC9797",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 23
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._AValid_s2e_T",
+            "signal_name": "ABypassCtrl._AValid_s2e_T",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_AKill_s1e",
+            "signal_name": "ABypassCtrl.io_AKill_s1e",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_ANoDest_s1e",
+            "signal_name": "ABypassCtrl.io_ANoDest_s1e",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.io_Except_s1w",
+            "signal_name": "ABypassCtrl.io_Except_s1w",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl._AValid_s2e_T"
+            },
+            "id": "call_00_oO71ZxstQZTUcihmCYKM4021",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.io_AKill_s1e"
+            },
+            "id": "call_01_tR6tWwmt7P0ae9ansaOw9986",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.io_ANoDest_s1e"
+            },
+            "id": "call_02_rwaazWTPCiPezBiJFCOQ4209",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.io_Except_s1w"
+            },
+            "id": "call_03_t1gf2iNaeo5lmzr4RCDR0143",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 24
+      },
+      {
+        "action_results": [
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "1"
+              },
+              {
+                "time": 5,
+                "value": "0"
+              },
+              {
+                "time": 10,
+                "value": "1"
+              },
+              {
+                "time": 15,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl.clock",
+            "signal_name": "ABypassCtrl.clock",
+            "success": true,
+            "total_changes": 4,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._GEN_0",
+            "signal_name": "ABypassCtrl._GEN_0",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._GEN_2",
+            "signal_name": "ABypassCtrl._GEN_2",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._GEN_3",
+            "signal_name": "ABypassCtrl._GEN_3",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          },
+          {
+            "changes": [
+              {
+                "time": 0,
+                "value": "0"
+              }
+            ],
+            "length": 1,
+            "resolved_name": "ABypassCtrl._GEN_4",
+            "signal_name": "ABypassCtrl._GEN_4",
+            "success": true,
+            "total_changes": 1,
+            "truncated": false,
+            "type": "waveform_trace_signal"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl.clock"
+            },
+            "id": "call_00_Sutc5EvEtQ1v45Y0Jroh3564",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl._GEN_0"
+            },
+            "id": "call_01_atpxS9Q18W6N6YG69TxD7985",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl._GEN_2"
+            },
+            "id": "call_02_MYWQ9pfKiZmtpNuXwIsM5061",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl._GEN_3"
+            },
+            "id": "call_03_NVUAdYS4bLPZ57KCVK7v3787",
+            "name": "waveform_trace_signal"
+          },
+          {
+            "arguments": {
+              "max_changes": 10,
+              "signal_name": "ABypassCtrl._GEN_4"
+            },
+            "id": "call_04_nmy59RpfLD9sdVkj9nJx4391",
+            "name": "waveform_trace_signal"
+          }
+        ],
+        "iteration": 25
+      },
+      {
+        "action_results": [
+          {
+            "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/torch_regfile_ABypassCtrl/counterexample_analysis.md",
+            "success": true,
+            "type": "write_report"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "content": "# Counterexample Analysis Report\n\n## 1. Verification Environment\n\n- **Top Module**: `ABypassCtrl` (package `llmverify`)\n- **Module Type**: Chisel Module with `Formal` mixin (chiselFv)\n- **Key Components**:\n  - Pipeline registers for A-side and B-side instruction validity (AValid_s2e, AValid_s1m, AValid_s2m, AValid_s1w, BValid_s2e, BValid_s1m, BValid_s2m)\n  - Kill chain registers for boost signals\n  - Bypass control logic (ASBypassLoad/ASBypassData, ATBypassLoad/ATBypassData)\n  - Stall delay registers (IStall_s2, MemStall_s2)\n  - Two-phase clocking (Phi1, Phi2 = ~Phi1)\n- **Design Description**: The `ABypassCtrl` module manages pipeline bypass control for a dual-issue out-of-order processor. It tracks instruction validity through a 4-stage pipeline (s1e→s2e→s1m→s2m→s1w) with stall support, kill handling, and memory bypass selection for address-side (A) and base-side (B) instructions.\n\n## 2. Violated Assertion\n\n- **Assertion Name**: `AValid_s2e_stable_during_stall` (extracted from waveform filename `ABypassCtrl.AValid_s2e_stable_during_stall.fst`)\n- **Code Snippet** (from `ABypassCtrl.scala`, line ~246):\n  ```scala\n  // When stalled on Phi1, AValid_s2e must hold its value (register does not update)\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2e,\n    \"AValid_s2e_stable_during_stall\")\n  ```\n- **Natural Language Description**: When the pipeline is stalled (`Stall_s1` is asserted) during phase 1 (`Phi1` is high), the `AValid_s2e` pipeline register must retain its value (i.e., not change between consecutive clock cycles).\n- **File Location**: `ABypassCtrl.scala`, lines ~245–247\n\n## 3. Waveform Information\n\n- **Full Waveform Path**: `verilog/extra_bench/torch_regfile_ABypassCtrl/ABypassCtrl.AValid_s2e_stable_during_stall.fst`\n- **Time Range**: 0 ns → 20 ns (2 clock cycles, clock period = 10 ns)\n- **Key Time Points**:\n\n### Cycle 1 (time = 0 ns, rising clock edge)\n| Signal | Value | Description |\n|--------|-------|-------------|\n| `ABypassCtrl.clock` | 1 | Rising edge |\n| `ABypassCtrl.io_Phi1` | 1 | Phase 1 active |\n| `ABypassCtrl.io_Stall_s1` | 0 | Stall NOT asserted |\n| `ABypassCtrl._GEN` (= Phi1 & ~Stall_s1) | 1 | Register enable ACTIVE |\n| `ABypassCtrl.io_AKill_s1e` | 0 | Not killed |\n| `ABypassCtrl.io_ANoDest_s1e` | 0 | Has destination |\n| `ABypassCtrl.io_Except_s1w` | 0 | No exception |\n| `ABypassCtrl._AValid_s2e_T` | 0 | Register input data |\n| `ABypassCtrl.AValid_s2e` | 0 | Register output (still at reset value) |\n| `ABypassCtrl.AValid_s2e_stable_during_stall` | 1 | Assertion passes (condition false) |\n\n### Cycle 2 (time = 10 ns, rising clock edge)\n| Signal | Value | Description |\n|--------|-------|-------------|\n| `ABypassCtrl.clock` | 1 | Rising edge |\n| `ABypassCtrl.io_Phi1` | 1 | Phase 1 active |\n| `ABypassCtrl.io_Stall_s1` | 1 | Stall NOW asserted (transitioned 0→1) |\n| `ABypassCtrl._GEN` (= Phi1 & ~Stall_s1) | 0 | Register enable INACTIVE |\n| `ABypassCtrl.AValid_s2e` | **1** | Register output CHANGED (0→1 from previous cycle's update) |\n| `ABypassCtrl.AValid_s2e_stable_during_stall` | **0** | Assertion FAILS |\n\n## 4. Root Cause Analysis\n\n### Bug Classification: **Assertion Error (assertion_error)**\n\nThe assertion `assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2e, ...)` is incorrectly conditioned.\n\n### Detailed Explanation\n\nThe pipeline register `AValid_s2e` is defined as:\n\n```scala\nval AValid_s2e = RegInit(false.B)\n\nwhen(io.Phi1 & ~io.Stall_s1) {\n    AValid_s2e := ~(io.AKill_s1e | io.ANoDest_s1e | io.Except_s1w)\n    // ...\n}\n```\n\nThe register updates on the rising clock edge when the enable condition `io.Phi1 & ~io.Stall_s1` is true.\n\n**What happens in the counterexample:**\n\n1. **Cycle 1 (time 0–10)**: `Stall_s1 = 0`, so the enable condition `Phi1 & ~Stall_s1 = 1`. The register input is prepared as `~(0|0|0) = 1`, and the register latches this value on the rising edge at time 10.\n\n2. **Cycle 2 (time 10–20)**: At the exact clock edge (time 10), two things happen simultaneously:\n   - The register `AValid_s2e` updates from `0` to `1` (latching the value computed when enabled in the previous cycle).\n   - `Stall_s1` transitions from `0` to `1` (as injected by the formal solver).\n   - The assertion condition `Phi1 & Stall_s1` becomes `1 & 1 = 1` (just became true).\n   - The assertion checks: since condition is true, `AValid_s2e` must equal its previous value (`0`), but it is now `1` → **assertion fails**.\n\n### Why This Is an Assertion Error (Not a Design Bug)\n\n- **Design logic is correct**: The register enable `io.Phi1 & ~io.Stall_s1` correctly gates the update: when `Stall_s1=0` the register updates, when `Stall_s1=1` it holds. The register value changes at time 10 because it was enabled in the **previous** cycle (when `Stall_s1=0`), not because it updated during the stalled cycle.\n\n- **The assertion condition is too aggressive**: The property \"during a stall, the register must be stable\" is conceptually correct. However, the assertion checks `io.Phi1 & io.Stall_s1` in the **same** cycle where the register may have just been updated from the **previous** non-stalled cycle. This creates a false failure when `Stall_s1` transitions from `0` to `1` simultaneously with the register update.\n\n- **The assertion does not account for the initial transition**: A proper stability assertion should check that the register is stable only after it has already been in the stalled state for at least one full cycle. The current assertion fires at the **first** cycle where both `Phi1` and `Stall_s1` are true, without ensuring the register was already stalled in the previous cycle.\n\n### Root Cause Location\n\n- **File**: `ABypassCtrl.scala`, line ~246\n- **Code**:\n  ```scala\n  assertStableWhen(io.Phi1 & io.Stall_s1, AValid_s2e,\n    \"AValid_s2e_stable_during_stall\")\n  ```\n- **Issue**: The `assertStableWhen` primitive checks `cond ==> (signal === past(signal))`. When `Stall_s1` transitions from `0→1`, the condition becomes true at the same moment the register `AValid_s2e` updates from `0→1` (due to the previous non-stalled cycle), causing a false assertion failure.\n\n### Potential Fixes\n\n**Option A (Preferred — Relax assertion condition):** Change the assertion to only check stability after the register has already been stalled for at least one cycle:\n\n```scala\n// Use past() to ensure we only check after stall is already established\nassertStableWhen(past(io.Phi1 & io.Stall_s1), AValid_s2e,\n  \"AValid_s2e_stable_during_stall\")\n```\n\n**Option B (Add formal assumption):** Constrain `Stall_s1` such that it does not change simultaneously with the register update:\n\n```scala\n// When Phi1 is active and Stall transitions, it must remain stable\nfvAssume(!(io.Phi1 & (io.Stall_s1 =/= past(io.Stall_s1))),\n  \"Stall_stable_during_Phi1\")\n```\n\n**Option C (Alternative assertion formulation):** Use a dedicated assertion that defers stability checking by one cycle relative to the stall assertion:\n```scala\n// On the first cycle of stall, allow the register to have updated from previous cycle\n// Then check stability from the second stalled cycle onward\nassertImplies(io.Phi1 & io.Stall_s1 & past(io.Phi1 & io.Stall_s1),\n  AValid_s2e === past(AValid_s2e),\n  \"AValid_s2e_stable_during_stall_v2\")\n```\n",
+              "error_type": "assertion_error",
+              "stage_complete": true
+            },
+            "id": "call_00_8NgaiiopnTNbtK1POplW2329",
+            "name": "write_report"
+          }
+        ],
+        "iteration": 26
+      }
+    ],
+    "root_cause": null,
+    "success": true,
+    "summary": "",
+    "verification_passed": true
+  },
+  "success": true
+}

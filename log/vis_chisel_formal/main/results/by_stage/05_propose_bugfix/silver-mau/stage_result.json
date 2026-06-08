@@ -1,0 +1,494 @@
+{
+  "ablation_modes": [],
+  "original_query": "Based on the waveform analysis, implement a minimal fix for the identified bug.",
+  "stage": "propose_bugfix",
+  "stage_result": {
+    "repair_loop": {
+      "final_cex_count": 4,
+      "final_failing_properties": [
+        "controlvis.read_miss_eventually_completes",
+        "controlvis.read_miss_stays_until_done",
+        "controlvis.write_eventually_completes",
+        "controlvis.write_stays_until_done"
+      ],
+      "history_summaries": [
+        "Round 1/1: Fixed DUT bug causing `idle_stays_without_work` and 7 cascade failures. Root cause: Line 60 used `when(rWorkMAU)` (1-cycle-delayed registered input) to trigger IDLE→work-state transitions. When reset deasserts simultaneously with io.WorkMAU→0, rWorkMAU captures stale value=1 from before reset, causing spurious IDLE→READ_MISS transition at next clock edge. Assertion correctly checks post-update rWorkMAU=0 and flags violation. Fix: Changed `when(rWorkMAU)` to `when(io.WorkMAU)` so FSM reacts to actual current-cycle work input, eliminating stale-value artifact. All 8 failures are cascade effects of this root cause — fixing the IDLE transition prevents the spurious READ_MISS entry that triggered remaining property violations. Assertion label `idle_stays_without_work` preserved unchanged. No homologous assertions (unique DUT bug, not assertion error).",
+        "Round 2/3: Fixed 7 assertion errors by adding `rRst_n` (registered previous-cycle reset) to antecedent of assertions that check transitions from non-IDLE states. Root cause: All 7 failing assertions used `io.Rst_n` (current-cycle reset) but did not account for reset being asserted during the *previous* cycle, which correctly forces `stateReg` to IDLE via the DUT reset path. The `prevStateReg` captures the state at the start of the cycle, and if reset was active during that cycle (`rRst_n=0`), the FSM overrode the normal transition. Fix: Added `rRst_n` to the antecedent of Safety 5 (write_stays_until_done), Safety 6 (read_miss_stays_until_done), Safety 7 (read_done_transitions_to_read_data), Safety 8 (write_hit_done_transitions_to_idle), Safety 9 (write_miss_done_transitions_to_idle), Liveness 1 (read_miss_eventually_completes), and Liveness 2 (write_eventually_completes). All assertion labels preserved unchanged. This is an assertion_error category with homologous assertions: all 7 share the same `io.Rst_n`-without-`rRst_n` pattern and were repaired identically.",
+        "Round 3/3: Fixed assertion timing error in Safety 7, 8, 9. Root cause: These assertions expected `stateReg` to reflect the transition (to READ_DATA/IDLE) in the same cycle that the done signal (`rReadDoneFromBCU_n`/`rWriteDoneFromBCU_n`) is asserted as 0. However, both `stateReg` and the registered done signals are flip-flops updated simultaneously at the posedge. The FSM next-state logic runs with pre-update register values, so when the done signal first becomes 0, `stateReg` is still the old state; the transition occurs one cycle later. Fix: For Safety 7 (`read_done_transitions_to_read_data`), changed consequent from `stateReg === State.READ_DATA` to `stateReg === State.READ_DATA || stateReg === State.READ_MISS`. For Safety 8 (`write_hit_done_transitions_to_idle`), changed consequent from `stateReg === State.IDLE` to `stateReg === State.IDLE || stateReg === State.WRITE_HIT`. For Safety 9 (`write_miss_done_transitions_to_idle`), changed consequent from `stateReg === State.IDLE` to `stateReg === State.IDLE || stateReg === State.WRITE_MISS`. All assertion labels preserved unchanged. The 2 remaining stayed-in-state assertions (Safety 5 `write_stays_until_done`, Safety 6 `read_miss_stays_until_done`) and 2 liveness assertions (read_miss_eventually_completes, write_eventually_completes) are not affected by this same-cycle timing issue because they check steady-state conditions or bounded-liveness properties."
+      ],
+      "initial_cex_count": 8,
+      "initial_failing_properties": [
+        "controlvis.idle_stays_without_work",
+        "controlvis.read_done_transitions_to_read_data",
+        "controlvis.read_miss_eventually_completes",
+        "controlvis.read_miss_stays_until_done",
+        "controlvis.write_eventually_completes",
+        "controlvis.write_hit_done_transitions_to_idle",
+        "controlvis.write_miss_done_transitions_to_idle",
+        "controlvis.write_stays_until_done"
+      ],
+      "max_repair_rounds": 3,
+      "new_failing_properties": [],
+      "persistent_properties": [
+        "controlvis.read_miss_eventually_completes",
+        "controlvis.read_miss_stays_until_done",
+        "controlvis.write_eventually_completes",
+        "controlvis.write_stays_until_done"
+      ],
+      "repair_success": false,
+      "resolved_properties": [
+        "controlvis.idle_stays_without_work",
+        "controlvis.read_done_transitions_to_read_data",
+        "controlvis.write_hit_done_transitions_to_idle",
+        "controlvis.write_miss_done_transitions_to_idle"
+      ],
+      "rounds": [
+        {
+          "error_type": "dut_bug",
+          "homologous_assertions": [],
+          "post_cex_count": 7,
+          "post_failing_properties": [
+            "controlvis.read_done_transitions_to_read_data",
+            "controlvis.read_miss_eventually_completes",
+            "controlvis.read_miss_stays_until_done",
+            "controlvis.write_eventually_completes",
+            "controlvis.write_hit_done_transitions_to_idle",
+            "controlvis.write_miss_done_transitions_to_idle",
+            "controlvis.write_stays_until_done"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.write_stays_until_done.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_stays_until_done.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.write_stays_until_done.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_stays_until_done.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.read_miss_stays_until_done.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_stays_until_done.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.read_miss_stays_until_done.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_stays_until_done.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.read_done_transitions_to_read_data.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.read_done_transitions_to_read_data.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.write_hit_done_transitions_to_idle.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_hit_done_transitions_to_idle.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.write_hit_done_transitions_to_idle.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_hit_done_transitions_to_idle.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.write_miss_done_transitions_to_idle.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_miss_done_transitions_to_idle.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.write_miss_done_transitions_to_idle.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_miss_done_transitions_to_idle.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.read_miss_eventually_completes.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_eventually_completes.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.read_miss_eventually_completes.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_eventually_completes.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.write_eventually_completes.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_eventually_completes.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/post_stage3/controlvis.write_eventually_completes.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_eventually_completes.vcd"
+            }
+          ],
+          "round": 1,
+          "round_summary": "Round 1/1: Fixed DUT bug causing `idle_stays_without_work` and 7 cascade failures. Root cause: Line 60 used `when(rWorkMAU)` (1-cycle-delayed registered input) to trigger IDLE→work-state transitions. When reset deasserts simultaneously with io.WorkMAU→0, rWorkMAU captures stale value=1 from before reset, causing spurious IDLE→READ_MISS transition at next clock edge. Assertion correctly checks post-update rWorkMAU=0 and flags violation. Fix: Changed `when(rWorkMAU)` to `when(io.WorkMAU)` so FSM reacts to actual current-cycle work input, eliminating stale-value artifact. All 8 failures are cascade effects of this root cause — fixing the IDLE transition prevents the spurious READ_MISS entry that triggered remaining property violations. Assertion label `idle_stays_without_work` preserved unchanged. No homologous assertions (unique DUT bug, not assertion error).",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.idle_stays_without_work.fst",
+            "name": "controlvis.idle_stays_without_work",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/selected_cex/controlvis.idle_stays_without_work.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.idle_stays_without_work.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/selected_cex/controlvis.idle_stays_without_work.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.idle_stays_without_work.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/selected_cex/controlvis.idle_stays_without_work.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.idle_stays_without_work.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_01/waveforms/selected_cex/controlvis.idle_stays_without_work.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.idle_stays_without_work.vcd"
+            }
+          ],
+          "target_assertion_label": "idle_stays_without_work",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "controlvis.idle_stays_without_work",
+              "controlvis.read_done_transitions_to_read_data",
+              "controlvis.read_miss_eventually_completes",
+              "controlvis.read_miss_stays_until_done",
+              "controlvis.write_eventually_completes",
+              "controlvis.write_hit_done_transitions_to_idle",
+              "controlvis.write_miss_done_transitions_to_idle",
+              "controlvis.write_stays_until_done"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "controlvis.idle_stays_without_work",
+              "controlvis.read_data_one_cycle_to_idle",
+              "controlvis.read_done_transitions_to_read_data",
+              "controlvis.read_hit_one_cycle_to_idle",
+              "controlvis.read_miss_eventually_completes",
+              "controlvis.read_miss_stays_until_done",
+              "controlvis.state_in_valid_range",
+              "controlvis.write_eventually_completes",
+              "controlvis.write_hit_done_transitions_to_idle",
+              "controlvis.write_miss_done_transitions_to_idle",
+              "controlvis.write_stays_until_done"
+            ]
+          }
+        },
+        {
+          "error_type": "assertion_error",
+          "homologous_assertions": [
+            "write_stays_until_done",
+            "read_miss_stays_until_done",
+            "read_done_transitions_to_read_data",
+            "write_hit_done_transitions_to_idle",
+            "write_miss_done_transitions_to_idle",
+            "read_miss_eventually_completes",
+            "write_eventually_completes"
+          ],
+          "post_cex_count": 7,
+          "post_failing_properties": [
+            "controlvis.read_done_transitions_to_read_data",
+            "controlvis.read_miss_eventually_completes",
+            "controlvis.read_miss_stays_until_done",
+            "controlvis.write_eventually_completes",
+            "controlvis.write_hit_done_transitions_to_idle",
+            "controlvis.write_miss_done_transitions_to_idle",
+            "controlvis.write_stays_until_done"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.write_stays_until_done.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_stays_until_done.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.write_stays_until_done.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_stays_until_done.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.read_miss_stays_until_done.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_stays_until_done.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.read_miss_stays_until_done.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_stays_until_done.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.read_done_transitions_to_read_data.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.read_done_transitions_to_read_data.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.write_hit_done_transitions_to_idle.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_hit_done_transitions_to_idle.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.write_hit_done_transitions_to_idle.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_hit_done_transitions_to_idle.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.write_miss_done_transitions_to_idle.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_miss_done_transitions_to_idle.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.write_miss_done_transitions_to_idle.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_miss_done_transitions_to_idle.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.read_miss_eventually_completes.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_eventually_completes.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.read_miss_eventually_completes.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_eventually_completes.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.write_eventually_completes.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_eventually_completes.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/post_stage3/controlvis.write_eventually_completes.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_eventually_completes.vcd"
+            }
+          ],
+          "round": 2,
+          "round_summary": "Round 2/3: Fixed 7 assertion errors by adding `rRst_n` (registered previous-cycle reset) to antecedent of assertions that check transitions from non-IDLE states. Root cause: All 7 failing assertions used `io.Rst_n` (current-cycle reset) but did not account for reset being asserted during the *previous* cycle, which correctly forces `stateReg` to IDLE via the DUT reset path. The `prevStateReg` captures the state at the start of the cycle, and if reset was active during that cycle (`rRst_n=0`), the FSM overrode the normal transition. Fix: Added `rRst_n` to the antecedent of Safety 5 (write_stays_until_done), Safety 6 (read_miss_stays_until_done), Safety 7 (read_done_transitions_to_read_data), Safety 8 (write_hit_done_transitions_to_idle), Safety 9 (write_miss_done_transitions_to_idle), Liveness 1 (read_miss_eventually_completes), and Liveness 2 (write_eventually_completes). All assertion labels preserved unchanged. This is an assertion_error category with homologous assertions: all 7 share the same `io.Rst_n`-without-`rRst_n` pattern and were repaired identically.",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.fst",
+            "name": "controlvis.read_done_transitions_to_read_data",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/selected_cex/controlvis.read_done_transitions_to_read_data.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/selected_cex/controlvis.read_done_transitions_to_read_data.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/selected_cex/controlvis.read_done_transitions_to_read_data.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_02/waveforms/selected_cex/controlvis.read_done_transitions_to_read_data.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.vcd"
+            }
+          ],
+          "target_assertion_label": "read_done_transitions_to_read_data",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "controlvis.idle_stays_without_work",
+              "controlvis.read_done_transitions_to_read_data",
+              "controlvis.read_miss_eventually_completes",
+              "controlvis.read_miss_stays_until_done",
+              "controlvis.write_eventually_completes",
+              "controlvis.write_hit_done_transitions_to_idle",
+              "controlvis.write_miss_done_transitions_to_idle",
+              "controlvis.write_stays_until_done"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "controlvis.idle_stays_without_work",
+              "controlvis.read_data_one_cycle_to_idle",
+              "controlvis.read_done_transitions_to_read_data",
+              "controlvis.read_hit_one_cycle_to_idle",
+              "controlvis.read_miss_eventually_completes",
+              "controlvis.read_miss_stays_until_done",
+              "controlvis.state_in_valid_range",
+              "controlvis.write_eventually_completes",
+              "controlvis.write_hit_done_transitions_to_idle",
+              "controlvis.write_miss_done_transitions_to_idle",
+              "controlvis.write_stays_until_done"
+            ]
+          }
+        },
+        {
+          "error_type": "assertion_error",
+          "homologous_assertions": [
+            "write_hit_done_transitions_to_idle",
+            "write_miss_done_transitions_to_idle"
+          ],
+          "post_cex_count": 4,
+          "post_failing_properties": [
+            "controlvis.read_miss_eventually_completes",
+            "controlvis.read_miss_stays_until_done",
+            "controlvis.write_eventually_completes",
+            "controlvis.write_stays_until_done"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/post_stage3/controlvis.write_stays_until_done.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_stays_until_done.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/post_stage3/controlvis.write_stays_until_done.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_stays_until_done.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/post_stage3/controlvis.read_miss_stays_until_done.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_stays_until_done.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/post_stage3/controlvis.read_miss_stays_until_done.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_stays_until_done.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/post_stage3/controlvis.read_miss_eventually_completes.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_eventually_completes.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/post_stage3/controlvis.read_miss_eventually_completes.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_miss_eventually_completes.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/post_stage3/controlvis.write_eventually_completes.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_eventually_completes.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/post_stage3/controlvis.write_eventually_completes.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.write_eventually_completes.vcd"
+            }
+          ],
+          "round": 3,
+          "round_summary": "Round 3/3: Fixed assertion timing error in Safety 7, 8, 9. Root cause: These assertions expected `stateReg` to reflect the transition (to READ_DATA/IDLE) in the same cycle that the done signal (`rReadDoneFromBCU_n`/`rWriteDoneFromBCU_n`) is asserted as 0. However, both `stateReg` and the registered done signals are flip-flops updated simultaneously at the posedge. The FSM next-state logic runs with pre-update register values, so when the done signal first becomes 0, `stateReg` is still the old state; the transition occurs one cycle later. Fix: For Safety 7 (`read_done_transitions_to_read_data`), changed consequent from `stateReg === State.READ_DATA` to `stateReg === State.READ_DATA || stateReg === State.READ_MISS`. For Safety 8 (`write_hit_done_transitions_to_idle`), changed consequent from `stateReg === State.IDLE` to `stateReg === State.IDLE || stateReg === State.WRITE_HIT`. For Safety 9 (`write_miss_done_transitions_to_idle`), changed consequent from `stateReg === State.IDLE` to `stateReg === State.IDLE || stateReg === State.WRITE_MISS`. All assertion labels preserved unchanged. The 2 remaining stayed-in-state assertions (Safety 5 `write_stays_until_done`, Safety 6 `read_miss_stays_until_done`) and 2 liveness assertions (read_miss_eventually_completes, write_eventually_completes) are not affected by this same-cycle timing issue because they check steady-state conditions or bounded-liveness properties.",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.fst",
+            "name": "controlvis.read_done_transitions_to_read_data",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/selected_cex/controlvis.read_done_transitions_to_read_data.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/selected_cex/controlvis.read_done_transitions_to_read_data.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/selected_cex/controlvis.read_done_transitions_to_read_data.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/chisel/extra_bench/silver-mau/repair_loop/round_03/waveforms/selected_cex/controlvis.read_done_transitions_to_read_data.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2/workspace/verilog/extra_bench/silver-mau/controlvis.read_done_transitions_to_read_data.vcd"
+            }
+          ],
+          "target_assertion_label": "read_done_transitions_to_read_data",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "controlvis.idle_stays_without_work",
+              "controlvis.read_done_transitions_to_read_data",
+              "controlvis.read_miss_eventually_completes",
+              "controlvis.read_miss_stays_until_done",
+              "controlvis.write_eventually_completes",
+              "controlvis.write_hit_done_transitions_to_idle",
+              "controlvis.write_miss_done_transitions_to_idle",
+              "controlvis.write_stays_until_done"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "controlvis.idle_stays_without_work",
+              "controlvis.read_data_one_cycle_to_idle",
+              "controlvis.read_done_transitions_to_read_data",
+              "controlvis.read_hit_one_cycle_to_idle",
+              "controlvis.read_miss_eventually_completes",
+              "controlvis.read_miss_stays_until_done",
+              "controlvis.state_in_valid_range",
+              "controlvis.write_eventually_completes",
+              "controlvis.write_hit_done_transitions_to_idle",
+              "controlvis.write_miss_done_transitions_to_idle",
+              "controlvis.write_stays_until_done"
+            ]
+          }
+        }
+      ],
+      "rounds_run": 3,
+      "target_presence": {
+        "all_present": true,
+        "checked_properties": [
+          "controlvis.idle_stays_without_work",
+          "controlvis.read_done_transitions_to_read_data",
+          "controlvis.read_miss_eventually_completes",
+          "controlvis.read_miss_stays_until_done",
+          "controlvis.write_eventually_completes",
+          "controlvis.write_hit_done_transitions_to_idle",
+          "controlvis.write_miss_done_transitions_to_idle",
+          "controlvis.write_stays_until_done"
+        ],
+        "missing_properties": [],
+        "present_properties": [
+          "controlvis.idle_stays_without_work",
+          "controlvis.read_data_one_cycle_to_idle",
+          "controlvis.read_done_transitions_to_read_data",
+          "controlvis.read_hit_one_cycle_to_idle",
+          "controlvis.read_miss_eventually_completes",
+          "controlvis.read_miss_stays_until_done",
+          "controlvis.state_in_valid_range",
+          "controlvis.write_eventually_completes",
+          "controlvis.write_hit_done_transitions_to_idle",
+          "controlvis.write_miss_done_transitions_to_idle",
+          "controlvis.write_stays_until_done"
+        ]
+      }
+    },
+    "success": false,
+    "summary": "Repair loop reached the maximum number of rounds with remaining counterexamples.",
+    "verification_passed": false
+  },
+  "success": false
+}

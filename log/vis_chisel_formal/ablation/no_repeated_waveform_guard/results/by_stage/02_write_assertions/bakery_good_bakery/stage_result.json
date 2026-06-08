@@ -1,0 +1,105 @@
+{
+  "ablation_modes": [
+    "no_repeated_waveform_guard"
+  ],
+  "original_query": "Add formal verification assertions to the design using ChiselFV or Chisel LTL. Place assertions directly inside the original DUT module/class emitted by VerilogGenerator, not in a separate *Formal wrapper or sibling module. Focus on key properties like safety and liveness.",
+  "stage": "write_assertions",
+  "stage_result": {
+    "counterexample_path": null,
+    "iterations": [
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\n\n// Enum for program counter locations\nobject Loc extends ChiselEnum {\n  val L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11 = Value\n}\n\nclass bakery extends Module {\n  val io = IO(new Bundle {\n    val select = Input(UInt(2.W))  // SELMSB+1 bits\n    val pause = Input(Bool())\n    // Add outputs to preserve internal state for verification\n    val ticket = Output(Vec(3, Bool()))  // HIPROC+1 = 3\n    val choosing = Output(Vec(3, Bool()))\n    val pc = Output(Vec(3, Loc()))\n    val j = Output(Vec(3, UInt(2.W)))\n    val selReg = Output(UInt(2.W))\n    val defer = Output(Vec(3, UInt(3.W)))  // HIPROC+1 bits each\n  })\n  \n  val SELMSB = 1\n  val HIPROC = 2\n  \n  // State registers\n  val ticket = RegInit(VecInit(Seq.fill(HIPROC + 1)(false.B)))\n  val choosing = RegInit(VecInit(Seq.fill(HIPROC + 1)(false.B)))\n  val pc = RegInit(VecInit(Seq.fill(HIPROC + 1)(Loc.L1)))\n  val j = RegInit(VecInit(Seq.fill(HIPROC + 1)(0.U((SELMSB + 1).W))))\n  val selReg = RegInit(0.U((SELMSB + 1).W))\n  val defer = RegInit(VecInit(Seq.fill(HIPROC + 1)(0.U((HIPROC + 1).W))))\n  \n  // Helper function to extract one bit from a vector\n  def extract(in: UInt, index: UInt): Bool = {\n    val result = Wire(Bool())\n    when(index === 0.U) {\n      result := in(0)\n    }.elsewhen(index === 1.U) {\n      result := in(1)\n    }.elsewhen(index === 2.U) {\n      result := in(2)\n    }.otherwise {\n      result := false.B\n    }\n    result\n  }\n  \n  // Helper function to clear a bit at given index\n  def clearBit(in: UInt, index: UInt): UInt = {\n    val result = Wire(UInt(in.getWidth.W))\n    when(index === 0.U) {\n      result := in & ~\"b001\".U\n    }.elsewhen(index === 1.U) {\n      result := in & ~\"b010\".U\n    }.elsewhen(index === 2.U) {\n      result := in & ~\"b100\".U\n    }.otherwise {\n      result := in\n    }\n    result\n  }\n  \n  // Process logic for each process\n  for (sel <- 0 to HIPROC) {\n    val selUInt = sel.U\n    \n    switch(pc(selUInt)) {\n      is(Loc.L1) {\n        when(selReg === selUInt) {\n          choosing(selUInt) := true.B\n          pc(selUInt) := Loc.L2\n        }\n      }\n      is(Loc.L2) {\n        when(selReg === selUInt) {\n          val defSel = Wire(UInt((HIPROC + 1).W))\n          defSel := Cat(ticket(2), ticket(1), ticket(0))\n          defer(selUInt) := defSel\n          ticket(selUInt) := true.B\n          pc(selUInt) := Loc.L3\n        }\n      }\n      is(Loc.L3) {\n        when(selReg === selUInt) {\n          choosing(selUInt) := false.B\n          pc(selUInt) := Loc.L4\n        }\n      }\n      is(Loc.L4) {\n        when(selReg === selUInt) {\n          j(selUInt) := 0.U\n          pc(selUInt) := Loc.L5\n        }\n      }\n      is(Loc.L5) {\n        when(selReg === selUInt) {\n          when(j(selUInt) <= HIPROC.U) {\n            pc(selUInt) := Loc.L6\n          }.otherwise {\n            pc(selUInt) := Loc.L9\n          }\n        }\n      }\n      is(Loc.L6) {\n        when(selReg === selUInt) {\n          val k = j(selUInt)\n          when(choosing(k)) {\n            pc(selUInt) := Loc.L6\n          }.otherwise {\n            pc(selUInt) := Loc.L7\n          }\n        }\n      }\n      is(Loc.L7) {\n        when(selReg === selUInt) {\n          val k = j(selUInt)\n          val defSel = defer(selUInt)\n          val defK = defer(k)\n          val defSelK = extract(defSel, k)\n          val defKSel = extract(defK, selUInt)\n          when(ticket(k) && (defSelK || (!defKSel && (k < selUInt)))) {\n            pc(selUInt) := Loc.L7\n          }.otherwise {\n            pc(selUInt) := Loc.L8\n          }\n        }\n      }\n      is(Loc.L8) {\n        when(selReg === selUInt) {\n          j(selUInt) := j(selUInt) + 1.U\n          pc(selUInt) := Loc.L5\n        }\n      }\n      is(Loc.L9) {\n        when(selReg === selUInt) {\n          when(io.pause) {\n            pc(selUInt) := Loc.L9\n          }.otherwise {\n            pc(selUInt) := Loc.L10\n          }\n        }\n      }\n      is(Loc.L10) {\n        when(selReg === selUInt) {\n          ticket(selUInt) := false.B\n          // Clear defer bits for all processes\n          defer(0) := clearBit(defer(0), selUInt)\n          defer(1) := clearBit(defer(1), selUInt)\n          defer(2) := clearBit(defer(2), selUInt)\n          pc(selUInt) := Loc.L11\n        }\n      }\n      is(Loc.L11) {\n        when(selReg === selUInt) {\n          when(io.pause) {\n            pc(selUInt) := Loc.L11\n          }.otherwise {\n            pc(selUInt) := Loc.L1\n          }\n        }\n      }\n    }\n  }\n  \n  // Clock behavior\n  when(io.select > HIPROC.U) {\n    selReg := 0.U\n  }.otherwise {\n    selReg := io.select\n  }\n  \n  // Connect outputs\n  io.ticket := ticket\n  io.choosing := choosing\n  io.pc := pc\n  io.j := j\n  io.selReg := selReg\n  io.defer := defer\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new bakery(), args)\n}",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/bakery_good_bakery/good_bakery.scala",
+                "original_chars": 4790,
+                "original_lines": 185,
+                "returned_chars": 4790,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "good_bakery.scala"
+              ],
+              "reason": "Read the full design to understand signals and structure before adding assertions"
+            },
+            "id": "call_00_sHw17CmbvAsebLSr7JS19152",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 1
+      },
+      {
+        "action_results": [
+          {
+            "files": [
+              {
+                "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\n\n// Enum for program counter locations\nobject Loc extends ChiselEnum {\n  val L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11 = Value\n}\n\nclass bakery extends Module {\n  val io = IO(new Bundle {\n    val select = Input(UInt(2.W))  // SELMSB+1 bits\n    val pause = Input(Bool())\n    // Add outputs to preserve internal state for verification\n    val ticket = Output(Vec(3, Bool()))  // HIPROC+1 = 3\n    val choosing = Output(Vec(3, Bool()))\n    val pc = Output(Vec(3, Loc()))\n    val j = Output(Vec(3, UInt(2.W)))\n    val selReg = Output(UInt(2.W))\n    val defer = Output(Vec(3, UInt(3.W)))  // HIPROC+1 bits each\n  })\n  \n  val SELMSB = 1\n  val HIPROC = 2\n  \n  // State registers\n  val ticket = RegInit(VecInit(Seq.fill(HIPROC + 1)(false.B)))\n  val choosing = RegInit(VecInit(Seq.fill(HIPROC + 1)(false.B)))\n  val pc = RegInit(VecInit(Seq.fill(HIPROC + 1)(Loc.L1)))\n  val j = RegInit(VecInit(Seq.fill(HIPROC + 1)(0.U((SELMSB + 1).W))))\n  val selReg = RegInit(0.U((SELMSB + 1).W))\n  val defer = RegInit(VecInit(Seq.fill(HIPROC + 1)(0.U((HIPROC + 1).W))))\n  \n  // Helper function to extract one bit from a vector\n  def extract(in: UInt, index: UInt): Bool = {\n    val result = Wire(Bool())\n    when(index === 0.U) {\n      result := in(0)\n    }.elsewhen(index === 1.U) {\n      result := in(1)\n    }.elsewhen(index === 2.U) {\n      result := in(2)\n    }.otherwise {\n      result := false.B\n    }\n    result\n  }\n  \n  // Helper function to clear a bit at given index\n  def clearBit(in: UInt, index: UInt): UInt = {\n    val result = Wire(UInt(in.getWidth.W))\n    when(index === 0.U) {\n      result := in & ~\"b001\".U\n    }.elsewhen(index === 1.U) {\n      result := in & ~\"b010\".U\n    }.elsewhen(index === 2.U) {\n      result := in & ~\"b100\".U\n    }.otherwise {\n      result := in\n    }\n    result\n  }\n  \n  // Process logic for each process\n  for (sel <- 0 to HIPROC) {\n    val selUInt = sel.U\n    \n    switch(pc(selUInt)) {\n      is(Loc.L1) {\n        when(selReg === selUInt) {\n          choosing(selUInt) := true.B\n          pc(selUInt) := Loc.L2\n        }\n      }\n      is(Loc.L2) {\n        when(selReg === selUInt) {\n          val defSel = Wire(UInt((HIPROC + 1).W))\n          defSel := Cat(ticket(2), ticket(1), ticket(0))\n          defer(selUInt) := defSel\n          ticket(selUInt) := true.B\n          pc(selUInt) := Loc.L3\n        }\n      }\n      is(Loc.L3) {\n        when(selReg === selUInt) {\n          choosing(selUInt) := false.B\n          pc(selUInt) := Loc.L4\n        }\n      }\n      is(Loc.L4) {\n        when(selReg === selUInt) {\n          j(selUInt) := 0.U\n          pc(selUInt) := Loc.L5\n        }\n      }\n      is(Loc.L5) {\n        when(selReg === selUInt) {\n          when(j(selUInt) <= HIPROC.U) {\n            pc(selUInt) := Loc.L6\n          }.otherwise {\n            pc(selUInt) := Loc.L9\n          }\n        }\n      }\n      is(Loc.L6) {\n        when(selReg === selUInt) {\n          val k = j(selUInt)\n          when(choosing(k)) {\n            pc(selUInt) := Loc.L6\n          }.otherwise {\n            pc(selUInt) := Loc.L7\n          }\n        }\n      }\n      is(Loc.L7) {\n        when(selReg === selUInt) {\n          val k = j(selUInt)\n          val defSel = defer(selUInt)\n          val defK = defer(k)\n          val defSelK = extract(defSel, k)\n          val defKSel = extract(defK, selUInt)\n          when(ticket(k) && (defSelK || (!defKSel && (k < selUInt)))) {\n            pc(selUInt) := Loc.L7\n          }.otherwise {\n            pc(selUInt) := Loc.L8\n          }\n        }\n      }\n      is(Loc.L8) {\n        when(selReg === selUInt) {\n          j(selUInt) := j(selUInt) + 1.U\n          pc(selUInt) := Loc.L5\n        }\n      }\n      is(Loc.L9) {\n        when(selReg === selUInt) {\n          when(io.pause) {\n            pc(selUInt) := Loc.L9\n          }.otherwise {\n            pc(selUInt) := Loc.L10\n          }\n        }\n      }\n      is(Loc.L10) {\n        when(selReg === selUInt) {\n          ticket(selUInt) := false.B\n          // Clear defer bits for all processes\n          defer(0) := clearBit(defer(0), selUInt)\n          defer(1) := clearBit(defer(1), selUInt)\n          defer(2) := clearBit(defer(2), selUInt)\n          pc(selUInt) := Loc.L11\n        }\n      }\n      is(Loc.L11) {\n        when(selReg === selUInt) {\n          when(io.pause) {\n            pc(selUInt) := Loc.L11\n          }.otherwise {\n            pc(selUInt) := Loc.L1\n          }\n        }\n      }\n    }\n  }\n  \n  // Clock behavior\n  when(io.select > HIPROC.U) {\n    selReg := 0.U\n  }.otherwise {\n    selReg := io.select\n  }\n  \n  // Connect outputs\n  io.ticket := ticket\n  io.choosing := choosing\n  io.pc := pc\n  io.j := j\n  io.selReg := selReg\n  io.defer := defer\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new bakery(), args)\n}",
+                "error": null,
+                "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/bakery_good_bakery/good_bakery.scala",
+                "original_chars": 4790,
+                "original_lines": 185,
+                "returned_chars": 4790,
+                "success": true,
+                "truncated": false
+              }
+            ],
+            "success": true,
+            "type": "read_files"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "file_paths": [
+                "good_bakery.scala"
+              ],
+              "reason": "Read full design to understand state machine, signals, and invariants"
+            },
+            "id": "call_00_xkdOFSUDXxu7cH5g2vXZ7397",
+            "name": "read_files"
+          }
+        ],
+        "iteration": 2
+      },
+      {
+        "action_results": [
+          {
+            "error": null,
+            "file_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/bakery_good_bakery/good_bakery.scala",
+            "success": true,
+            "type": "write_assertions"
+          }
+        ],
+        "function_calls": [
+          {
+            "arguments": {
+              "content": "package llmverify\n\nimport chisel3._\nimport chisel3.util._\nimport chiselFv._\n\n// Enum for program counter locations\nobject Loc extends ChiselEnum {\n  val L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11 = Value\n}\n\nclass bakery extends Module with Formal {\n  val io = IO(new Bundle {\n    val select = Input(UInt(2.W))  // SELMSB+1 bits\n    val pause = Input(Bool())\n    // Add outputs to preserve internal state for verification\n    val ticket = Output(Vec(3, Bool()))  // HIPROC+1 = 3\n    val choosing = Output(Vec(3, Bool()))\n    val pc = Output(Vec(3, Loc()))\n    val j = Output(Vec(3, UInt(2.W)))\n    val selReg = Output(UInt(2.W))\n    val defer = Output(Vec(3, UInt(3.W)))  // HIPROC+1 bits each\n  })\n  \n  val SELMSB = 1\n  val HIPROC = 2\n  \n  // State registers\n  val ticket = RegInit(VecInit(Seq.fill(HIPROC + 1)(false.B)))\n  val choosing = RegInit(VecInit(Seq.fill(HIPROC + 1)(false.B)))\n  val pc = RegInit(VecInit(Seq.fill(HIPROC + 1)(Loc.L1)))\n  val j = RegInit(VecInit(Seq.fill(HIPROC + 1)(0.U((SELMSB + 1).W))))\n  val selReg = RegInit(0.U((SELMSB + 1).W))\n  val defer = RegInit(VecInit(Seq.fill(HIPROC + 1)(0.U((HIPROC + 1).W))))\n  \n  // Helper function to extract one bit from a vector\n  def extract(in: UInt, index: UInt): Bool = {\n    val result = Wire(Bool())\n    when(index === 0.U) {\n      result := in(0)\n    }.elsewhen(index === 1.U) {\n      result := in(1)\n    }.elsewhen(index === 2.U) {\n      result := in(2)\n    }.otherwise {\n      result := false.B\n    }\n    result\n  }\n  \n  // Helper function to clear a bit at given index\n  def clearBit(in: UInt, index: UInt): UInt = {\n    val result = Wire(UInt(in.getWidth.W))\n    when(index === 0.U) {\n      result := in & ~\"b001\".U\n    }.elsewhen(index === 1.U) {\n      result := in & ~\"b010\".U\n    }.elsewhen(index === 2.U) {\n      result := in & ~\"b100\".U\n    }.otherwise {\n      result := in\n    }\n    result\n  }\n  \n  // Process logic for each process\n  for (sel <- 0 to HIPROC) {\n    val selUInt = sel.U\n    \n    switch(pc(selUInt)) {\n      is(Loc.L1) {\n        when(selReg === selUInt) {\n          choosing(selUInt) := true.B\n          pc(selUInt) := Loc.L2\n        }\n      }\n      is(Loc.L2) {\n        when(selReg === selUInt) {\n          val defSel = Wire(UInt((HIPROC + 1).W))\n          defSel := Cat(ticket(2), ticket(1), ticket(0))\n          defer(selUInt) := defSel\n          ticket(selUInt) := true.B\n          pc(selUInt) := Loc.L3\n        }\n      }\n      is(Loc.L3) {\n        when(selReg === selUInt) {\n          choosing(selUInt) := false.B\n          pc(selUInt) := Loc.L4\n        }\n      }\n      is(Loc.L4) {\n        when(selReg === selUInt) {\n          j(selUInt) := 0.U\n          pc(selUInt) := Loc.L5\n        }\n      }\n      is(Loc.L5) {\n        when(selReg === selUInt) {\n          when(j(selUInt) <= HIPROC.U) {\n            pc(selUInt) := Loc.L6\n          }.otherwise {\n            pc(selUInt) := Loc.L9\n          }\n        }\n      }\n      is(Loc.L6) {\n        when(selReg === selUInt) {\n          val k = j(selUInt)\n          when(choosing(k)) {\n            pc(selUInt) := Loc.L6\n          }.otherwise {\n            pc(selUInt) := Loc.L7\n          }\n        }\n      }\n      is(Loc.L7) {\n        when(selReg === selUInt) {\n          val k = j(selUInt)\n          val defSel = defer(selUInt)\n          val defK = defer(k)\n          val defSelK = extract(defSel, k)\n          val defKSel = extract(defK, selUInt)\n          when(ticket(k) && (defSelK || (!defKSel && (k < selUInt)))) {\n            pc(selUInt) := Loc.L7\n          }.otherwise {\n            pc(selUInt) := Loc.L8\n          }\n        }\n      }\n      is(Loc.L8) {\n        when(selReg === selUInt) {\n          j(selUInt) := j(selUInt) + 1.U\n          pc(selUInt) := Loc.L5\n        }\n      }\n      is(Loc.L9) {\n        when(selReg === selUInt) {\n          when(io.pause) {\n            pc(selUInt) := Loc.L9\n          }.otherwise {\n            pc(selUInt) := Loc.L10\n          }\n        }\n      }\n      is(Loc.L10) {\n        when(selReg === selUInt) {\n          ticket(selUInt) := false.B\n          // Clear defer bits for all processes\n          defer(0) := clearBit(defer(0), selUInt)\n          defer(1) := clearBit(defer(1), selUInt)\n          defer(2) := clearBit(defer(2), selUInt)\n          pc(selUInt) := Loc.L11\n        }\n      }\n      is(Loc.L11) {\n        when(selReg === selUInt) {\n          when(io.pause) {\n            pc(selUInt) := Loc.L11\n          }.otherwise {\n            pc(selUInt) := Loc.L1\n          }\n        }\n      }\n    }\n  }\n  \n  // Clock behavior\n  when(io.select > HIPROC.U) {\n    selReg := 0.U\n  }.otherwise {\n    selReg := io.select\n  }\n  \n  // Connect outputs\n  io.ticket := ticket\n  io.choosing := choosing\n  io.pc := pc\n  io.j := j\n  io.selReg := selReg\n  io.defer := defer\n\n  // ============================================================\n  // Formal Verification Assertions\n  // ============================================================\n\n  // --- Safety: Mutual Exclusion ---\n  // No two processes may be in the critical section (L10) simultaneously.\n  // The critical section is where the process clears its ticket and defer bits,\n  // corresponding to the release phase of the bakery algorithm.\n  assertMutex(\n    Seq(pc(0) === Loc.L10, pc(1) === Loc.L10, pc(2) === Loc.L10),\n    \"mutual_exclusion_critical_section\"\n  )\n\n  // --- Safety: Choosing signal consistency ---\n  // The choosing(i) signal must only be asserted when process i is actively\n  // choosing a ticket number, i.e. in states L2 or L3.\n  // choosing is set true at L1→L2 and cleared false at L3→L4.\n  for (i <- 0 to HIPROC) {\n    fvAssert(\n      !choosing(i) || pc(i) === Loc.L2 || pc(i) === Loc.L3,\n      s\"choosing_consistent_p$i\"\n    )\n  }\n\n  // --- Safety: Ticket consistency ---\n  // If ticket(i) is true, process i must be past the choosing phase (past L3)\n  // and still waiting for or in the critical section (before L11).\n  // ticket(i) is set true at L2→L3 and cleared false at L10→L11.\n  for (i <- 0 to HIPROC) {\n    fvAssert(\n      !ticket(i) || pc(i).isOneOf(Loc.L3, Loc.L4, Loc.L5, Loc.L6, Loc.L7, Loc.L8, Loc.L9, Loc.L10),\n      s\"ticket_consistent_p$i\"\n    )\n  }\n\n  // --- Safety: No process in CS while another is choosing ---\n  // A process in the critical section (L10) must not coexist with another\n  // process that is still choosing (choosing true). This mirrors the\n  // bakery algorithm's guarantee that choosing processes are waited on.\n  for (i <- 0 to HIPROC) {\n    for (j <- 0 to HIPROC) {\n      if (i != j) {\n        fvAssert(\n          !(pc(i) === Loc.L10 && choosing(j)),\n          s\"no_cs_during_choose_p${i}_p${j}\"\n        )\n      }\n    }\n  }\n\n  // --- Liveness: Progress into critical section ---\n  // If a process is at the initial state L1 and is selected (selReg matches),\n  // it should eventually reach the critical section (L10) within a generous\n  // bounded number of cycles. The bound accounts for the full traversal of the\n  // state machine: inner loops over all processes (0..HIPROC) and waiting at\n  // L6/L7 for other processes' choosing/ticket conditions.\n  for (i <- 0 to HIPROC) {\n    astRelaxedLiveness(\n      selReg === i.U && pc(i) === Loc.L1,\n      pc(i) === Loc.L10,\n      200,\n      s\"progress_into_cs_p$i\"\n    )\n  }\n}\n\nobject VerilogGenerator extends App {\n  emitVerilog(new bakery(), args)\n}\n",
+              "file_path": "good_bakery.scala",
+              "stage_complete": true
+            },
+            "id": "call_00_BpKSB8TGxwjWdFiSBF4U8613",
+            "name": "write_assertions"
+          }
+        ],
+        "iteration": 3
+      }
+    ],
+    "root_cause": null,
+    "success": true,
+    "summary": "",
+    "verification_passed": true
+  },
+  "success": true
+}

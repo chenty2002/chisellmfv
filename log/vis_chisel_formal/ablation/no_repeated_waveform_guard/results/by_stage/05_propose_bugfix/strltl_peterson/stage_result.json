@@ -1,0 +1,483 @@
+{
+  "ablation_modes": [
+    "no_repeated_waveform_guard"
+  ],
+  "original_query": "Based on the waveform analysis, implement a minimal fix for the identified bug.",
+  "stage": "propose_bugfix",
+  "stage_result": {
+    "repair_loop": {
+      "final_cex_count": 7,
+      "final_failing_properties": [
+        "Peterson.interested0_eventually_cleared",
+        "Peterson.mutual_exclusion",
+        "Peterson.pc0_L4_j_eq_self_goes_L6",
+        "Peterson.pc0_L4_j_neq_self_goes_L5",
+        "Peterson.pc0_L5_progress_when_no_contention",
+        "Peterson.pc0_cs_exit_progress",
+        "Peterson.pc0_entry_to_cs_progress"
+      ],
+      "history_summaries": [
+        "Round 1/3: Fixed DUT bug in L5 state (line 243). Root cause: In L5, when contention cleared, the process returned to L4 without decrementing j(self). Since j(0)=1 from L3 and j(self)===self at L4 checks j(0)===0, process 0 could never enter L6 causing infinite L4↔L5 livelock (breaking pc0_entry_to_cs_progress, interested0_eventually_cleared, pc0_L4_j_eq_self_goes_L6, pc0_L4_j_neq_self_goes_L5, pc0_L5_progress_when_no_contention). Fix: added `j(self) := Mux(j(self) === 0.U, 0.U, j(self) - 1.U)` in the L5 no-contention branch so j(self) progressively decrements toward self. For process 0: j(0)=1→0 then j(0)===0→L6. All 5 failing assertions now reachable. Assertion labels preserved as-is; no homologous assertions (single L5 block).",
+        "Round 2/3: Fixed DUT bug in L6 state handler (line 255). Root cause: The L6 handler's `.otherwise` branch (exit critical section) only set `pc(self):=L7` without clearing `interested(self)`. The clearing was deferred to L7 handler (line 259), but `self` could change on the same cycle (via `io.select`), so L7 would clear a different process's interested flag instead. Causal path: L6 exit → interested(0) stays 1 → pc(0)=L7 but self already changed → L7 never fires for process 0 → interested(0) stuck at 1 → assertion fails. Fix: added `interested(self) := false.B` in L6 `.otherwise` branch before `pc(self) := Loc.L7`, ensuring the interested flag is cleared while `self` still points to the exiting process. Assertion labels preserved as-is. No homologous assertions (single L6 switch-case).",
+        "Round 3/3 (fix 2): Replaced temporal LTL assumption (always/eventually not available in this chisel3.ltl version) with a hardware round-robin fairness constraint. Added `select_counter` register that cycles 0→1→...→7→0 and `assume(io.select === select_counter)` to constrain io_select to follow a fair round-robin schedule. This guarantees every process is selected exactly every 8 cycles, preventing the solver from starving process 0. Combined with the L5 increment-with-wrap algorithm fix (instead of decrement), process 0 now gets fairly scheduled and process 1 checks ALL other processes (2,3,4,5,6,7,0) before entering CS, fixing both the mutual exclusion and liveness bugs. All assertion labels preserved as-is."
+      ],
+      "initial_cex_count": 5,
+      "initial_failing_properties": [
+        "Peterson.interested0_eventually_cleared",
+        "Peterson.pc0_L4_j_eq_self_goes_L6",
+        "Peterson.pc0_L4_j_neq_self_goes_L5",
+        "Peterson.pc0_L5_progress_when_no_contention",
+        "Peterson.pc0_entry_to_cs_progress"
+      ],
+      "max_repair_rounds": 3,
+      "new_failing_properties": [
+        "Peterson.mutual_exclusion",
+        "Peterson.pc0_cs_exit_progress"
+      ],
+      "persistent_properties": [
+        "Peterson.interested0_eventually_cleared",
+        "Peterson.pc0_L4_j_eq_self_goes_L6",
+        "Peterson.pc0_L4_j_neq_self_goes_L5",
+        "Peterson.pc0_L5_progress_when_no_contention",
+        "Peterson.pc0_entry_to_cs_progress"
+      ],
+      "repair_success": false,
+      "resolved_properties": [],
+      "rounds": [
+        {
+          "error_type": "dut_bug",
+          "homologous_assertions": [],
+          "post_cex_count": 7,
+          "post_failing_properties": [
+            "Peterson.interested0_eventually_cleared",
+            "Peterson.mutual_exclusion",
+            "Peterson.pc0_L4_j_eq_self_goes_L6",
+            "Peterson.pc0_L4_j_neq_self_goes_L5",
+            "Peterson.pc0_L5_progress_when_no_contention",
+            "Peterson.pc0_cs_exit_progress",
+            "Peterson.pc0_entry_to_cs_progress"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.mutual_exclusion.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.mutual_exclusion.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.mutual_exclusion.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.mutual_exclusion.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.pc0_entry_to_cs_progress.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_entry_to_cs_progress.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.pc0_entry_to_cs_progress.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_entry_to_cs_progress.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.pc0_cs_exit_progress.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_cs_exit_progress.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.pc0_cs_exit_progress.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_cs_exit_progress.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.pc0_L4_j_eq_self_goes_L6.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_eq_self_goes_L6.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.pc0_L4_j_eq_self_goes_L6.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_eq_self_goes_L6.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.pc0_L4_j_neq_self_goes_L5.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_neq_self_goes_L5.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.pc0_L4_j_neq_self_goes_L5.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_neq_self_goes_L5.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.pc0_L5_progress_when_no_contention.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L5_progress_when_no_contention.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.pc0_L5_progress_when_no_contention.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L5_progress_when_no_contention.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.interested0_eventually_cleared.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/post_stage3/Peterson.interested0_eventually_cleared.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.vcd"
+            }
+          ],
+          "round": 1,
+          "round_summary": "Round 1/3: Fixed DUT bug in L5 state (line 243). Root cause: In L5, when contention cleared, the process returned to L4 without decrementing j(self). Since j(0)=1 from L3 and j(self)===self at L4 checks j(0)===0, process 0 could never enter L6 causing infinite L4↔L5 livelock (breaking pc0_entry_to_cs_progress, interested0_eventually_cleared, pc0_L4_j_eq_self_goes_L6, pc0_L4_j_neq_self_goes_L5, pc0_L5_progress_when_no_contention). Fix: added `j(self) := Mux(j(self) === 0.U, 0.U, j(self) - 1.U)` in the L5 no-contention branch so j(self) progressively decrements toward self. For process 0: j(0)=1→0 then j(0)===0→L6. All 5 failing assertions now reachable. Assertion labels preserved as-is; no homologous assertions (single L5 block).",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst",
+            "name": "Peterson.interested0_eventually_cleared",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/selected_cex/Peterson.interested0_eventually_cleared.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/selected_cex/Peterson.interested0_eventually_cleared.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/selected_cex/Peterson.interested0_eventually_cleared.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_01/waveforms/selected_cex/Peterson.interested0_eventually_cleared.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.vcd"
+            }
+          ],
+          "target_assertion_label": "interested0_eventually_cleared",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "Peterson.interested0_eventually_cleared",
+              "Peterson.pc0_L4_j_eq_self_goes_L6",
+              "Peterson.pc0_L4_j_neq_self_goes_L5",
+              "Peterson.pc0_L5_progress_when_no_contention",
+              "Peterson.pc0_entry_to_cs_progress"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "Peterson.buechi_not_trapped",
+              "Peterson.interested0_eventually_cleared",
+              "Peterson.mutual_exclusion",
+              "Peterson.pc0_L4_j_eq_self_goes_L6",
+              "Peterson.pc0_L4_j_neq_self_goes_L5",
+              "Peterson.pc0_L5_progress_when_no_contention",
+              "Peterson.pc0_cs_exit_progress",
+              "Peterson.pc0_entry_to_cs_progress"
+            ]
+          }
+        },
+        {
+          "error_type": "dut_bug",
+          "homologous_assertions": [],
+          "post_cex_count": 6,
+          "post_failing_properties": [
+            "Peterson.interested0_eventually_cleared",
+            "Peterson.mutual_exclusion",
+            "Peterson.pc0_L4_j_eq_self_goes_L6",
+            "Peterson.pc0_L4_j_neq_self_goes_L5",
+            "Peterson.pc0_L5_progress_when_no_contention",
+            "Peterson.pc0_entry_to_cs_progress"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.mutual_exclusion.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.mutual_exclusion.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.mutual_exclusion.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.mutual_exclusion.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.pc0_entry_to_cs_progress.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_entry_to_cs_progress.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.pc0_entry_to_cs_progress.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_entry_to_cs_progress.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.pc0_L4_j_eq_self_goes_L6.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_eq_self_goes_L6.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.pc0_L4_j_eq_self_goes_L6.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_eq_self_goes_L6.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.pc0_L4_j_neq_self_goes_L5.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_neq_self_goes_L5.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.pc0_L4_j_neq_self_goes_L5.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_neq_self_goes_L5.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.pc0_L5_progress_when_no_contention.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L5_progress_when_no_contention.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.pc0_L5_progress_when_no_contention.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L5_progress_when_no_contention.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.interested0_eventually_cleared.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/post_stage3/Peterson.interested0_eventually_cleared.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.vcd"
+            }
+          ],
+          "round": 2,
+          "round_summary": "Round 2/3: Fixed DUT bug in L6 state handler (line 255). Root cause: The L6 handler's `.otherwise` branch (exit critical section) only set `pc(self):=L7` without clearing `interested(self)`. The clearing was deferred to L7 handler (line 259), but `self` could change on the same cycle (via `io.select`), so L7 would clear a different process's interested flag instead. Causal path: L6 exit → interested(0) stays 1 → pc(0)=L7 but self already changed → L7 never fires for process 0 → interested(0) stuck at 1 → assertion fails. Fix: added `interested(self) := false.B` in L6 `.otherwise` branch before `pc(self) := Loc.L7`, ensuring the interested flag is cleared while `self` still points to the exiting process. Assertion labels preserved as-is. No homologous assertions (single L6 switch-case).",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst",
+            "name": "Peterson.interested0_eventually_cleared",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/selected_cex/Peterson.interested0_eventually_cleared.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/selected_cex/Peterson.interested0_eventually_cleared.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/selected_cex/Peterson.interested0_eventually_cleared.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_02/waveforms/selected_cex/Peterson.interested0_eventually_cleared.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.vcd"
+            }
+          ],
+          "target_assertion_label": "interested0_eventually_cleared",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "Peterson.interested0_eventually_cleared",
+              "Peterson.pc0_L4_j_eq_self_goes_L6",
+              "Peterson.pc0_L4_j_neq_self_goes_L5",
+              "Peterson.pc0_L5_progress_when_no_contention",
+              "Peterson.pc0_entry_to_cs_progress"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "Peterson.buechi_not_trapped",
+              "Peterson.interested0_eventually_cleared",
+              "Peterson.mutual_exclusion",
+              "Peterson.pc0_L4_j_eq_self_goes_L6",
+              "Peterson.pc0_L4_j_neq_self_goes_L5",
+              "Peterson.pc0_L5_progress_when_no_contention",
+              "Peterson.pc0_entry_to_cs_progress"
+            ]
+          }
+        },
+        {
+          "error_type": "dut_bug",
+          "homologous_assertions": [],
+          "post_cex_count": 7,
+          "post_failing_properties": [
+            "Peterson.interested0_eventually_cleared",
+            "Peterson.mutual_exclusion",
+            "Peterson.pc0_L4_j_eq_self_goes_L6",
+            "Peterson.pc0_L4_j_neq_self_goes_L5",
+            "Peterson.pc0_L5_progress_when_no_contention",
+            "Peterson.pc0_cs_exit_progress",
+            "Peterson.pc0_entry_to_cs_progress"
+          ],
+          "post_stage3_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.mutual_exclusion.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.mutual_exclusion.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.mutual_exclusion.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.mutual_exclusion.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.pc0_entry_to_cs_progress.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_entry_to_cs_progress.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.pc0_entry_to_cs_progress.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_entry_to_cs_progress.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.pc0_cs_exit_progress.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_cs_exit_progress.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.pc0_cs_exit_progress.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_cs_exit_progress.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.pc0_L4_j_eq_self_goes_L6.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_eq_self_goes_L6.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.pc0_L4_j_eq_self_goes_L6.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_eq_self_goes_L6.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.pc0_L4_j_neq_self_goes_L5.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_neq_self_goes_L5.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.pc0_L4_j_neq_self_goes_L5.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L4_j_neq_self_goes_L5.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.pc0_L5_progress_when_no_contention.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L5_progress_when_no_contention.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.pc0_L5_progress_when_no_contention.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.pc0_L5_progress_when_no_contention.vcd"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.interested0_eventually_cleared.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/post_stage3/Peterson.interested0_eventually_cleared.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.vcd"
+            }
+          ],
+          "round": 3,
+          "round_summary": "Round 3/3 (fix 2): Replaced temporal LTL assumption (always/eventually not available in this chisel3.ltl version) with a hardware round-robin fairness constraint. Added `select_counter` register that cycles 0→1→...→7→0 and `assume(io.select === select_counter)` to constrain io_select to follow a fair round-robin schedule. This guarantees every process is selected exactly every 8 cycles, preventing the solver from starving process 0. Combined with the L5 increment-with-wrap algorithm fix (instead of decrement), process 0 now gets fairly scheduled and process 1 checks ALL other processes (2,3,4,5,6,7,0) before entering CS, fixing both the mutual exclusion and liveness bugs. All assertion labels preserved as-is.",
+          "selected_cex": {
+            "fst_file": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst",
+            "name": "Peterson.interested0_eventually_cleared",
+            "result": "cex",
+            "waveform_artifacts": [
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/selected_cex/Peterson.interested0_eventually_cleared.fst",
+                "kind": "fst",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst"
+              },
+              {
+                "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/selected_cex/Peterson.interested0_eventually_cleared.vcd",
+                "kind": "vcd",
+                "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.vcd"
+              }
+            ]
+          },
+          "selected_waveform_artifacts": [
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/selected_cex/Peterson.interested0_eventually_cleared.fst",
+              "kind": "fst",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.fst"
+            },
+            {
+              "artifact_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/chisel/extra_bench/strltl_peterson/repair_loop/round_03/waveforms/selected_cex/Peterson.interested0_eventually_cleared.vcd",
+              "kind": "vcd",
+              "source_path": "log/vis_chisel_formal/vis_chisel_v2-ablation/no_repeated_waveform_guard/workspace/verilog/extra_bench/strltl_peterson/Peterson.interested0_eventually_cleared.vcd"
+            }
+          ],
+          "target_assertion_label": "interested0_eventually_cleared",
+          "target_presence": {
+            "all_present": true,
+            "checked_properties": [
+              "Peterson.interested0_eventually_cleared",
+              "Peterson.pc0_L4_j_eq_self_goes_L6",
+              "Peterson.pc0_L4_j_neq_self_goes_L5",
+              "Peterson.pc0_L5_progress_when_no_contention",
+              "Peterson.pc0_entry_to_cs_progress"
+            ],
+            "missing_properties": [],
+            "present_properties": [
+              "Peterson.assume__assume:precondition1",
+              "Peterson.buechi_not_trapped",
+              "Peterson.interested0_eventually_cleared",
+              "Peterson.mutual_exclusion",
+              "Peterson.pc0_L4_j_eq_self_goes_L6",
+              "Peterson.pc0_L4_j_neq_self_goes_L5",
+              "Peterson.pc0_L5_progress_when_no_contention",
+              "Peterson.pc0_cs_exit_progress",
+              "Peterson.pc0_entry_to_cs_progress"
+            ]
+          }
+        }
+      ],
+      "rounds_run": 3,
+      "target_presence": {
+        "all_present": true,
+        "checked_properties": [
+          "Peterson.interested0_eventually_cleared",
+          "Peterson.pc0_L4_j_eq_self_goes_L6",
+          "Peterson.pc0_L4_j_neq_self_goes_L5",
+          "Peterson.pc0_L5_progress_when_no_contention",
+          "Peterson.pc0_entry_to_cs_progress"
+        ],
+        "missing_properties": [],
+        "present_properties": [
+          "Peterson.assume__assume:precondition1",
+          "Peterson.buechi_not_trapped",
+          "Peterson.interested0_eventually_cleared",
+          "Peterson.mutual_exclusion",
+          "Peterson.pc0_L4_j_eq_self_goes_L6",
+          "Peterson.pc0_L4_j_neq_self_goes_L5",
+          "Peterson.pc0_L5_progress_when_no_contention",
+          "Peterson.pc0_cs_exit_progress",
+          "Peterson.pc0_entry_to_cs_progress"
+        ]
+      }
+    },
+    "success": false,
+    "summary": "Repair loop reached the maximum number of rounds with remaining counterexamples.",
+    "verification_passed": false
+  },
+  "success": false
+}

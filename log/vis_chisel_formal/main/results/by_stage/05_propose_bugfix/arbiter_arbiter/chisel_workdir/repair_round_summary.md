@@ -1,0 +1,1 @@
+Fix compilation error: `(id === Selection.A).B` changed to `id === Selection.A` since the equality already returns a `Bool` in Chisel. No semantic change to the repair logic.

@@ -1,0 +1,1 @@
+Round 1/3. Replaced hasBeenReset (not available) with a self-contained notFirstCycle = RegNext(true.B, false.B) guard on all four RegNext-based assertions. This guard is false only on cycle 1, making all assertions vacuously pass on that cycle; from cycle 2 onward the original check applies. Preserves all assertion labels exactly.
