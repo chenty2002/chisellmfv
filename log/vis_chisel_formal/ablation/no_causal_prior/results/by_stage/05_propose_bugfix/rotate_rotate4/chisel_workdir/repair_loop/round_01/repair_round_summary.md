@@ -1,1 +1,0 @@
-Repair round 1/3: Changed from RegNext to explicit RegInit/:= to fix width inference. Same pipeline-timing fix: prev_inr captures the previous cycle's inr value, used in both assertions to match dout's pipeline stage.

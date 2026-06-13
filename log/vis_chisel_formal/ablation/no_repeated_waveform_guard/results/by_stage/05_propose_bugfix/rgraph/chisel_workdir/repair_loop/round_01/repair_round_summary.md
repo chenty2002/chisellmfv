@@ -1,1 +1,0 @@
-Round 1 (fixup): Fixed type mismatch error - mode is UInt(1.W) but chisel3.assert requires Bool arguments. Changed `!mode_prev || mode` to `!(mode_prev === 1.U) || (mode === 1.U)` which correctly converts UInt comparisons to Bool for the assertion condition.
