@@ -311,22 +311,47 @@ class CoupledL2BuildOperations:
 
     def scan_generated_assertions(self) -> Dict[str, Any]:
         files = self.discover_generated_verilog_files()
-        assertion_files = []
-        count = 0
+        generated_assertions = []
         for path in files:
             text = path.read_text(encoding="utf-8", errors="ignore")
-            file_count = len(re.findall(r"\bassert\s*(?:property|final)?\s*\(", text))
-            if file_count:
-                assertion_files.append(str(path))
-                count += file_count
-        if count:
-            return {"success": True, "assertion_count": count, "assertion_files": assertion_files}
-        return {
-            "success": False,
-            "assertion_count": 0,
+            generated_assertions.extend(_scan_verilog_assertions(path, text))
+
+        formal_surface = self._load_json(self.workspace.indexes_dir / "formal_surface.json")
+        source_assertions = formal_surface.get("assertions", [])
+        source_count = int(formal_surface.get("assertion_count", len(source_assertions)))
+        count = len(generated_assertions)
+        success = count > 0
+        result = {
+            "success": success,
+            "assertion_count": count,
+            "assertion_files": sorted({item["file"] for item in generated_assertions}),
             "files_checked": [str(path) for path in files],
-            "error": "generated Verilog/SystemVerilog contains no assertions",
+            "generated_assertions": generated_assertions,
         }
+        if not success:
+            result["error"] = "generated Verilog/SystemVerilog contains no assertions"
+
+        assertion_map = {
+            "source_assertions": source_assertions,
+            "source_assertion_count": source_count,
+            "generated_assertions": generated_assertions,
+            "generated_assertion_count": count,
+            "all_source_assertions_emitted": bool(source_count and count >= source_count),
+        }
+        assertion_plan = {
+            "property_category": self.workspace.config.property_category,
+            "source_assertion_count": source_count,
+            "generated_verilog_files": [str(path) for path in files],
+            "acceptance": {
+                "requires_generated_assertions": True,
+                "requires_stable_labels": True,
+            },
+        }
+        stage_dir = self._stage_dir("write_assertions")
+        self._write_json(stage_dir / "generated_assertion_scan.json", result)
+        self._write_json(stage_dir / "assertion_map.json", assertion_map)
+        self._write_json(stage_dir / "assertion_plan.json", assertion_plan)
+        return result
 
     def _stage_dir(self, stage: str) -> Path:
         from .workspace import COUPLEDL2_STAGES
@@ -386,6 +411,7 @@ def parse_jaspergold_report(log_text: str, trace_dir: Optional[Path] = None) -> 
     for match in pattern.finditer(log_text):
         status = match.group("status").lower()
         name = match.group("name")
+        trace = _match_trace_for_property(name, trace_dir)
         property_statuses[name] = {
             "name": name,
             "status": status,
@@ -393,6 +419,8 @@ def parse_jaspergold_report(log_text: str, trace_dir: Optional[Path] = None) -> 
             "bound": match.group("bound"),
             "time": match.group("time").strip(),
         }
+        if trace:
+            property_statuses[name]["fst_file"] = str(trace)
 
     proven = sorted(name for name, item in property_statuses.items() if item["status"] in {"proven", "covered", "bounded_proven", "unreachable"})
     failing = sorted(name for name, item in property_statuses.items() if item["status"] == "cex")
@@ -400,23 +428,61 @@ def parse_jaspergold_report(log_text: str, trace_dir: Optional[Path] = None) -> 
     trace_artifacts = []
     if trace_dir and trace_dir.exists():
         trace_artifacts = [str(path) for path in sorted(trace_dir.glob("*")) if path.suffix in {".fst", ".vcd"}]
+    assertions = [dict(property_statuses[name]) for name in sorted(property_statuses)]
+    cex_assertions = [dict(property_statuses[name]) for name in failing]
+    timed_out = bool(re.search(r"\b(time(?:d)?\s*out|timeout)\b", log_text, flags=re.IGNORECASE))
 
     return {
         "analyze_ok": _phase_failed(log_text, "analyze") is False,
         "elaborate_ok": _phase_failed(log_text, "elaborate") is False,
         "property_statuses": property_statuses,
+        "assertions": assertions,
+        "cex_assertions": cex_assertions,
         "proven_properties": proven,
         "failing_properties": failing,
         "inconclusive_properties": inconclusive,
         "proven_count": len(proven),
         "cex_count": len(failing),
         "inconclusive_count": len(inconclusive),
+        "timed_out": timed_out,
         "trace_artifacts": trace_artifacts,
     }
 
 
 def _phase_failed(text: str, phase: str) -> bool:
     return bool(re.search(rf"\b{re.escape(phase)}\b.*\b(error|failed|failure)\b", text, flags=re.IGNORECASE))
+
+
+def _scan_verilog_assertions(path: Path, text: str) -> List[Dict[str, Any]]:
+    assertions: List[Dict[str, Any]] = []
+    pattern = re.compile(
+        r"^\s*(?:(?P<label>[A-Za-z_][A-Za-z0-9_$]*)\s*:\s*)?"
+        r"(?P<body>assert\s*(?:property|final)?\s*\([^;]*;?)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for match in pattern.finditer(text):
+        line = text.count("\n", 0, match.start()) + 1
+        label = match.group("label")
+        assertions.append({
+            "file": str(path),
+            "line": line,
+            "label": label,
+            "text": " ".join(match.group("body").split())[:240],
+        })
+    return assertions
+
+
+def _match_trace_for_property(name: str, trace_dir: Optional[Path]) -> Optional[Path]:
+    if not trace_dir or not trace_dir.exists():
+        return None
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
+    for path in sorted(trace_dir.glob("*")):
+        if path.suffix not in {".fst", ".vcd"}:
+            continue
+        candidate = re.sub(r"[^A-Za-z0-9]+", "_", path.stem).strip("_").lower()
+        if normalized and (normalized in candidate or candidate in normalized):
+            return path
+    return None
 
 
 def _unique_sorted(paths: List[Path]) -> List[Path]:

@@ -6,13 +6,12 @@ Handles file operations, compilation, and waveform analysis actions.
 """
 
 import os
+import json
+import subprocess
+from pathlib import Path
 from typing import Dict, List, Any, Optional, Callable
 
-try:
-    from .waveform_actions import execute_waveform_action, WaveformActions
-except ModuleNotFoundError:
-    execute_waveform_action = None
-    WaveformActions = Any
+from .waveform_actions import execute_waveform_action, WaveformActions
 from ..causal_analysis import CausalAnalysisActions
 
 
@@ -45,7 +44,7 @@ def _coerce_file_paths(action: Dict[str, Any]) -> List[str]:
     return paths
 
 
-def _resolve_work_path(file_path: str, work_dir: str) -> str:
+def _resolve_work_path(file_path: str, work_dir: str, workspace_root: Optional[str] = None) -> str:
     """
     Resolve a tool-supplied path to the current benchmark work directory.
 
@@ -59,6 +58,9 @@ def _resolve_work_path(file_path: str, work_dir: str) -> str:
     chisel_dir = os.path.dirname(work_parent)
     workspace_abs = os.path.dirname(chisel_dir)
     target = os.path.basename(work_abs)
+
+    if workspace_root:
+        return str(_resolve_workspace_path(file_path, workspace_root, work_dir))
 
     if os.path.isabs(file_path):
         abs_path = os.path.normpath(file_path)
@@ -96,6 +98,35 @@ def _resolve_work_path(file_path: str, work_dir: str) -> str:
     return os.path.normpath(os.path.join(work_abs, normalized))
 
 
+def _resolve_workspace_path(path: str, workspace_root: str, work_dir: Optional[str] = None) -> Path:
+    """Resolve a model path inside the run workspace and reject escapes."""
+    root = Path(workspace_root).resolve()
+    work = Path(work_dir).resolve() if work_dir else root
+    raw = Path(path or ".")
+    if raw.is_absolute():
+        candidate = raw.resolve()
+    else:
+        first = raw.parts[0] if raw.parts else ""
+        if first in {"workspace", "case", "skills", "rules", "memories", "indexes", "results", "logs"}:
+            candidate = (root / raw).resolve()
+            if first == "workspace" and not (root / "workspace").exists():
+                candidate = (root / Path(*raw.parts[1:])).resolve()
+        else:
+            candidate = (work / raw).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError(f"path escapes workspace: {path}")
+    return candidate
+
+
+def _workspace_relative(path: Path, workspace_root: str) -> str:
+    return path.resolve().relative_to(Path(workspace_root).resolve()).as_posix()
+
+
+def _with_md_suffix(name: str) -> str:
+    path = Path(name)
+    return path.with_suffix(".md").as_posix() if not path.suffix else path.as_posix()
+
+
 def execute_stage_actions(
     actions: List[Dict[str, Any]], 
     work_dir: str,
@@ -105,6 +136,7 @@ def execute_stage_actions(
     write_file_func: Callable,
     logger,
     reset_stage_func: Optional[Callable] = None,
+    workspace_root: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Execute actions for the current stage.
@@ -132,19 +164,37 @@ def execute_stage_actions(
         
         try:
             if action_type == "read_files":
-                result = _execute_read_files(action, work_dir, read_file_func)
+                result = _execute_read_files(action, work_dir, read_file_func, workspace_root)
+
+            elif action_type == "list_files":
+                result = _execute_list_files(action, work_dir, workspace_root)
+
+            elif action_type == "rg":
+                result = _execute_rg(action, work_dir, workspace_root)
+
+            elif action_type == "read_skill":
+                result = _execute_read_asset(action, work_dir, workspace_root, "skills")
+
+            elif action_type == "read_rule":
+                result = _execute_read_asset(action, work_dir, workspace_root, "rules")
+
+            elif action_type == "read_memory":
+                result = _execute_read_asset(action, work_dir, workspace_root, "memories")
+
+            elif action_type == "write_memory":
+                result = _execute_write_memory(action, work_dir, workspace_root)
             
             elif action_type == "confirm_existing_harness":
                 result = _execute_confirm_existing_harness(action, work_dir, logger)
             
             elif action_type == "write_file":
-                result = _execute_write_file(action, work_dir, write_file_func)
+                result = _execute_write_file(action, work_dir, write_file_func, workspace_root)
             
             elif action_type == "write_assertions":
-                result = _execute_write_assertions(action, work_dir, write_file_func)
+                result = _execute_write_assertions(action, work_dir, write_file_func, workspace_root)
             
             elif action_type == "write_fix":
-                result = _execute_write_fix(action, work_dir, write_file_func, logger)
+                result = _execute_write_fix(action, work_dir, write_file_func, logger, workspace_root)
             
             elif action_type == "write_report":
                 result = _execute_write_report(action, work_dir, logger)
@@ -171,7 +221,12 @@ def execute_stage_actions(
     return results
 
 
-def _execute_read_files(action: Dict[str, Any], work_dir: str, read_file_func) -> Dict[str, Any]:
+def _execute_read_files(
+    action: Dict[str, Any],
+    work_dir: str,
+    read_file_func,
+    workspace_root: Optional[str] = None,
+) -> Dict[str, Any]:
     """Execute read_files action."""
     file_paths = _coerce_file_paths(action)
     line_start = action.get("line_start")
@@ -180,9 +235,18 @@ def _execute_read_files(action: Dict[str, Any], work_dir: str, read_file_func) -
     files_result = []
     
     for fp in file_paths:
-        fp = _resolve_work_path(fp, work_dir)
-        content = read_file_func(fp)
-        success = "Error reading file" not in content
+        try:
+            fp = _resolve_work_path(fp, work_dir, workspace_root)
+            content = read_file_func(fp)
+            success = "Error reading file" not in content
+        except Exception as exc:
+            files_result.append({
+                "file_path": fp,
+                "content": None,
+                "error": str(exc),
+                "success": False,
+            })
+            continue
         display_content = None
         read_meta: Dict[str, Any] = {}
         if success:
@@ -205,6 +269,111 @@ def _execute_read_files(action: Dict[str, Any], work_dir: str, read_file_func) -
         "files": files_result,
         "success": all(f["success"] for f in files_result)
     }
+
+
+def _execute_list_files(
+    action: Dict[str, Any],
+    work_dir: str,
+    workspace_root: Optional[str],
+) -> Dict[str, Any]:
+    if not workspace_root:
+        return {"type": "list_files", "success": False, "error": "workspace tools are not available"}
+    root = _resolve_workspace_path(action.get("path", "."), workspace_root, work_dir)
+    pattern = action.get("pattern") or "*"
+    if not root.exists():
+        return {"type": "list_files", "success": False, "error": f"path does not exist: {action.get('path', '.')}"}
+    files = root.rglob(pattern) if root.is_dir() else [root]
+    items = [
+        {"path": _workspace_relative(path, workspace_root), "bytes": path.stat().st_size}
+        for path in files
+        if path.is_file()
+    ]
+    return {"type": "list_files", "success": True, "files": sorted(items, key=lambda item: item["path"])}
+
+
+def _execute_rg(
+    action: Dict[str, Any],
+    work_dir: str,
+    workspace_root: Optional[str],
+) -> Dict[str, Any]:
+    if not workspace_root:
+        return {"type": "rg", "success": False, "error": "workspace tools are not available"}
+    pattern = action.get("pattern") or ""
+    if not pattern:
+        return {"type": "rg", "success": False, "error": "pattern cannot be empty"}
+    root = _resolve_workspace_path(action.get("path", "."), workspace_root, work_dir)
+    argv = ["rg", "--json", pattern, str(root)]
+    if action.get("glob"):
+        argv[1:1] = ["-g", str(action["glob"])]
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=workspace_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"type": "rg", "success": False, "error": "rg is not available"}
+    if completed.returncode == 1:
+        return {"type": "rg", "success": True, "matches": []}
+    if completed.returncode != 0:
+        return {"type": "rg", "success": False, "error": completed.stdout[-4000:]}
+    max_matches = max(1, int(action.get("max_matches") or 100))
+    matches = []
+    for line in completed.stdout.splitlines():
+        event = json.loads(line)
+        if event.get("type") != "match":
+            continue
+        data = event["data"]
+        path = Path(data["path"]["text"]).resolve()
+        matches.append({
+            "path": _workspace_relative(path, workspace_root),
+            "line": data["line_number"],
+            "text": data["lines"]["text"].rstrip("\n"),
+        })
+        if len(matches) >= max_matches:
+            break
+    return {"type": "rg", "success": True, "matches": matches}
+
+
+def _execute_read_asset(
+    action: Dict[str, Any],
+    work_dir: str,
+    workspace_root: Optional[str],
+    subdir: str,
+) -> Dict[str, Any]:
+    if not workspace_root:
+        return {"type": f"read_{subdir[:-1]}", "success": False, "error": "workspace tools are not available"}
+    name = action.get("name") or ("project.md" if subdir == "memories" else "index.md")
+    rel = Path(subdir) / _with_md_suffix(str(name))
+    try:
+        path = _resolve_workspace_path(rel.as_posix(), workspace_root, work_dir)
+        content = path.read_text(encoding="utf-8")
+        return {"type": f"read_{subdir[:-1]}", "success": True, "path": _workspace_relative(path, workspace_root), "content": content}
+    except Exception as exc:
+        return {"type": f"read_{subdir[:-1]}", "success": False, "error": str(exc)}
+
+
+def _execute_write_memory(
+    action: Dict[str, Any],
+    work_dir: str,
+    workspace_root: Optional[str],
+) -> Dict[str, Any]:
+    if not workspace_root:
+        return {"type": "write_memory", "success": False, "error": "workspace tools are not available"}
+    try:
+        rel = Path("memories") / _with_md_suffix(str(action.get("name") or "project.md"))
+        path = _resolve_workspace_path(rel.as_posix(), workspace_root, work_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "a" if action.get("append") else "w"
+        with path.open(mode, encoding="utf-8") as handle:
+            handle.write(action.get("content", ""))
+        return {"type": "write_memory", "success": True, "path": _workspace_relative(path, workspace_root), "bytes": path.stat().st_size}
+    except Exception as exc:
+        return {"type": "write_memory", "success": False, "error": str(exc)}
 
 
 def _filter_read_content(
@@ -246,12 +415,24 @@ def _filter_read_content(
     return selected, meta
 
 
-def _execute_write_file(action: Dict[str, Any], work_dir: str, write_file_func) -> Dict[str, Any]:
+def _execute_write_file(
+    action: Dict[str, Any],
+    work_dir: str,
+    write_file_func,
+    workspace_root: Optional[str] = None,
+) -> Dict[str, Any]:
     """Execute write_file action."""
     content = action.get("content", "")
     file_path = action.get("file_path", "")
     
-    file_path = _resolve_work_path(file_path, work_dir)
+    try:
+        file_path = (
+            str(_resolve_workspace_path(file_path, work_dir, work_dir))
+            if workspace_root
+            else _resolve_work_path(file_path, work_dir)
+        )
+    except Exception as exc:
+        return {"type": "write_file", "file_path": file_path, "success": False, "error": str(exc)}
     
     ok, err = write_file_func(file_path, content)
     
@@ -266,13 +447,21 @@ def _execute_write_file(action: Dict[str, Any], work_dir: str, write_file_func) 
 def _execute_write_assertions(
     action: Dict[str, Any], 
     work_dir: str, 
-    write_file_func
+    write_file_func,
+    workspace_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute write_assertions action."""
     content = action.get("content", "")
     
     file_path = action.get("file_path", "Main.scala")
-    file_path = _resolve_work_path(file_path, work_dir)
+    try:
+        file_path = (
+            str(_resolve_workspace_path(file_path, work_dir, work_dir))
+            if workspace_root
+            else _resolve_work_path(file_path, work_dir)
+        )
+    except Exception as exc:
+        return {"type": "write_assertions", "file_path": file_path, "success": False, "error": str(exc)}
     
     ok, err = write_file_func(file_path, content)
     
@@ -287,13 +476,21 @@ def _execute_write_fix(
     action: Dict[str, Any],
     work_dir: str, 
     write_file_func,
-    logger
+    logger,
+    workspace_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute write_fix action."""
     file_path = action.get("file_path", "")
     content = action.get("content", "")
     
-    file_path = _resolve_work_path(file_path, work_dir)
+    try:
+        file_path = (
+            str(_resolve_workspace_path(file_path, work_dir, work_dir))
+            if workspace_root
+            else _resolve_work_path(file_path, work_dir)
+        )
+    except Exception as exc:
+        return {"type": "write_fix", "file_path": file_path, "success": False, "error": str(exc)}
     
     ok, err = write_file_func(file_path, content)
     

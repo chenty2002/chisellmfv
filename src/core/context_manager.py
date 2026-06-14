@@ -17,10 +17,11 @@ from typing import Any, Dict, List
 NOTEBOOK_MARKER = "## Waveform Evidence Notebook"
 
 
-class EvidenceNotebook:
-    """Compact deterministic summary of waveform and causal-analysis evidence."""
+class StageNotebook:
+    """Compact deterministic summary of stage evidence."""
 
-    def __init__(self, max_entries: int = 80):
+    def __init__(self, stage: str = "waveform_explanation", max_entries: int = 80):
+        self.stage = stage
         self.max_entries = max_entries
         self.entries: List[str] = []
         self._seen: set[str] = set()
@@ -48,11 +49,12 @@ class EvidenceNotebook:
         if self.entries:
             body = "\n".join(f"- {entry}" for entry in self.entries[-self.max_entries:])
         else:
-            body = "- No compacted waveform evidence yet."
+            body = f"- No compacted {self.stage.replace('_', ' ')} evidence yet."
 
+        marker = _notebook_marker(self.stage)
         content = (
-            f"{NOTEBOOK_MARKER}\n\n"
-            "Older waveform/tool turns have been compacted into this notebook. "
+            f"{marker}\n\n"
+            "Older stage/tool turns have been compacted into this notebook. "
             "Treat these entries as established observations, and use the recent "
             "raw tool messages below for exact JSON details.\n\n"
             f"{body}"
@@ -171,9 +173,16 @@ class EvidenceNotebook:
         return self._truncate(text, max_chars)
 
 
+class EvidenceNotebook(StageNotebook):
+    """Backward-compatible waveform notebook name."""
+
+    def __init__(self, max_entries: int = 80):
+        super().__init__(stage="waveform_explanation", max_entries=max_entries)
+
+
 def compact_messages_with_notebook(
     messages: List[Dict[str, Any]],
-    notebook: EvidenceNotebook,
+    notebook: StageNotebook,
     keep_recent_messages: int = 12,
     compact_after_messages: int = 18,
 ) -> bool:
@@ -186,12 +195,13 @@ def compact_messages_with_notebook(
         return False
 
     protected = messages[:2]
+    marker = _notebook_marker(notebook.stage)
     rest = [
         msg for msg in messages[2:]
         if not (
             msg.get("role") == "user"
             and isinstance(msg.get("content"), str)
-            and msg["content"].startswith(NOTEBOOK_MARKER)
+            and msg["content"].startswith(marker)
         )
     ]
 
@@ -210,3 +220,9 @@ def compact_messages_with_notebook(
 
     messages[:] = compacted
     return True
+
+
+def _notebook_marker(stage: str) -> str:
+    if stage == "waveform_explanation":
+        return NOTEBOOK_MARKER
+    return f"## {stage.replace('_', ' ').title()} Notebook"

@@ -269,12 +269,15 @@ def build_system_prompt(
         "",
         f"## Prompt Version: {PROMPT_VERSION}",
         "",
-        "## Response Format Requirements",
+        "## Stable Rules",
         "- You MUST respond ONLY with tool calls. Never respond with plain text.",
         "- Always use the provided tools to perform actions",
         "- Each response must contain at least one tool call",
         "- Set `stage_complete=true` in your final tool call when the stage objective is achieved",
+        "- Treat benchmark or CoupledL2-specific paths and indexes in the user message as retrieved context.",
+        "- Read exact source slices with tools before modifying files.",
         "",
+        "## Stage Instructions",
         f"## Current Stage: {stage.replace('_', ' ').title()}",
         "",
         f"## Iteration Limit",
@@ -398,6 +401,37 @@ def build_user_prompt(
         for path in sorted(context.get("existing_harness_files", [])):
             sections.append(f"- `{_display_path(path, workspace_dir)}`")
         sections.append("")
+
+    coupledl2 = env.get("coupledl2")
+    if coupledl2:
+        stage_context = coupledl2.get("stage_context") or {}
+        sections.extend([
+            "## CoupledL2 Stage Context",
+            f"- Case: `{coupledl2.get('case_name', '')}`",
+            f"- Property Category: `{coupledl2.get('property_category', '')}`",
+            f"- Verify Mode: `{coupledl2.get('verify_mode', '')}`",
+            f"- Input Mode: `{coupledl2.get('input_mode', '')}`",
+            f"- Workspace Case Path: `{_display_path(coupledl2.get('workspace_case_path'), workspace_dir)}`",
+            f"- Stage Directory: `{_display_path(stage_context.get('stage_dir'), workspace_dir)}`",
+            f"- Snapshot Directory: `{_display_path(stage_context.get('snapshot_dir'), workspace_dir)}`",
+            "",
+            "### Stage Skills",
+        ])
+        for path in stage_context.get("skills", []):
+            sections.append(f"- `{path}`")
+        sections.extend(["", "### Stage Rules"])
+        for path in stage_context.get("rules", []):
+            sections.append(f"- `{path}`")
+        context_indexes = stage_context.get("context_indexes")
+        if context_indexes:
+            sections.extend([
+                "",
+                "### Retrieved Context Indexes",
+                "```json",
+                json.dumps(context_indexes, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                "```",
+            ])
+        sections.extend(["", "---", ""])
     
     # Add source files if provided
     if scala_sources and stage != "invoke_verification":

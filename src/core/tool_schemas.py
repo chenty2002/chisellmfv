@@ -268,6 +268,78 @@ def create_read_files_tool(extra_description: str = "") -> Dict:
     }
 
 
+WORKSPACE_CONTEXT_TOOLS = [
+    {
+        "name": "list_files",
+        "description": "List files under the CoupledL2 run workspace. Paths are workspace-relative and cannot escape the workspace.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative directory or file path", "default": "."},
+                "pattern": {"type": "string", "description": "Glob pattern for files", "default": "*"},
+            },
+        },
+    },
+    {
+        "name": "rg",
+        "description": "Search CoupledL2 workspace files with ripgrep and return structured line matches.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Search pattern"},
+                "path": {"type": "string", "description": "Workspace-relative path to search", "default": "."},
+                "glob": {"type": "string", "description": "Optional ripgrep glob, such as *.scala"},
+                "max_matches": {"type": "integer", "description": "Maximum matches to return", "default": 100},
+            },
+            "required": ["pattern"],
+        },
+    },
+    {
+        "name": "read_skill",
+        "description": "Read one installed CoupledL2 workspace skill by name or relative path.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill file name, with or without .md suffix"},
+            },
+        },
+    },
+    {
+        "name": "read_rule",
+        "description": "Read one installed CoupledL2 workspace rule by name or relative path.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Rule file name, with or without .md suffix"},
+            },
+        },
+    },
+    {
+        "name": "read_memory",
+        "description": "Read a workspace-scoped memory note from the CoupledL2 run workspace.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Memory note name", "default": "project.md"},
+            },
+        },
+    },
+    {
+        "name": "write_memory",
+        "description": "Write or append a workspace-scoped memory note inside the CoupledL2 run workspace.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Memory note name"},
+                "content": {"type": "string", "description": "Markdown content"},
+                "append": {"type": "boolean", "description": "Append instead of replacing", "default": False},
+            },
+            "required": ["name", "content"],
+        },
+    },
+]
+
+
 # Reset stage tool - only for benchmark build_top_module
 RESET_STAGE_TOOL = {
     "name": "reset_stage",
@@ -400,7 +472,11 @@ PROPOSE_BUGFIX_TOOL_SCHEMAS = [
 ]
 
 
-def get_tool_schemas(formal_stage: str = "build_top_module", target: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_tool_schemas(
+    formal_stage: str = "build_top_module",
+    target: Optional[str] = None,
+    coupledl2: bool = False,
+) -> List[Dict[str, Any]]:
     """
     Get the appropriate tool schemas for a formal verification stage.
     
@@ -418,7 +494,10 @@ def get_tool_schemas(formal_stage: str = "build_top_module", target: Optional[st
         "waveform_explanation": WAVEFORM_EXPLANATION_TOOL_SCHEMAS,
         "propose_bugfix": PROPOSE_BUGFIX_TOOL_SCHEMAS,
     }
-    return stage_schemas.get(formal_stage, stage_schemas["build_top_module"])
+    schemas = list(stage_schemas.get(formal_stage, stage_schemas["build_top_module"]))
+    if coupledl2:
+        schemas = WORKSPACE_CONTEXT_TOOLS + schemas
+    return schemas
 
 
 def convert_tool_call_to_action(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:

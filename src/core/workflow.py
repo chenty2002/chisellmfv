@@ -316,6 +316,7 @@ class FormalWorkflow:
         
         result["stage_result"] = stage_result
         result["success"] = stage_result.get("success", False)
+        self._record_coupledl2_stage_result(stage, stage_result, result)
         
         # Handle waveform path update from verification result
         if stage == "invoke_verification":
@@ -612,7 +613,11 @@ class FormalWorkflow:
         self._stage_snapshot = capture_stage_snapshot(self.work_dir, self.logger)
         self.logger.info(f"Captured stage snapshot: {list(self._stage_snapshot.keys())}")
         
-        tool_schemas = get_tool_schemas(stage, target=self.target)
+        tool_schemas = get_tool_schemas(
+            stage,
+            target=self.target,
+            coupledl2=self.run_context is not None,
+        )
         cache_metadata = self._build_prompt_cache_metadata(stage, tool_schemas)
         
         # Load Scala sources for initial prompt
@@ -1054,6 +1059,8 @@ class FormalWorkflow:
             # Include error_type if present (for RL reward calculation)
             if error_type:
                 result["error_type"] = error_type
+            if stage == "waveform_explanation":
+                self._write_coupledl2_diagnosis(args, result)
             context["stage_results"][stage] = result
             if stage == "propose_bugfix" and result.get("success"):
                 context["workflow_complete"] = True
@@ -1143,7 +1150,8 @@ class FormalWorkflow:
             read_file_func=self.read_file,
             write_file_func=self.write_file,
             reset_stage_func=self.reset_stage,
-            logger=self.logger
+            logger=self.logger,
+            workspace_root=str(self.run_context.workspace_dir) if self.run_context is not None else None,
         )
     
     def read_file(self, file_path: str) -> str:
@@ -1151,3 +1159,104 @@ class FormalWorkflow:
     
     def write_file(self, file_path: str, content: str):
         return write_file(file_path, content, self._allowed_write_dirs)
+
+    def _coupledl2_stage_dir(self, stage: str) -> Optional[Path]:
+        if self.run_context is None:
+            return None
+        from ..coupledl2.workspace import COUPLEDL2_STAGES
+
+        index = COUPLEDL2_STAGES.index(stage) + 1
+        path = self.run_context.results_dir / "by_stage" / f"{index:02d}_{stage}"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _record_coupledl2_stage_result(
+        self,
+        stage: str,
+        stage_result: Dict[str, Any],
+        workflow_result: Dict[str, Any],
+    ) -> None:
+        """Persist CoupledL2 stage/final records in the run results tree."""
+        stage_dir = self._coupledl2_stage_dir(stage)
+        if stage_dir is None or self.run_context is None:
+            return
+
+        self._write_json(stage_dir / "stage_result.json", stage_result)
+
+        if stage == "invoke_verification":
+            formal = stage_result.get("jaspergold_result") or stage_result.get("formal_result")
+            if isinstance(formal, dict):
+                self._write_json(stage_dir / "formal_result.json", formal)
+                self._write_json(stage_dir / "property_status.json", formal.get("property_statuses", {}))
+
+        if stage == "propose_bugfix":
+            repair = stage_result.get("repair_loop") or stage_result
+            if isinstance(repair, dict):
+                self._write_json(stage_dir / "repair_result.json", repair)
+                self._write_json(stage_dir / "repair_history.json", {"rounds": repair.get("rounds", [])})
+
+        if stage == "propose_bugfix" or workflow_result.get("success") is False:
+            final = {
+                "stage": stage,
+                "success": bool(workflow_result.get("success")),
+                "stage_result": stage_result,
+                "run_dir": str(self.run_context.run_dir),
+                "case_name": self.run_context.config.case_name,
+            }
+            self._write_json(self.run_context.results_dir / "final_result.json", final)
+
+    def _write_coupledl2_diagnosis(self, args: Dict[str, Any], result: Dict[str, Any]) -> None:
+        """Write the stage-4 machine-readable diagnosis artifact."""
+        stage_dir = self._coupledl2_stage_dir("waveform_explanation")
+        if stage_dir is None:
+            return
+
+        property_name = (
+            args.get("property")
+            or args.get("target_assertion_label")
+            or self._first_failing_property()
+            or "unknown"
+        )
+        classification = args.get("error_type") or "inconclusive"
+        evidence = []
+        for key in ("summary", "root_cause", "counterexample_path"):
+            value = args.get(key) or result.get(key)
+            if value:
+                evidence.append({"kind": key, "value": value})
+        diagnosis = {
+            "diagnoses": [
+                {
+                    "property": property_name,
+                    "classification": classification,
+                    "evidence": evidence,
+                    "uncertainty": args.get("uncertainty") or "not_reported",
+                }
+            ],
+            "summary": args.get("summary", result.get("summary", "")),
+        }
+        self._write_json(stage_dir / "diagnosis.json", diagnosis)
+        report_path = stage_dir / "counterexample_analysis.md"
+        if not report_path.exists():
+            report_path.write_text(str(diagnosis["summary"]), encoding="utf-8")
+
+    def _first_failing_property(self) -> Optional[str]:
+        data = self.last_verification_result or {}
+        for key in ("failing_properties", "inconclusive_properties"):
+            values = data.get(key)
+            if isinstance(values, list) and values:
+                return str(values[0])
+        nested = data.get("jaspergold_result")
+        if isinstance(nested, dict):
+            for key in ("failing_properties", "inconclusive_properties"):
+                values = nested.get(key)
+                if isinstance(values, list) and values:
+                    return str(values[0])
+        return None
+
+    @staticmethod
+    def _write_json(path: Path, value: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
