@@ -37,7 +37,10 @@ from .prompt_builder import (
     build_compilation_error_message
 )
 from .context_manager import EvidenceNotebook, compact_messages_with_notebook
-from .waveform_actions import WaveformActions
+try:
+    from .waveform_actions import WaveformActions
+except ModuleNotFoundError:
+    WaveformActions = None
 from .tool_schemas import get_tool_schemas, convert_tool_call_to_action
 from .actions import execute_stage_actions
 from .build_operations import BuildOperations
@@ -49,6 +52,13 @@ from .repair_loop import (
     select_next_counterexample,
     snapshot_waveform_artifacts,
     write_repair_json,
+)
+from ..coupledl2.config import CoupledL2RunConfig
+from ..coupledl2.workspace import (
+    CoupledL2Workspace,
+    StageContext,
+    create_coupledl2_workspace,
+    initialize_stage_context,
 )
 from ..causal_analysis import (
     CausalAnalysisActions,
@@ -79,6 +89,7 @@ class FormalWorkflow:
         ablation_modes: Optional[List[str]] = None,
         max_repair_rounds: int = DEFAULT_MAX_REPAIR_ROUNDS,
         initial_verification_result: Optional[Dict[str, Any]] = None,
+        coupledl2_config: Optional[CoupledL2RunConfig] = None,
     ):
         """
         Initialize the formal verification workflow for a single stage.
@@ -105,6 +116,9 @@ class FormalWorkflow:
         self.max_repair_rounds = max(0, int(max_repair_rounds))
         self.last_verification_result = initial_verification_result
         self.causal_actions: Optional[CausalAnalysisActions] = None
+        self.coupledl2_config = coupledl2_config
+        self.run_context: Optional[CoupledL2Workspace] = None
+        self.stage_context: Optional[StageContext] = None
         
         # Initialize paths based on target
         self._init_paths()
@@ -117,6 +131,15 @@ class FormalWorkflow:
     
     def _init_paths(self) -> None:
         """Initialize directory paths based on target."""
+        if self.coupledl2_config is not None:
+            self.run_context = create_coupledl2_workspace(self.coupledl2_config)
+            self.work_dir = str(self.run_context.case_workspace)
+            self.verify_src_dir = str(self.run_context.case_workspace / "Chisel")
+            self.generated_dir = str(self.run_context.case_workspace / "Chisel" / "generated")
+            self.verilog_dir = str(self.run_context.case_workspace / "Verilog")
+            self._allowed_write_dirs = [self.work_dir]
+            return
+
         # For benchmark targets: work in chisel/extra_bench/<benchmark_name> directory
         self.work_dir = os.path.join(self.chisel_dir, "extra_bench", self.target)
         self.verify_src_dir = self.work_dir
@@ -141,6 +164,9 @@ class FormalWorkflow:
         """Initialize waveform actions if waveform path is provided."""
         self.waveform_actions = None
         if self.waveform_path:
+            if WaveformActions is None:
+                self.logger.error("Failed to initialize waveform actions: pylibfst is not installed")
+                return
             try:
                 self.waveform_actions = WaveformActions(self.waveform_path)
             except Exception as e:
@@ -186,6 +212,10 @@ class FormalWorkflow:
         }
         if self.ablation_modes:
             env_info["ablation_modes"] = sorted(self.ablation_modes)
+
+        if self.run_context is not None:
+            self.stage_context = initialize_stage_context(self.run_context, self.current_stage)
+            env_info["coupledl2"] = self._coupledl2_environment()
         
         env_info["work_dir"] = self.work_dir
         env_info["benchmark"] = self.target
@@ -214,6 +244,26 @@ class FormalWorkflow:
                 context["environment"]["waveform_metadata"] = self.waveform_actions.metadata
         
         return context
+
+    def _coupledl2_environment(self) -> Dict[str, Any]:
+        """Return serializable CoupledL2 initialization context for prompts and logs."""
+        assert self.run_context is not None
+        stage_context = self.stage_context
+        return {
+            "case_name": self.run_context.config.case_name,
+            "run_dir": str(self.run_context.run_dir),
+            "workspace_case_path": str(self.run_context.case_workspace),
+            "manifest_path": str(self.run_context.manifest_path),
+            "indexes_dir": str(self.run_context.indexes_dir),
+            "verify_mode": self.run_context.config.verify_mode,
+            "input_mode": self.run_context.config.input_mode,
+            "property_category": self.run_context.config.property_category,
+            "stage_context": (
+                stage_context.to_dict(self.run_context.workspace_dir)
+                if stage_context is not None
+                else None
+            ),
+        }
     
     def process_task(self, user_query: str) -> Dict[str, Any]:
         """
@@ -516,6 +566,9 @@ class FormalWorkflow:
         cex_path = stage_result.get("counterexample_path")
         if cex_path and os.path.exists(cex_path):
             self.waveform_path = cex_path
+            if WaveformActions is None:
+                self.logger.error("Failed to load counterexample: pylibfst is not installed")
+                return
             try:
                 self.waveform_actions = WaveformActions(cex_path)
                 context["environment"]["waveform_path"] = cex_path

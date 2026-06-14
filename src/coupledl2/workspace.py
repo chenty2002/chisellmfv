@@ -1,0 +1,199 @@
+"""Workspace and stage initialization for CoupledL2 workflows."""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
+from uuid import uuid4
+
+from .config import CoupledL2RunConfig
+from .indexer import generate_indexes
+from .skills import install_context_assets, stage_rule_paths, stage_skill_paths
+
+
+COUPLEDL2_STAGES = [
+    "build_top_module",
+    "write_assertions",
+    "invoke_verification",
+    "waveform_explanation",
+    "propose_bugfix",
+]
+
+IGNORED_COPY_ENTRIES = {
+    ".git",
+    ".bsp",
+    ".metals",
+    ".mill",
+    "out",
+    "target",
+    "generated",
+    "__pycache__",
+}
+
+
+@dataclass(frozen=True)
+class CoupledL2Workspace:
+    run_dir: Path
+    workspace_dir: Path
+    case_workspace: Path
+    indexes_dir: Path
+    logs_dir: Path
+    results_dir: Path
+    manifest_path: Path
+    config: CoupledL2RunConfig
+
+
+@dataclass(frozen=True)
+class StageContext:
+    stage: str
+    stage_dir: Path
+    snapshot_dir: Path
+    skills: List[Path]
+    rules: List[Path]
+    context_indexes: Dict[str, Dict[str, Any]]
+
+    def to_dict(self, workspace_dir: Path) -> Dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "stage_dir": str(self.stage_dir),
+            "snapshot_dir": str(self.snapshot_dir),
+            "skills": [_rel_to_workspace(path, workspace_dir) for path in self.skills],
+            "rules": [_rel_to_workspace(path, workspace_dir) for path in self.rules],
+            "context_indexes": sorted(self.context_indexes.keys()),
+        }
+
+
+def create_coupledl2_workspace(config: CoupledL2RunConfig) -> CoupledL2Workspace:
+    """Create an isolated run workspace and minimal indexes for a CoupledL2 case."""
+    run_dir = _allocate_run_dir(config.run_root, config.case_name)
+    workspace_dir = run_dir / "workspace"
+    case_workspace = workspace_dir / "case"
+    indexes_dir = run_dir / "indexes"
+    logs_dir = run_dir / "logs"
+    results_dir = run_dir / "results"
+
+    for directory in [workspace_dir, indexes_dir, logs_dir, results_dir]:
+        directory.mkdir(parents=True, exist_ok=True)
+
+    shutil.copytree(config.case_path, case_workspace, ignore=_ignore_copy_entries)
+    install_context_assets(workspace_dir)
+    _create_stage_dirs(results_dir)
+
+    manifest_path = run_dir / "manifest.json"
+    manifest = _build_manifest(config, run_dir, workspace_dir, case_workspace)
+    _write_json(manifest_path, manifest)
+
+    generate_indexes(run_dir, case_workspace, config)
+    _append_jsonl(logs_dir / "events.jsonl", {
+        "event": "workflow_initialized",
+        "case_name": config.case_name,
+        "run_dir": str(run_dir),
+    })
+
+    return CoupledL2Workspace(
+        run_dir=run_dir,
+        workspace_dir=workspace_dir,
+        case_workspace=case_workspace,
+        indexes_dir=indexes_dir,
+        logs_dir=logs_dir,
+        results_dir=results_dir,
+        manifest_path=manifest_path,
+        config=config,
+    )
+
+
+def initialize_stage_context(workspace: CoupledL2Workspace, stage: str) -> StageContext:
+    """Load the stage-specific context slice for the five-stage workflow."""
+    if stage not in COUPLEDL2_STAGES:
+        raise ValueError(f"unknown CoupledL2 stage: {stage}")
+
+    index = COUPLEDL2_STAGES.index(stage) + 1
+    stage_dir = workspace.results_dir / "by_stage" / f"{index:02d}_{stage}"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_dir = stage_dir / "source_snapshot"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    context_indexes = _load_stage_indexes(workspace.indexes_dir, stage)
+    ctx = StageContext(
+        stage=stage,
+        stage_dir=stage_dir,
+        snapshot_dir=snapshot_dir,
+        skills=stage_skill_paths(workspace.workspace_dir, stage),
+        rules=stage_rule_paths(workspace.workspace_dir, stage),
+        context_indexes=context_indexes,
+    )
+    _append_jsonl(workspace.logs_dir / "events.jsonl", {
+        "event": "stage_initialized",
+        "stage": stage,
+        "stage_dir": str(stage_dir),
+    })
+    return ctx
+
+
+def _allocate_run_dir(run_root: Path, case_name: str) -> Path:
+    run_root.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", case_name.lower())[:64].strip("-") or "coupledl2"
+    return run_root / f"{timestamp}-{slug}-{uuid4().hex[:8]}"
+
+
+def _ignore_copy_entries(_directory: str, names: List[str]) -> set:
+    return {name for name in names if name in IGNORED_COPY_ENTRIES}
+
+
+def _create_stage_dirs(results_dir: Path) -> None:
+    for index, stage in enumerate(COUPLEDL2_STAGES, start=1):
+        (results_dir / "by_stage" / f"{index:02d}_{stage}").mkdir(parents=True, exist_ok=True)
+
+
+def _build_manifest(
+    config: CoupledL2RunConfig,
+    run_dir: Path,
+    workspace_dir: Path,
+    case_workspace: Path,
+) -> Dict[str, Any]:
+    return {
+        "case_name": config.case_name,
+        "original_case_path": str(config.case_path),
+        "workspace_case_path": str(case_workspace),
+        "run_dir": str(run_dir),
+        "workspace_dir": str(workspace_dir),
+        "copy_strategy": config.copy_strategy,
+        "verify_mode": config.verify_mode,
+        "input_mode": config.input_mode,
+        "property_category": config.property_category,
+        "stages": COUPLEDL2_STAGES,
+    }
+
+
+def _load_stage_indexes(indexes_dir: Path, stage: str) -> Dict[str, Dict[str, Any]]:
+    required = {
+        "build_top_module": ["project_tree", "build_contract", "formal_surface"],
+        "write_assertions": ["build_contract", "formal_surface"],
+        "invoke_verification": ["build_contract", "formal_surface"],
+        "waveform_explanation": ["build_contract", "formal_surface"],
+        "propose_bugfix": ["build_contract", "formal_surface"],
+    }[stage]
+    return {
+        name: json.loads((indexes_dir / f"{name}.json").read_text(encoding="utf-8"))
+        for name in required
+    }
+
+
+def _rel_to_workspace(path: Path, workspace_dir: Path) -> str:
+    return path.relative_to(workspace_dir).as_posix()
+
+
+def _write_json(path: Path, value: Dict[str, Any]) -> None:
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _append_jsonl(path: Path, value: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")

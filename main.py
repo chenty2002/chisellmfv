@@ -460,6 +460,33 @@ def main_quality(args):
     }, indent=2, ensure_ascii=False))
 
 
+def main_coupledl2_run(args):
+    """Initialize a CoupledL2 run workspace for the refactored workflow."""
+    from src.coupledl2.config import CoupledL2RunConfig
+    from src.coupledl2.workspace import create_coupledl2_workspace, initialize_stage_context
+
+    if not args.dry_run_init:
+        print("错误: commit 1 only supports --dry-run-init for CoupledL2 run initialization")
+        sys.exit(2)
+
+    config = CoupledL2RunConfig(
+        case_path=Path(args.case),
+        verify_mode=args.mode,
+        input_mode=args.input_mode,
+        property_category=args.property_category,
+        run_root=Path(args.run_root),
+    )
+    workspace = create_coupledl2_workspace(config)
+    stage = args.stage or args.start_stage or "build_top_module"
+    initialize_stage_context(workspace, stage)
+
+    print("prepared CoupledL2 workspace only")
+    print(f"run_dir: {workspace.run_dir}")
+    print(f"manifest: {workspace.manifest_path}")
+    print(f"indexes: {workspace.indexes_dir}")
+    print(f"results: {workspace.results_dir}")
+
+
 def _split_csv(value: Optional[str]) -> List[str]:
     if not value:
         return []
@@ -624,6 +651,35 @@ def parse_args():
     quality_parser.add_argument('--jg-timeout', type=int, default=900,
                                 help='单个 JasperGold 阶段的进程超时秒数')
 
+    # CoupledL2 refactored workflow entrypoint
+    run_parser = subparsers.add_parser('run', help='CoupledL2 五阶段形式化验证工作流')
+    run_parser.add_argument('--case', type=str, required=True,
+                            help='CoupledL2 case 目录')
+    run_parser.add_argument('--mode', type=str, default='small', choices=['small', 'large'],
+                            help='VERIFY_MODE（默认: small）')
+    run_parser.add_argument('--input-mode', type=str, default='msggen',
+                            choices=['msggen', 'coupledl2asl1'],
+                            help='VERIFY_INPUT_MODE（默认: msggen）')
+    run_parser.add_argument('--property', dest='property_category', type=str, default='deadlock',
+                            choices=['deadlock', 'write_read', 'copy_equality', 'peer_l2', 'custom'],
+                            help='属性类别（默认: deadlock）')
+    run_parser.add_argument('--run-root', type=str, default='runs',
+                            help='run workspace 根目录（默认: runs）')
+    run_parser.add_argument('--full', action='store_true',
+                            help='预留：运行完整五阶段流程')
+    run_parser.add_argument('--stage', type=str, default=None,
+                            choices=['build_top_module', 'write_assertions',
+                                     'invoke_verification', 'waveform_explanation',
+                                     'propose_bugfix'],
+                            help='预留：运行单个阶段')
+    run_parser.add_argument('--start-stage', type=str, default=None,
+                            choices=['build_top_module', 'write_assertions',
+                                     'invoke_verification', 'waveform_explanation',
+                                     'propose_bugfix'],
+                            help='预留：从指定阶段开始')
+    run_parser.add_argument('--dry-run-init', action='store_true',
+                            help='仅执行 workflow/stage 初始化并退出')
+
     return parser.parse_args()
 
 
@@ -650,8 +706,10 @@ def main():
             print("可使用 --counter 运行 counter smoke 默认配置")
             sys.exit(1)
         main_quality(args)
+    elif args.command == 'run':
+        main_coupledl2_run(args)
     else:
-        print("错误: 请指定工作流类型 (formal, v2c)")
+        print("错误: 请指定工作流类型 (formal, v2c, quality, run)")
         print("运行 'python main.py --help' 查看帮助")
         sys.exit(1)
 

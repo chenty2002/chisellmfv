@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Action execution functions for formal verification workflow.
 Handles file operations, compilation, and waveform analysis actions.
@@ -6,7 +8,11 @@ Handles file operations, compilation, and waveform analysis actions.
 import os
 from typing import Dict, List, Any, Optional, Callable
 
-from .waveform_actions import execute_waveform_action, WaveformActions
+try:
+    from .waveform_actions import execute_waveform_action, WaveformActions
+except ModuleNotFoundError:
+    execute_waveform_action = None
+    WaveformActions = Any
 from ..causal_analysis import CausalAnalysisActions
 
 
@@ -343,7 +349,7 @@ def _execute_write_report(
 
 def _execute_waveform_action(action: Dict[str, Any], waveform_actions: Optional[WaveformActions]) -> Dict[str, Any]:
     """Execute waveform-related action."""
-    if waveform_actions:
+    if waveform_actions and execute_waveform_action is not None:
         return execute_waveform_action(action, waveform_actions)
     else:
         return {

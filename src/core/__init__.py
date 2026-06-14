@@ -19,7 +19,10 @@ from .prompt_builder import (
     build_tool_result_message,
     build_compilation_error_message,
 )
-from .waveform_actions import WaveformActions
+try:
+    from .waveform_actions import WaveformActions
+except ModuleNotFoundError:
+    WaveformActions = None
 from .tool_schemas import (
     FORMAL_STAGES,
     get_tool_schemas,
