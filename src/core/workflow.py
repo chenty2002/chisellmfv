@@ -44,6 +44,7 @@ except ModuleNotFoundError:
 from .tool_schemas import get_tool_schemas, convert_tool_call_to_action
 from .actions import execute_stage_actions
 from .build_operations import BuildOperations
+from ..coupledl2.backend import CoupledL2BuildOperations
 from .repair_loop import (
     DEFAULT_MAX_REPAIR_ROUNDS,
     build_final_repair_result,
@@ -151,6 +152,13 @@ class FormalWorkflow:
     
     def _init_helpers(self) -> None:
         """Initialize helper classes for build operations."""
+        if self.run_context is not None:
+            self.build_ops = CoupledL2BuildOperations(
+                workspace=self.run_context,
+                logger=self.logger,
+            )
+            return
+
         self.build_ops = BuildOperations(
             chisel_dir=self.chisel_dir,
             work_dir=self.work_dir,

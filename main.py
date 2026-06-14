@@ -462,12 +462,10 @@ def main_quality(args):
 
 def main_coupledl2_run(args):
     """Initialize a CoupledL2 run workspace for the refactored workflow."""
+    from src.coupledl2.backend import CoupledL2BuildOperations
     from src.coupledl2.config import CoupledL2RunConfig
     from src.coupledl2.workspace import create_coupledl2_workspace, initialize_stage_context
-
-    if not args.dry_run_init:
-        print("错误: commit 1 only supports --dry-run-init for CoupledL2 run initialization")
-        sys.exit(2)
+    from src.utils.logger import get_logger
 
     config = CoupledL2RunConfig(
         case_path=Path(args.case),
@@ -480,11 +478,39 @@ def main_coupledl2_run(args):
     stage = args.stage or args.start_stage or "build_top_module"
     initialize_stage_context(workspace, stage)
 
-    print("prepared CoupledL2 workspace only")
-    print(f"run_dir: {workspace.run_dir}")
-    print(f"manifest: {workspace.manifest_path}")
-    print(f"indexes: {workspace.indexes_dir}")
-    print(f"results: {workspace.results_dir}")
+    if args.dry_run_init:
+        print("prepared CoupledL2 workspace only")
+        print(f"run_dir: {workspace.run_dir}")
+        print(f"manifest: {workspace.manifest_path}")
+        print(f"indexes: {workspace.indexes_dir}")
+        print(f"results: {workspace.results_dir}")
+        return
+
+    logger = get_logger(
+        __name__,
+        console_output=False,
+        clear_log=True,
+        base_name=f"application-coupledl2-{stage}.log",
+    )
+    backend = CoupledL2BuildOperations(workspace, logger)
+
+    if args.build_only:
+        result = backend.run_build_only()
+        print("build-only completed" if result.get("success") else "build-only failed")
+        print(json.dumps({
+            "run_dir": str(workspace.run_dir),
+            "success": result.get("success"),
+            "target": result.get("command", [None, None])[-1],
+            "top_module": result.get("top_module"),
+            "generated_files": result.get("generated_files", []),
+            "error": result.get("error"),
+        }, indent=2, ensure_ascii=False))
+        if not result.get("success"):
+            sys.exit(1)
+        return
+
+    print("错误: CoupledL2 run currently supports --dry-run-init or --build-only")
+    sys.exit(2)
 
 
 def _split_csv(value: Optional[str]) -> List[str]:
@@ -679,6 +705,8 @@ def parse_args():
                             help='预留：从指定阶段开始')
     run_parser.add_argument('--dry-run-init', action='store_true',
                             help='仅执行 workflow/stage 初始化并退出')
+    run_parser.add_argument('--build-only', action='store_true',
+                            help='执行 CoupledL2 case-local Makefile 构建并写入 stage 1 artifacts')
 
     return parser.parse_args()
 
