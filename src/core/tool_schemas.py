@@ -10,12 +10,54 @@ Defines structured actions as function declarations for the LLM to call.
   5. propose_bugfix - Fix identified bugs
 """
 
-from typing import Dict, List, Any, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Any, Optional, Iterable, Set
 from copy import deepcopy
 
 # Supported formal verification stages
 FORMAL_STAGES = ["build_top_module", "write_assertions", "invoke_verification", 
                  "waveform_explanation", "propose_bugfix"]
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """Registered tool schema plus workflow policy metadata."""
+
+    name: str
+    schema: Dict[str, Any]
+    allowed_stages: Set[str]
+    write_policy: str = "read_only"
+    completion_capability: bool = False
+    audit_level: str = "standard"
+    workspace_only: bool = False
+
+
+class ToolRegistry:
+    """Stage-aware registry for formal workflow tool schemas."""
+
+    def __init__(self, specs: Optional[Iterable[ToolSpec]] = None):
+        self._specs_by_name: Dict[str, List[ToolSpec]] = {}
+        self._ordered_specs: List[ToolSpec] = []
+        for spec in specs or []:
+            self.register(spec)
+
+    def register(self, spec: ToolSpec) -> None:
+        self._ordered_specs.append(spec)
+        self._specs_by_name.setdefault(spec.name, []).append(spec)
+
+    def get(self, name: str) -> ToolSpec:
+        return self._specs_by_name[name][-1]
+
+    def get_stage_specs(self, stage: str, *, include_workspace: bool = False) -> List[ToolSpec]:
+        return [
+            spec
+            for spec in self._ordered_specs
+            if stage in spec.allowed_stages
+            and (include_workspace or not spec.workspace_only)
+        ]
+
+    def get_tool_schemas(self, stage: str, *, include_workspace: bool = False) -> List[Dict[str, Any]]:
+        return [deepcopy(spec.schema) for spec in self.get_stage_specs(stage, include_workspace=include_workspace)]
 
 
 STAGE_COMPLETION_PARAMS = {
@@ -268,6 +310,41 @@ def create_read_files_tool(extra_description: str = "") -> Dict:
     }
 
 
+def create_coupledl2_read_files_tool() -> Dict:
+    """Create a CoupledL2 workspace-oriented read_files schema."""
+    return {
+        "name": "read_files",
+        "description": "Read source or artifact files inside the CoupledL2 run workspace. Prefer workspace-relative paths with line_start/line_end when possible.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Workspace-relative files to read, such as case/Chisel/src/test/scala/coupledl2/VerifyTop.scala or results/by_stage/03_invoke_verification/formal_result.json."
+                },
+                "line_start": {
+                    "type": "integer",
+                    "description": "Optional 1-based first line to read from each file"
+                },
+                "line_end": {
+                    "type": "integer",
+                    "description": "Optional 1-based last line to read from each file"
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Optional maximum characters to return per file after line filtering"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Reason for reading these files"
+                }
+            },
+            "required": ["file_paths", "reason"]
+        }
+    }
+
+
 WORKSPACE_CONTEXT_TOOLS = [
     {
         "name": "list_files",
@@ -338,6 +415,132 @@ WORKSPACE_CONTEXT_TOOLS = [
         },
     },
 ]
+
+
+EDIT_FILE_TOOL = {
+    "name": "edit_file",
+    "description": "Edit one workspace file with a focused operation. Prefer replace_text, replace_range, insert_before/after, or apply_patch over replacing entire files.",
+    "parameters": {
+        "type": "object",
+        "properties": add_complete_params({
+            "file_path": {
+                "type": "string",
+                "description": "Workspace-relative file path. Absolute paths and paths escaping the workspace are rejected.",
+            },
+            "operation": {
+                "type": "string",
+                "enum": [
+                    "replace_file",
+                    "apply_patch",
+                    "replace_range",
+                    "replace_text",
+                    "insert_after",
+                    "insert_before",
+                    "delete_range",
+                ],
+                "description": "Focused edit operation to apply.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Full replacement content for replace_file, inserted content for insert operations, or unified diff for apply_patch.",
+            },
+            "old_text": {
+                "type": "string",
+                "description": "Unique text to replace, or anchor text for insert_before/insert_after.",
+            },
+            "new_text": {
+                "type": "string",
+                "description": "Replacement text for replace_text.",
+            },
+            "line_start": {
+                "type": "integer",
+                "description": "1-based start line for replace_range/delete_range, or anchor line for insert_after/insert_before.",
+            },
+            "line_end": {
+                "type": "integer",
+                "description": "1-based inclusive end line for replace_range/delete_range.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Brief reason for the edit.",
+            },
+        }),
+        "required": ["file_path", "operation", "reason"],
+    },
+}
+
+
+COMPLETE_STAGE_TOOL = {
+    "name": "complete_stage",
+    "description": "Declare the current stage ready for deterministic workflow validation. Use this after required files or reports have been written and evidence has been collected.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "Compact stage summary grounded in tool evidence.",
+            },
+            "evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Artifact paths, tool observations, or file references supporting completion.",
+            },
+            "verification_passed": {
+                "type": "boolean",
+                "description": "Whether the stage result indicates verification passed when relevant.",
+            },
+            "counterexample_path": {
+                "type": "string",
+                "description": "Counterexample waveform path when relevant.",
+            },
+            "root_cause": {
+                "type": "string",
+                "description": "Root cause or diagnosis when relevant.",
+            },
+            "files_modified": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Workspace-relative files modified during the stage.",
+            },
+            "error_type": {
+                "type": "string",
+                "enum": ["dut_bug", "assertion_error", "setup_error", "inconclusive"],
+                "description": "Failure or repair category when relevant.",
+            },
+            "target_assertion_label": {
+                "type": "string",
+                "description": "Original failing assertion/property label handled by a repair stage.",
+            },
+            "homologous_assertions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Structurally identical assertions inspected or repaired with the target assertion.",
+            },
+        },
+        "required": ["summary", "evidence"],
+    },
+}
+
+
+COUPLEDL2_WRITE_REPORT_TOOL = {
+    "name": "write_report",
+    "description": "Write the counterexample analysis report to counterexample_analysis.md in the current CoupledL2 case workspace.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "Markdown content of the analysis report"
+            },
+            "error_type": {
+                "type": "string",
+                "enum": ["dut_bug", "assertion_error", "setup_error", "inconclusive"],
+                "description": "Type of error found in counterexample."
+            }
+        },
+        "required": ["content"]
+    }
+}
 
 
 # Reset stage tool - only for benchmark build_top_module
@@ -472,6 +675,108 @@ PROPOSE_BUGFIX_TOOL_SCHEMAS = [
 ]
 
 
+def _completion_capable(schema: Dict[str, Any]) -> bool:
+    properties = schema.get("parameters", {}).get("properties", {})
+    return "stage_complete" in properties
+
+
+def _register_many(
+    registry: ToolRegistry,
+    schemas: Iterable[Dict[str, Any]],
+    stages: Iterable[str],
+    *,
+    write_policy: str = "read_only",
+    audit_level: str = "standard",
+    workspace_only: bool = False,
+) -> None:
+    allowed_stages = set(stages)
+    for schema in schemas:
+        registry.register(
+            ToolSpec(
+                name=schema["name"],
+                schema=schema,
+                allowed_stages=allowed_stages,
+                write_policy=write_policy,
+                completion_capability=_completion_capable(schema),
+                audit_level=audit_level,
+                workspace_only=workspace_only,
+            )
+        )
+
+
+def get_default_tool_registry() -> ToolRegistry:
+    """Build the default stage-aware registry for formal workflow tools."""
+    registry = ToolRegistry()
+    all_stages = set(FORMAL_STAGES)
+    source_write_stages = {"build_top_module", "write_assertions", "propose_bugfix"}
+
+    _register_many(
+        registry,
+        WORKSPACE_CONTEXT_TOOLS,
+        all_stages,
+        workspace_only=True,
+    )
+    _register_many(
+        registry,
+        [EDIT_FILE_TOOL],
+        source_write_stages,
+        write_policy="workspace_source",
+        audit_level="diff",
+        workspace_only=True,
+    )
+    _register_many(
+        registry,
+        BUILD_TOP_TOOL_SCHEMAS,
+        {"build_top_module"},
+        write_policy="source_file",
+        audit_level="diff",
+    )
+    _register_many(
+        registry,
+        WRITE_ASSERTIONS_TOOL_SCHEMAS,
+        {"write_assertions"},
+        write_policy="source_file",
+        audit_level="diff",
+    )
+    _register_many(
+        registry,
+        WAVEFORM_EXPLANATION_TOOL_SCHEMAS,
+        {"waveform_explanation"},
+        audit_level="evidence",
+    )
+    _register_many(
+        registry,
+        PROPOSE_BUGFIX_TOOL_SCHEMAS,
+        {"propose_bugfix"},
+        write_policy="source_file",
+        audit_level="diff",
+    )
+    return registry
+
+
+def get_coupledl2_tool_schemas(formal_stage: str = "build_top_module") -> List[Dict[str, Any]]:
+    """Return CoupledL2-only tools without legacy benchmark write surfaces."""
+    stage = formal_stage if formal_stage in FORMAL_STAGES else "build_top_module"
+    schemas: List[Dict[str, Any]] = []
+    source_write_stages = {"build_top_module", "write_assertions", "propose_bugfix"}
+
+    schemas.extend(deepcopy(WORKSPACE_CONTEXT_TOOLS))
+    schemas.append(create_coupledl2_read_files_tool())
+
+    if stage in source_write_stages:
+        schemas.append(deepcopy(EDIT_FILE_TOOL))
+
+    if stage == "waveform_explanation":
+        schemas.extend(deepcopy(WAVEFORM_TOOLS))
+        schemas.extend(deepcopy(CAUSAL_TOOLS))
+        schemas.append(deepcopy(COUPLEDL2_WRITE_REPORT_TOOL))
+
+    if stage != "invoke_verification":
+        schemas.append(deepcopy(COMPLETE_STAGE_TOOL))
+
+    return schemas
+
+
 def get_tool_schemas(
     formal_stage: str = "build_top_module",
     target: Optional[str] = None,
@@ -488,16 +793,11 @@ def get_tool_schemas(
     Returns:
         List of tool schema dictionaries
     """
-    stage_schemas = {
-        "build_top_module": BUILD_TOP_TOOL_SCHEMAS,
-        "write_assertions": WRITE_ASSERTIONS_TOOL_SCHEMAS,
-        "waveform_explanation": WAVEFORM_EXPLANATION_TOOL_SCHEMAS,
-        "propose_bugfix": PROPOSE_BUGFIX_TOOL_SCHEMAS,
-    }
-    schemas = list(stage_schemas.get(formal_stage, stage_schemas["build_top_module"]))
     if coupledl2:
-        schemas = WORKSPACE_CONTEXT_TOOLS + schemas
-    return schemas
+        return get_coupledl2_tool_schemas(formal_stage)
+
+    stage = formal_stage if formal_stage in FORMAL_STAGES else "build_top_module"
+    return get_default_tool_registry().get_tool_schemas(stage, include_workspace=coupledl2)
 
 
 def convert_tool_call_to_action(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:

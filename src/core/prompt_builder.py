@@ -273,7 +273,8 @@ def build_system_prompt(
         "- You MUST respond ONLY with tool calls. Never respond with plain text.",
         "- Always use the provided tools to perform actions",
         "- Each response must contain at least one tool call",
-        "- Set `stage_complete=true` in your final tool call when the stage objective is achieved",
+        "- Use `complete_stage` when it is available to declare the stage ready for deterministic validation.",
+        "- For legacy tools that expose `stage_complete`, set `stage_complete=true` only in the final tool call.",
         "- Treat benchmark or CoupledL2-specific paths and indexes in the user message as retrieved context.",
         "- Read exact source slices with tools before modifying files.",
         "",
@@ -378,6 +379,7 @@ def build_user_prompt(
     env = context.get("environment", {})
     workspace_dir = context.get("workspace_dir")
     target = env.get("target") or env.get("benchmark", "")
+    coupledl2 = env.get("coupledl2")
     
     # User query/task first: it is mostly stage-static in benchmark runs, which
     # improves prompt-cache locality before benchmark-specific data appears.
@@ -385,16 +387,30 @@ def build_user_prompt(
         "## Task",
         context.get("user_query", "Complete the current stage of formal verification."),
         "",
-        "## Benchmark Context",
-        f"- Benchmark: `{target}`",
-        f"- Work Directory: `{_display_path(env.get('work_dir'), workspace_dir)}`",
-        f"- Source Directory: `{_display_path(env.get('verify_src'), workspace_dir)}`",
-        f"- Generated Verilog: `chisel/extra_bench/{target}/generated/`",
-        f"- Verilog Output: `verilog/extra_bench/{target}/`",
-        "- Writable Directory: the benchmark work directory",
-        "- File Tool Path Rule: use source-manifest basenames such as `gigamax.scala` when possible; `chisel/extra_bench/<benchmark>/...` paths are also resolved to the same benchmark work directory regardless of process cwd",
-        "",
     ])
+
+    if coupledl2:
+        sections.extend([
+            "## CoupledL2 Run Context",
+            f"- Target: `{target}`",
+            f"- Work Directory: `{_display_path(env.get('work_dir'), workspace_dir)}`",
+            f"- Source Directory: `{_display_path(env.get('verify_src'), workspace_dir)}`",
+            "- File Tool Path Rule: use workspace-relative paths such as `case/Chisel/...`, `indexes/...`, `skills/...`, `rules/...`, or `results/...`.",
+            "- Source edits should use `edit_file`; finish the stage with `complete_stage` after evidence is available.",
+            "",
+        ])
+    else:
+        sections.extend([
+            "## Benchmark Context",
+            f"- Benchmark: `{target}`",
+            f"- Work Directory: `{_display_path(env.get('work_dir'), workspace_dir)}`",
+            f"- Source Directory: `{_display_path(env.get('verify_src'), workspace_dir)}`",
+            f"- Generated Verilog: `chisel/extra_bench/{target}/generated/`",
+            f"- Verilog Output: `verilog/extra_bench/{target}/`",
+            "- Writable Directory: the benchmark work directory",
+            "- File Tool Path Rule: use source-manifest basenames such as `gigamax.scala` when possible; `chisel/extra_bench/<benchmark>/...` paths are also resolved to the same benchmark work directory regardless of process cwd",
+            "",
+        ])
 
     if context.get("existing_harness_files"):
         sections.append("## Existing Harness Candidates")
@@ -402,7 +418,6 @@ def build_user_prompt(
             sections.append(f"- `{_display_path(path, workspace_dir)}`")
         sections.append("")
 
-    coupledl2 = env.get("coupledl2")
     if coupledl2:
         stage_context = coupledl2.get("stage_context") or {}
         sections.extend([

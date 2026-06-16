@@ -12,6 +12,8 @@ TileLinkLLM Core Module
 """
 
 from .llm_client import LLMClient, TokenBudgetExceeded
+from .llm_router import LLMRouter
+from .escape_policy import EscapeAction, EscapePolicy, EscapePolicyConfig
 from .workflow import FormalWorkflow
 from .prompt_builder import (
     build_system_prompt,
@@ -32,6 +34,10 @@ from .tool_schemas import (
 __all__ = [
     # LLM and workflow
     "LLMClient",
+    "LLMRouter",
+    "EscapeAction",
+    "EscapePolicy",
+    "EscapePolicyConfig",
     "TokenBudgetExceeded",
     "FormalWorkflow",
     "build_system_prompt",

@@ -8,11 +8,14 @@ Handles file operations, compilation, and waveform analysis actions.
 import os
 import json
 import subprocess
+import difflib
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Callable
 
 from .waveform_actions import execute_waveform_action, WaveformActions
 from ..causal_analysis import CausalAnalysisActions
+from .records import normalize_tool_result
 
 
 def _coerce_file_paths(action: Dict[str, Any]) -> List[str]:
@@ -103,6 +106,8 @@ def _resolve_workspace_path(path: str, workspace_root: str, work_dir: Optional[s
     root = Path(workspace_root).resolve()
     work = Path(work_dir).resolve() if work_dir else root
     raw = Path(path or ".")
+    if any(part == ".." for part in raw.parts):
+        raise ValueError(f"path escapes workspace: {path}")
     if raw.is_absolute():
         candidate = raw.resolve()
     else:
@@ -183,6 +188,12 @@ def execute_stage_actions(
 
             elif action_type == "write_memory":
                 result = _execute_write_memory(action, work_dir, workspace_root)
+
+            elif action_type == "edit_file":
+                result = _execute_edit_file(action, work_dir, read_file_func, write_file_func, workspace_root)
+
+            elif action_type == "complete_stage":
+                result = _execute_complete_stage(action)
             
             elif action_type == "confirm_existing_harness":
                 result = _execute_confirm_existing_harness(action, work_dir, logger)
@@ -216,7 +227,7 @@ def execute_stage_actions(
             result["error"] = str(e)
             result["success"] = False
         
-        results.append(result)
+        results.append(normalize_tool_result(result))
     
     return results
 
@@ -441,6 +452,203 @@ def _execute_write_file(
         "file_path": file_path,
         "success": ok,
         "error": err if not ok else None
+    }
+
+
+def _sha256_text(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _line_count(content: str) -> int:
+    return len(content.splitlines())
+
+
+def _make_unified_diff(path: str, before: str, after: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+        )
+    )
+
+
+def _normalize_insert_content(content: str) -> List[str]:
+    if content == "":
+        return []
+    return content.splitlines(keepends=True)
+
+
+def _replace_lines(
+    before: str,
+    line_start: Any,
+    line_end: Any,
+    replacement: str,
+) -> str:
+    lines = before.splitlines(keepends=True)
+    try:
+        start = int(line_start)
+        end = int(line_end)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("replace_range/delete_range require integer line_start and line_end") from exc
+    if start < 1 or end < start or end > len(lines):
+        raise ValueError(f"invalid line range: {line_start}-{line_end}")
+    replacement_lines = replacement.splitlines(keepends=True)
+    if replacement and not replacement.endswith("\n"):
+        replacement_lines = replacement.splitlines(keepends=True)
+    return "".join(lines[: start - 1] + replacement_lines + lines[end:])
+
+
+def _insert_at_line(before: str, line_no: Any, content: str, *, before_line: bool) -> str:
+    lines = before.splitlines(keepends=True)
+    try:
+        anchor = int(line_no)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("insert_before/insert_after require line_start or unique old_text") from exc
+    if anchor < 1 or anchor > len(lines):
+        raise ValueError(f"invalid insert anchor line: {line_no}")
+    idx = anchor - 1 if before_line else anchor
+    return "".join(lines[:idx] + _normalize_insert_content(content) + lines[idx:])
+
+
+def _insert_at_text(before: str, old_text: str, content: str, *, before_text: bool) -> str:
+    count = before.count(old_text)
+    if count != 1:
+        raise ValueError(f"old_text must match exactly once for unique insert anchor; matched {count}")
+    idx = before.index(old_text)
+    insert_idx = idx if before_text else idx + len(old_text)
+    return before[:insert_idx] + content + before[insert_idx:]
+
+
+def _apply_simple_unified_patch(before: str, patch: str) -> str:
+    """Apply a single-file unified diff without shelling out."""
+    lines = before.splitlines(keepends=True)
+    patch_lines = patch.splitlines(keepends=True)
+    output: List[str] = []
+    src_index = 0
+    i = 0
+    while i < len(patch_lines):
+        line = patch_lines[i]
+        if not line.startswith("@@"):
+            i += 1
+            continue
+        header = line
+        try:
+            old_range = header.split()[1]
+            old_start = int(old_range[1:].split(",", 1)[0])
+        except (IndexError, ValueError) as exc:
+            raise ValueError(f"invalid unified diff hunk header: {header.strip()}") from exc
+        hunk_start = max(old_start - 1, 0)
+        if hunk_start < src_index:
+            raise ValueError("overlapping unified diff hunks are not supported")
+        output.extend(lines[src_index:hunk_start])
+        src_index = hunk_start
+        i += 1
+        while i < len(patch_lines) and not patch_lines[i].startswith("@@"):
+            hunk_line = patch_lines[i]
+            marker = hunk_line[:1]
+            body = hunk_line[1:]
+            if marker == " ":
+                if src_index >= len(lines) or lines[src_index] != body:
+                    raise ValueError("unified diff context does not match file")
+                output.append(lines[src_index])
+                src_index += 1
+            elif marker == "-":
+                if src_index >= len(lines) or lines[src_index] != body:
+                    raise ValueError("unified diff removal does not match file")
+                src_index += 1
+            elif marker == "+":
+                output.append(body)
+            elif marker == "\\":
+                pass
+            else:
+                raise ValueError(f"unsupported unified diff line: {hunk_line.rstrip()}")
+            i += 1
+    output.extend(lines[src_index:])
+    return "".join(output)
+
+
+def _edit_file_content(action: Dict[str, Any], before: str) -> str:
+    operation = action.get("operation")
+    if operation == "replace_file":
+        return action.get("content", "")
+    if operation == "replace_text":
+        old_text = action.get("old_text", "")
+        count = before.count(old_text)
+        if not old_text or count != 1:
+            raise ValueError(f"old_text must match exactly once for unique replacement; matched {count}")
+        return before.replace(old_text, action.get("new_text", ""), 1)
+    if operation == "replace_range":
+        return _replace_lines(before, action.get("line_start"), action.get("line_end"), action.get("content", ""))
+    if operation == "delete_range":
+        return _replace_lines(before, action.get("line_start"), action.get("line_end"), "")
+    if operation == "insert_before":
+        if action.get("old_text"):
+            return _insert_at_text(before, action["old_text"], action.get("content", ""), before_text=True)
+        return _insert_at_line(before, action.get("line_start"), action.get("content", ""), before_line=True)
+    if operation == "insert_after":
+        if action.get("old_text"):
+            return _insert_at_text(before, action["old_text"], action.get("content", ""), before_text=False)
+        return _insert_at_line(before, action.get("line_start"), action.get("content", ""), before_line=False)
+    if operation == "apply_patch":
+        return _apply_simple_unified_patch(before, action.get("content", ""))
+    raise ValueError(f"unsupported edit_file operation: {operation}")
+
+
+def _execute_edit_file(
+    action: Dict[str, Any],
+    work_dir: str,
+    read_file_func,
+    write_file_func,
+    workspace_root: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not workspace_root:
+        return {"type": "edit_file", "success": False, "error": "workspace tools are not available"}
+
+    raw_path = action.get("file_path", "")
+    try:
+        path = _resolve_workspace_path(raw_path, workspace_root, work_dir)
+        before = read_file_func(str(path))
+        if isinstance(before, str) and before.startswith("Error reading file:"):
+            before = ""
+        after = _edit_file_content(action, before)
+        changed = before != after
+        ok = True
+        err = ""
+        if changed:
+            ok, err = write_file_func(str(path), after)
+        rel_path = _workspace_relative(path, workspace_root)
+        return {
+            "type": "edit_file",
+            "success": ok,
+            "path": rel_path,
+            "file_path": str(path),
+            "operation": action.get("operation"),
+            "changed": changed,
+            "diff": _make_unified_diff(rel_path, before, after),
+            "line_delta": _line_count(after) - _line_count(before),
+            "sha256_before": _sha256_text(before),
+            "sha256_after": _sha256_text(after),
+            "error": err if not ok else None,
+        }
+    except Exception as exc:
+        return {
+            "type": "edit_file",
+            "success": False,
+            "path": raw_path,
+            "operation": action.get("operation"),
+            "error": str(exc),
+        }
+
+
+def _execute_complete_stage(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Record an explicit stage completion request for workflow gates."""
+    return {
+        "type": "complete_stage",
+        "success": True,
+        "summary": action.get("summary", ""),
+        "evidence": action.get("evidence", []),
     }
 
 

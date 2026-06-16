@@ -129,8 +129,17 @@ Optional endpoint and model overrides:
 ```bash
 CHISELLMFV_LLM_BASE_URL=<optional-api-base-url>
 CHISELLMFV_LLM_MODEL=<optional-model-name>
+CHISELLMFV_LLM_MODEL_PRO=<optional-main-agent-model>
+CHISELLMFV_LLM_MODEL_FLASH=<optional-compaction-and-classification-model>
 CHISELLMFV_LLM_EXTRA_BODY=<optional-json-extra-body>
 ```
+
+`CHISELLMFV_LLM_MODEL` remains the single-model fallback. When
+`CHISELLMFV_LLM_MODEL_PRO` and `CHISELLMFV_LLM_MODEL_FLASH` are set, the
+workflow routes stage agent loops, source edits, completion decisions,
+diagnosis, and repairs to the PRO model. FLASH is reserved for low-risk helper
+work such as context compaction, retrieval assistance, tool-result summaries,
+lint-style checks, and failure preclassification.
 
 If a native wheel is unavailable, activate the environment and use the source
 fallbacks:

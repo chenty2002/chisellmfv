@@ -39,7 +39,8 @@ def _exit(llm_client, logger, success: bool):
 
 def main_formal(args):
     """运行五阶段形式化验证工作流"""
-    from src.core.llm_client import LLMClient, TokenBudgetExceeded
+    from src.core.llm_client import TokenBudgetExceeded
+    from src.core.llm_router import LLMRouter
     from src.core.workflow import FormalWorkflow
     from src.utils.logger import get_logger
     from src.core.tool_schemas import FORMAL_STAGES
@@ -63,7 +64,7 @@ def main_formal(args):
 
     # 创建 LLM 客户端
     max_tokens = getattr(args, 'max_tokens', None)
-    llm_client = LLMClient(max_token_budget=max_tokens)
+    llm_client = LLMRouter(max_token_budget=max_tokens, logger=logger)
     if max_tokens:
         logger.info(f"Token budget set to {max_tokens}")
 

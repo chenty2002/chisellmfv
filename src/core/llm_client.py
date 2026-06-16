@@ -48,7 +48,8 @@ class LLMClient:
                  reranker_url: Optional[str] = None,
                  embedding_model: Optional[str] = None,
                  reranker_model: Optional[str] = None,
-                 llm_extra_body: Optional[Dict[str, Any]] = None):
+                 llm_extra_body: Optional[Dict[str, Any]] = None,
+                 model_role: Optional[str] = None):
         """
         Initialize the LLM client.
 
@@ -62,10 +63,12 @@ class LLMClient:
             llm_url / embedding_url / reranker_url: Optional endpoint overrides
             embedding_model / reranker_model: Optional model overrides
             llm_extra_body: Optional extra request fields for chat completion API
+            model_role: Optional logical role for usage attribution
         """
         overrides = get_endpoint_overrides()
 
         self.model = model or overrides["llm_model"] or LLM_MODEL
+        self.model_role = model_role
         self.embedding_model = (
             embedding_model or overrides["embedding_model"] or EMBEDDING_MODEL
         )
@@ -416,9 +419,18 @@ class LLMClient:
         """Aggregate LLM usage by stage/prompt/tool key for benchmark analysis."""
         metadata = dict(request_metadata or {})
         metadata.setdefault("model", self.model)
+        if self.model_role:
+            metadata.setdefault("model_role", self.model_role)
         key_parts = [
             f"{name}={metadata[name]}"
-            for name in ("stage", "target", "prompt_version", "tool_schema_hash", "model")
+            for name in (
+                "stage",
+                "target",
+                "prompt_version",
+                "tool_schema_hash",
+                "model_role",
+                "model",
+            )
             if metadata.get(name)
         ]
         key = "|".join(key_parts) if key_parts else "unlabeled"

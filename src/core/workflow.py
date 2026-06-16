@@ -25,6 +25,7 @@ from typing import List, Dict, Any, Optional
 import logging
 
 from .llm_client import LLMClient, TokenBudgetExceeded
+from .llm_router import LLMRouter
 from ..utils.llm_properties import MAX_ITERATIONS, WAVEFORM_MAX_ITER
 from ..utils.llm_logging import LLMLogger
 from ..utils.file_utils import *
@@ -37,6 +38,12 @@ from .prompt_builder import (
     build_compilation_error_message
 )
 from .context_manager import EvidenceNotebook, compact_messages_with_notebook
+from .escape_policy import EscapePolicy
+from .records import (
+    build_run_cost_summary,
+    make_stage_event,
+    normalize_stage_result,
+)
 try:
     from .waveform_actions import WaveformActions
 except ModuleNotFoundError:
@@ -80,7 +87,7 @@ class FormalWorkflow:
     
     def __init__(
         self,
-        llm_client: LLMClient,
+        llm_client: Optional[Any],
         chisel_dir: str,
         workspace_dir: str,
         logger: logging.Logger,
@@ -606,8 +613,7 @@ class FormalWorkflow:
             and "no_waveform_notebook" not in self.ablation_modes
             else None
         )
-        self._repeated_tool_call_counts: Dict[str, int] = {}
-        self._repeated_tool_call_notified: set = set()
+        self.escape_policy = EscapePolicy()
         
         # Capture initial snapshot for benchmark targets (for reset functionality)
         self._stage_snapshot = capture_stage_snapshot(self.work_dir, self.logger)
@@ -668,9 +674,11 @@ class FormalWorkflow:
             self._log_llm_request(stage, i, [messages[0], messages[-1]], tool_schemas)
             
             # Use chat_with_tools for agent loop style API call
-            response = self.llm.chat_with_tools(
+            response = self._chat_with_stage_model(
                 messages,
                 tool_schemas,
+                stage=stage,
+                task_type="stage_loop",
                 prompt_cache_key=cache_metadata["prompt_cache_key"],
                 usage_metadata=cache_metadata,
             )
@@ -739,6 +747,37 @@ class FormalWorkflow:
             "prompt_version": PROMPT_VERSION,
             "tool_schema_hash": tool_hash,
         }
+
+    def _chat_with_stage_model(
+        self,
+        messages: List[Dict[str, Any]],
+        tool_schemas: List[Dict[str, Any]],
+        *,
+        stage: str,
+        task_type: str,
+        prompt_cache_key: Optional[str],
+        usage_metadata: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """Call either LLMRouter or a legacy single LLMClient."""
+        metadata = dict(usage_metadata)
+        if isinstance(self.llm, LLMRouter):
+            return self.llm.chat_with_tools(
+                messages,
+                tool_schemas,
+                stage=stage,
+                task_type=task_type,
+                prompt_cache_key=prompt_cache_key,
+                usage_metadata=metadata,
+            )
+        if self.llm is None:
+            raise ValueError("LLM client is not configured for model-backed stage execution")
+        metadata.setdefault("model_role", getattr(self.llm, "model_role", None) or "pro")
+        return self.llm.chat_with_tools(
+            messages,
+            tool_schemas,
+            prompt_cache_key=prompt_cache_key,
+            usage_metadata=metadata,
+        )
     
     def _build_initial_messages(
         self,
@@ -842,13 +881,14 @@ class FormalWorkflow:
             )
             messages.append(tool_message)
 
-        # Detect and discourage repeated no-progress tool calls
+        # Detect and discourage no-progress tool loops through the escape policy.
         self._handle_repeated_tool_calls(stage, function_calls, action_results, messages)
         
-        # Check for stage completion
+        # Check for stage completion. CoupledL2 uses an explicit complete_stage
+        # tool; legacy benchmark paths may still set stage_complete on write tools.
         for fc in function_calls:
             args = fc.get("arguments", {})
-            if args.get("stage_complete", False):
+            if fc.get("name") == "complete_stage" or args.get("stage_complete", False):
                 result = self._handle_stage_completion(
                     args, stage, context, iterations, iteration_count, messages
                 )
@@ -890,76 +930,29 @@ class FormalWorkflow:
         action_results: List[Dict[str, Any]],
         messages: List[Dict[str, Any]],
     ) -> None:
-        """Inject guidance when the model repeats identical no-progress tool calls."""
-        if "no_repeated_waveform_guard" in self.ablation_modes:
-            return
-        if stage != "waveform_explanation":
-            return
+        """Inject guidance when the escape policy detects no-progress behavior."""
+        if not hasattr(self, "escape_policy"):
+            self.escape_policy = EscapePolicy()
 
-        for fc, result in zip(function_calls, action_results):
-            if fc.get("name") != "waveform_get_signal_value":
+        actions = self.escape_policy.observe(
+            stage=stage,
+            function_calls=function_calls,
+            action_results=action_results,
+            messages=messages,
+        )
+        for action in actions:
+            if action.action_type != "nudge":
                 continue
-
-            args = fc.get("arguments", {}) or {}
-            if "signal_names" not in args and "signal_name" in args:
-                normalized_args = {
-                    "signal_names": [args.get("signal_name")],
-                    "times": [args.get("time", 0)]
-                }
-            else:
-                normalized_args = {
-                    "signal_names": args.get("signal_names", []),
-                    "times": args.get("times", [])
-                }
-
-            progress_signature = {
-                "value": result.get("value"),
-                "resolved_name": result.get("resolved_name"),
-                "error": result.get("error"),
-                "failed_count": result.get("failed_count", 0),
-            }
-
-            repeat_key = json.dumps(
-                {
-                    "tool": fc.get("name"),
-                    "args": normalized_args,
-                    "progress": progress_signature,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-
-            count = self._repeated_tool_call_counts.get(repeat_key, 0) + 1
-            self._repeated_tool_call_counts[repeat_key] = count
-
-            if count < 3 or repeat_key in self._repeated_tool_call_notified:
+            if (
+                action.metadata.get("rule") == "repeated_waveform_value"
+                and "no_repeated_waveform_guard" in self.ablation_modes
+            ):
                 continue
-
-            self._repeated_tool_call_notified.add(repeat_key)
             self.logger.warning(
-                "Detected repeated waveform_get_signal_value call with no progress. "
-                "Injecting guidance to switch strategy."
+                "Escape policy nudge triggered: %s",
+                action.metadata.get("rule", "unknown"),
             )
-
-            hints = []
-            if result.get("suggestions"):
-                hints.append(
-                    "Candidates: " + ", ".join(result.get("suggestions", [])[:5])
-                )
-
-            guidance = (
-                "You are repeating the same `waveform_get_signal_value` query with the same outcome. "
-                "Stop repeating it. First call `waveform_find_signals` with a focused pattern, then use the exact "
-                "returned signal name (including bit-range suffix like ` [15:0]` when present). "
-                "If the exact signal cannot be resolved after one retry, move on to other relevant signals and continue the analysis."
-            )
-            if hints:
-                guidance += "\n\n" + "\n".join(hints)
-
-            messages.append({
-                "role": "user",
-                "content": guidance
-            })
+            messages.append({"role": "user", "content": action.message})
     
     def _handle_stage_completion(
         self,
@@ -1181,7 +1174,22 @@ class FormalWorkflow:
         if stage_dir is None or self.run_context is None:
             return
 
-        self._write_json(stage_dir / "stage_result.json", stage_result)
+        normalized_stage_result = normalize_stage_result(stage, stage_result)
+        self._write_json(stage_dir / "stage_result.json", normalized_stage_result)
+        self._append_jsonl(
+            stage_dir / "stage_events.jsonl",
+            make_stage_event(
+                event="stage_result",
+                stage=stage,
+                success=bool(workflow_result.get("success")),
+                artifact="stage_result.json",
+                data={
+                    "summary": stage_result.get("summary"),
+                    "schema_version": normalized_stage_result.get("schema_version"),
+                },
+            ),
+        )
+        self._write_run_cost_summary()
 
         if stage == "invoke_verification":
             formal = stage_result.get("jaspergold_result") or stage_result.get("formal_result")
@@ -1197,13 +1205,37 @@ class FormalWorkflow:
 
         if stage == "propose_bugfix" or workflow_result.get("success") is False:
             final = {
+                "schema_version": "final_result.v1",
                 "stage": stage,
                 "success": bool(workflow_result.get("success")),
-                "stage_result": stage_result,
+                "stage_result": normalized_stage_result,
                 "run_dir": str(self.run_context.run_dir),
                 "case_name": self.run_context.config.case_name,
             }
             self._write_json(self.run_context.results_dir / "final_result.json", final)
+            self._append_jsonl(
+                stage_dir / "stage_events.jsonl",
+                make_stage_event(
+                    event="final_result",
+                    stage=stage,
+                    success=bool(workflow_result.get("success")),
+                    artifact="../../final_result.json",
+                ),
+            )
+
+    def _write_run_cost_summary(self) -> None:
+        """Persist token/cost metrics if the configured LLM exposes usage."""
+        if self.run_context is None or not hasattr(self.llm, "get_token_usage"):
+            return
+        try:
+            usage = self.llm.get_token_usage()
+        except Exception as exc:
+            self.logger.warning(f"Failed to collect run cost summary: {exc}")
+            return
+        self._write_json(
+            self.run_context.results_dir / "run_cost_summary.json",
+            build_run_cost_summary(usage),
+        )
 
     def _write_coupledl2_diagnosis(self, args: Dict[str, Any], result: Dict[str, Any]) -> None:
         """Write the stage-4 machine-readable diagnosis artifact."""
@@ -1260,3 +1292,9 @@ class FormalWorkflow:
             json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    @staticmethod
+    def _append_jsonl(path: Path, value: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
