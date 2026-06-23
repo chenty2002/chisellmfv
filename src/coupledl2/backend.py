@@ -35,7 +35,7 @@ class CoupledL2BuildOperations:
         self.build_contract = self._load_json(workspace.indexes_dir / "build_contract.json")
 
     def run_make(self, target: Optional[str] = None) -> Tuple[bool, str]:
-        """Compatibility wrapper used by legacy stage completion checks."""
+        """Run the configured CoupledL2 build target and return a compact status tuple."""
         result = self.run_build_only(target=target)
         return bool(result.get("success")), str(result.get("output") or result.get("error") or "")
 

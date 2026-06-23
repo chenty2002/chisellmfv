@@ -586,10 +586,6 @@ def execute_waveform_action(action: Dict[str, Any], waveform_actions: WaveformAc
         elif action_type == "waveform_get_signal_value":
             signal_names = action.get("signal_names", [])
             times = action.get("times", [])
-            # Backward compatibility: accept legacy single-signal format
-            if not signal_names and "signal_name" in action:
-                signal_names = [action["signal_name"]]
-                times = [action.get("time", 0)]
             batch_result = waveform_actions.get_signal_values_at_times(signal_names, times)
             if "error" in batch_result:
                 result["error"] = batch_result["error"]

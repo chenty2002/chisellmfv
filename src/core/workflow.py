@@ -40,6 +40,8 @@ from .prompt_builder import (
 from .context_manager import EvidenceNotebook, compact_messages_with_notebook
 from .escape_policy import EscapePolicy
 from .records import (
+    OPERATION_SCHEMA_VERSION,
+    STAGE_HANDOFF_SCHEMA_VERSION,
     build_run_cost_summary,
     make_stage_event,
     normalize_stage_result,
@@ -49,8 +51,7 @@ try:
 except ModuleNotFoundError:
     WaveformActions = None
 from .tool_schemas import get_tool_schemas, convert_tool_call_to_action
-from .actions import execute_stage_actions
-from .build_operations import BuildOperations
+from .actions import execute_stage_actions, _resolve_workspace_path, _workspace_relative
 from ..coupledl2.backend import CoupledL2BuildOperations
 from .repair_loop import (
     DEFAULT_MAX_REPAIR_ROUNDS,
@@ -81,8 +82,7 @@ class FormalWorkflow:
     Each call to process_task() runs exactly ONE stage.
     For full workflow, the caller (e.g., main.py) should invoke each stage sequentially.
     
-    Supports targets:
-    - '<benchmark_name>': Any benchmark in chisel/extra_bench/<benchmark_name>/
+    Supports CoupledL2 run configurations only.
     """
     
     def __init__(
@@ -109,7 +109,7 @@ class FormalWorkflow:
             logger: Logger instance
             waveform_path: Path to counterexample waveform (for waveform stage)
             stage: Which stage to run (single stage only)
-            target: Verification target (benchmark name like 'gigamax', 'philo')
+            target: CoupledL2 case label used in logs and prompt metadata
             ablation_modes: Optional experiment switches that disable selected
                 workflow mechanisms for controlled ablation studies.
         """
@@ -127,6 +127,9 @@ class FormalWorkflow:
         self.coupledl2_config = coupledl2_config
         self.run_context: Optional[CoupledL2Workspace] = None
         self.stage_context: Optional[StageContext] = None
+
+        if self.coupledl2_config is None:
+            raise ValueError("FormalWorkflow now requires a CoupledL2RunConfig")
         
         # Initialize paths based on target
         self._init_paths()
@@ -139,39 +142,18 @@ class FormalWorkflow:
     
     def _init_paths(self) -> None:
         """Initialize directory paths based on target."""
-        if self.coupledl2_config is not None:
-            self.run_context = create_coupledl2_workspace(self.coupledl2_config)
-            self.work_dir = str(self.run_context.case_workspace)
-            self.verify_src_dir = str(self.run_context.case_workspace / "Chisel")
-            self.generated_dir = str(self.run_context.case_workspace / "Chisel" / "generated")
-            self.verilog_dir = str(self.run_context.case_workspace / "Verilog")
-            self._allowed_write_dirs = [self.work_dir]
-            return
-
-        # For benchmark targets: work in chisel/extra_bench/<benchmark_name> directory
-        self.work_dir = os.path.join(self.chisel_dir, "extra_bench", self.target)
-        self.verify_src_dir = self.work_dir
-        self.generated_dir = os.path.join(self.work_dir, "generated")
-        self.verilog_dir = os.path.join(self.workspace_dir, "verilog", "extra_bench", self.target)
-
-        # Build allowed directories list for file writing
-        self._allowed_write_dirs = [self.verify_src_dir]
+        self.run_context = create_coupledl2_workspace(self.coupledl2_config)
+        self.work_dir = str(self.run_context.case_workspace)
+        self.verify_src_dir = str(self.run_context.case_workspace / "Chisel")
+        self.generated_dir = str(self.run_context.case_workspace / "Chisel" / "generated")
+        self.verilog_dir = str(self.run_context.case_workspace / "Verilog")
+        self._allowed_write_dirs = [self.work_dir]
     
     def _init_helpers(self) -> None:
         """Initialize helper classes for build operations."""
-        if self.run_context is not None:
-            self.build_ops = CoupledL2BuildOperations(
-                workspace=self.run_context,
-                logger=self.logger,
-            )
-            return
-
-        self.build_ops = BuildOperations(
-            chisel_dir=self.chisel_dir,
-            work_dir=self.work_dir,
-            generated_dir=self.generated_dir,
-            verilog_dir=self.verilog_dir,
-            workspace_dir=self.workspace_dir,
+        assert self.run_context is not None
+        self.build_ops = CoupledL2BuildOperations(
+            workspace=self.run_context,
             logger=self.logger,
         )
     
@@ -186,29 +168,6 @@ class FormalWorkflow:
                 self.waveform_actions = WaveformActions(self.waveform_path)
             except Exception as e:
                 self.logger.error(f"Failed to initialize waveform actions: {e}")
-    
-    def reset_stage(self, reason: str = "") -> Dict[str, Any]:
-        """
-        Reset the stage to its initial state by restoring the snapshot.
-        
-        Args:
-            reason: Description of why reset is needed
-            
-        Returns:
-            Dictionary with reset operation result
-        """
-        if not hasattr(self, '_stage_snapshot') or not self._stage_snapshot:
-            return {
-                "success": False,
-                "error": "No stage snapshot available"
-            }
-        
-        return restore_stage_snapshot(
-            self.work_dir, 
-            self._stage_snapshot, 
-            reason, 
-            self.logger
-        )
     
     def get_work_dir_files(self) -> List[str]:
         """
@@ -233,7 +192,6 @@ class FormalWorkflow:
             env_info["coupledl2"] = self._coupledl2_environment()
         
         env_info["work_dir"] = self.work_dir
-        env_info["benchmark"] = self.target
         
         context = {
             "user_query": user_query,
@@ -245,14 +203,6 @@ class FormalWorkflow:
             "stage_results": {},
         }
 
-        harness_candidates = []
-        for candidate in ("TestTop.scala", "Main.scala"):
-            candidate_path = os.path.join(self.work_dir, candidate)
-            if os.path.exists(candidate_path):
-                harness_candidates.append(candidate_path)
-        if harness_candidates:
-            context["existing_harness_files"] = harness_candidates
-        
         if self.waveform_path:
             context["environment"]["waveform_path"] = self.waveform_path
             if self.waveform_actions and self.waveform_actions.metadata:
@@ -561,6 +511,7 @@ class FormalWorkflow:
             ablation_modes=sorted(self.ablation_modes),
             max_repair_rounds=self.max_repair_rounds,
             initial_verification_result=self.last_verification_result,
+            coupledl2_config=self.coupledl2_config,
         )
         result = workflow.process_task(
             "Analyze the selected post-repair counterexample for the next repair round."
@@ -615,21 +566,12 @@ class FormalWorkflow:
         )
         self.escape_policy = EscapePolicy()
         
-        # Capture initial snapshot for benchmark targets (for reset functionality)
-        self._stage_snapshot = capture_stage_snapshot(self.work_dir, self.logger)
-        self.logger.info(f"Captured stage snapshot: {list(self._stage_snapshot.keys())}")
-        
         tool_schemas = get_tool_schemas(
             stage,
             target=self.target,
             coupledl2=self.run_context is not None,
         )
         cache_metadata = self._build_prompt_cache_metadata(stage, tool_schemas)
-        
-        # Load Scala sources for initial prompt
-        scala_for_prompt = None
-        if stage != "invoke_verification":
-            scala_for_prompt = load_files_from_directory(self.work_dir, ".scala", self.logger)
         
         # Load analysis report for propose_bugfix stage
         analysis_report = self._load_analysis_report(stage)
@@ -668,7 +610,7 @@ class FormalWorkflow:
                 self.logger.warning(f"Causal analysis failed to run: {e}")
 
         # Build initial message history
-        messages = self._build_initial_messages(context, stage, scala_for_prompt, analysis_report)
+        messages = self._build_initial_messages(context, stage, None, analysis_report)
         
         for i in range(1, max_iterations + 1):
             self._log_llm_request(stage, i, [messages[0], messages[-1]], tool_schemas)
@@ -692,7 +634,7 @@ class FormalWorkflow:
                     )
                     iteration_count = result["iteration_count"]
                     
-                    if result.get("stage_complete"):
+                    if result.get("completed"):
                         return result["result"]
 
                     self._maybe_compact_waveform_context(
@@ -758,7 +700,7 @@ class FormalWorkflow:
         prompt_cache_key: Optional[str],
         usage_metadata: Dict[str, str],
     ) -> Dict[str, Any]:
-        """Call either LLMRouter or a legacy single LLMClient."""
+        """Call either LLMRouter or a single LLMClient."""
         metadata = dict(usage_metadata)
         if isinstance(self.llm, LLMRouter):
             return self.llm.chat_with_tools(
@@ -787,16 +729,13 @@ class FormalWorkflow:
         analysis_report: Optional[str]
     ) -> List[Dict[str, Any]]:
         """Build initial message list for the agent loop."""
-        # Get work_dir files list for benchmark targets
-        work_dir_files = None
-        
         # System prompt - stage-specific instructions
         system_prompt = build_system_prompt(
             stage=stage,
             target=self.target,
             chisel_dir=self.chisel_dir,
             workspace_dir=self.workspace_dir,
-            work_dir_files=work_dir_files,
+            work_dir_files=None,
         )
         
         # User prompt - task description and context
@@ -884,22 +823,21 @@ class FormalWorkflow:
         # Detect and discourage no-progress tool loops through the escape policy.
         self._handle_repeated_tool_calls(stage, function_calls, action_results, messages)
         
-        # Check for stage completion. CoupledL2 uses an explicit complete_stage
-        # tool; legacy benchmark paths may still set stage_complete on write tools.
+        # CoupledL2 stages complete only through the explicit complete_stage tool.
         for fc in function_calls:
             args = fc.get("arguments", {})
-            if fc.get("name") == "complete_stage" or args.get("stage_complete", False):
+            if fc.get("name") == "complete_stage":
                 result = self._handle_stage_completion(
                     args, stage, context, iterations, iteration_count, messages
                 )
                 if result:
                     return {
-                        "stage_complete": True,
+                        "completed": True,
                         "result": result,
                         "iteration_count": iteration_count,
                     }
         
-        return {"stage_complete": False, "iteration_count": iteration_count}
+        return {"completed": False, "iteration_count": iteration_count}
 
     def _maybe_compact_waveform_context(
         self,
@@ -980,7 +918,6 @@ class FormalWorkflow:
 
         if (
             stage == "propose_bugfix"
-            and args.get("stage_complete", False)
             and error_type == "assertion_error"
             and "homologous_assertions" not in args
         ):
@@ -988,8 +925,8 @@ class FormalWorkflow:
                 "role": "user",
                 "content": (
                     "For an `assertion_error` repair you must inspect and report homologous assertions. "
-                    "Call `write_fix` again with `homologous_assertions` listing every structurally identical "
-                    "assertion repaired, or an empty list only if none exist."
+                    "Call `complete_stage` again with `homologous_assertions` listing every structurally "
+                    "identical assertion repaired, or an empty list only if none exist."
                 ),
             })
             return None
@@ -1135,17 +1072,171 @@ class FormalWorkflow:
             
     def _execute_stage_actions(self, actions: List[Dict[str, Any]], stage: str) -> List[Dict[str, Any]]:
         """Execute actions for the current stage."""
-        return execute_stage_actions(
+        edit_snapshots = self._capture_edit_snapshots(actions)
+        results = execute_stage_actions(
             actions=actions,
             work_dir=self.work_dir,
             waveform_actions=self.waveform_actions,
             causal_actions=self.causal_actions,
             read_file_func=self.read_file,
             write_file_func=self.write_file,
-            reset_stage_func=self.reset_stage,
             logger=self.logger,
             workspace_root=str(self.run_context.workspace_dir) if self.run_context is not None else None,
         )
+        self._record_stage_operations(stage, actions, results, edit_snapshots)
+        return results
+
+    def _capture_edit_snapshots(self, actions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """Capture pre-edit content for lazy source snapshots."""
+        if self.run_context is None:
+            return {}
+        snapshots: Dict[str, Dict[str, Any]] = {}
+        workspace_root = str(self.run_context.workspace_dir)
+        for action in actions:
+            if action.get("type") != "edit_file":
+                continue
+            raw_path = str(action.get("file_path", ""))
+            try:
+                path = _resolve_workspace_path(raw_path, workspace_root, self.work_dir)
+                rel_path = _workspace_relative(path, workspace_root)
+                if rel_path in snapshots:
+                    continue
+                content = path.read_bytes() if path.exists() else b""
+                snapshots[rel_path] = {
+                    "path": path,
+                    "content": content,
+                    "manifest": self._file_manifest(path, content=content),
+                }
+            except Exception as exc:
+                self.logger.warning(f"Failed to capture pre-edit snapshot for {raw_path}: {exc}")
+        return snapshots
+
+    def _record_stage_operations(
+        self,
+        stage: str,
+        actions: List[Dict[str, Any]],
+        results: List[Dict[str, Any]],
+        edit_snapshots: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Append tool operations and lazy edit snapshots to the stage ledger."""
+        stage_dir = self._coupledl2_stage_dir(stage)
+        if stage_dir is None or self.run_context is None:
+            return
+
+        operations_path = stage_dir / "operations.jsonl"
+        existing_count = self._jsonl_line_count(operations_path)
+        for offset, (action, result) in enumerate(zip(actions, results), start=1):
+            sequence = existing_count + offset
+            tool = str(result.get("type") or action.get("type") or "unknown")
+            operation = {
+                "schema_version": OPERATION_SCHEMA_VERSION,
+                "kind": "tool_result",
+                "stage": stage,
+                "iteration": int(action.get("_iteration", 0) or 0),
+                "sequence": sequence,
+                "tool": tool,
+                "success": bool(result.get("success", False)),
+                "action": self._compact_action_for_record(action),
+                "metrics": result.get("metrics", {}),
+                "artifacts": dict(result.get("artifacts", {})),
+            }
+            if result.get("error"):
+                operation["error"] = result.get("error")
+            if tool == "edit_file" and result.get("changed"):
+                self._record_edit_snapshot(stage_dir, operation, result, edit_snapshots, sequence)
+            self._append_jsonl(operations_path, operation)
+            self._append_jsonl(
+                stage_dir / "stage_events.jsonl",
+                make_stage_event(
+                    event="tool_result",
+                    stage=stage,
+                    success=bool(result.get("success", False)),
+                    iteration=operation["iteration"],
+                    tool=tool,
+                    artifact="operations.jsonl",
+                    data={"sequence": sequence},
+                ),
+            )
+
+    def _record_edit_snapshot(
+        self,
+        stage_dir: Path,
+        operation: Dict[str, Any],
+        result: Dict[str, Any],
+        edit_snapshots: Dict[str, Dict[str, Any]],
+        sequence: int,
+    ) -> None:
+        rel_path = result.get("path")
+        if not rel_path:
+            return
+        before = edit_snapshots.get(rel_path)
+        after_path = Path(result.get("file_path", ""))
+        if not before or not after_path.exists():
+            return
+
+        before_snapshot = stage_dir / "source_snapshot" / "before" / rel_path
+        after_snapshot = stage_dir / "source_snapshot" / "after" / rel_path
+        before_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        after_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        before_snapshot.write_bytes(before["content"])
+        after_content = after_path.read_bytes()
+        after_snapshot.write_bytes(after_content)
+
+        diff_artifact = f"diffs/iter_{operation['iteration']:03d}_edit_file_{sequence:03d}.patch"
+        diff_path = stage_dir / diff_artifact
+        diff_path.parent.mkdir(parents=True, exist_ok=True)
+        diff_path.write_text(str(result.get("diff", "")), encoding="utf-8")
+
+        operation["artifacts"]["before_snapshot"] = str(
+            before_snapshot.relative_to(stage_dir).as_posix()
+        )
+        operation["artifacts"]["after_snapshot"] = str(
+            after_snapshot.relative_to(stage_dir).as_posix()
+        )
+        operation["artifacts"]["diff_artifact"] = diff_artifact
+        self._merge_snapshot_manifest(
+            stage_dir / "snapshot_manifest_before.json",
+            rel_path,
+            before["manifest"],
+        )
+        self._merge_snapshot_manifest(
+            stage_dir / "snapshot_manifest_after.json",
+            rel_path,
+            self._file_manifest(after_path, content=after_content),
+        )
+
+    def _compact_action_for_record(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep operation records useful without duplicating large edit payloads."""
+        compact: Dict[str, Any] = {}
+        for key in ("type", "file_path", "operation", "reason", "line_start", "line_end", "pattern", "path"):
+            if key in action:
+                compact[key] = action[key]
+        for key in ("content", "old_text", "new_text"):
+            value = action.get(key)
+            if isinstance(value, str):
+                compact[f"{key}_chars"] = len(value)
+        return compact
+
+    def _file_manifest(self, path: Path, *, content: Optional[bytes] = None) -> Dict[str, Any]:
+        data = content if content is not None else (path.read_bytes() if path.exists() else b"")
+        return {
+            "exists": path.exists(),
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+
+    def _merge_snapshot_manifest(self, path: Path, rel_path: str, entry: Dict[str, Any]) -> None:
+        if path.is_file():
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            manifest = {"schema_version": "snapshot_manifest.v1", "files": {}}
+        manifest.setdefault("files", {})[rel_path] = entry
+        self._write_json(path, manifest)
+
+    def _jsonl_line_count(self, path: Path) -> int:
+        if not path.is_file():
+            return 0
+        return len(path.read_text(encoding="utf-8").splitlines())
     
     def read_file(self, file_path: str) -> str:
         return read_file(file_path)
@@ -1176,6 +1267,18 @@ class FormalWorkflow:
 
         normalized_stage_result = normalize_stage_result(stage, stage_result)
         self._write_json(stage_dir / "stage_result.json", normalized_stage_result)
+        handoff = self._build_stage_handoff(stage, normalized_stage_result, workflow_result)
+        self._write_json(stage_dir / "handoff.json", handoff)
+        self._append_jsonl(
+            stage_dir / "stage_events.jsonl",
+            make_stage_event(
+                event="stage_handoff",
+                stage=stage,
+                success=bool(workflow_result.get("success")),
+                artifact="handoff.json",
+                data={"schema_version": handoff.get("schema_version")},
+            ),
+        )
         self._append_jsonl(
             stage_dir / "stage_events.jsonl",
             make_stage_event(
@@ -1222,6 +1325,66 @@ class FormalWorkflow:
                     artifact="../../final_result.json",
                 ),
             )
+
+    def _build_stage_handoff(
+        self,
+        stage: str,
+        stage_result: Dict[str, Any],
+        workflow_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the compact cross-stage contract for downstream stages."""
+        handoff: Dict[str, Any] = {
+            "schema_version": STAGE_HANDOFF_SCHEMA_VERSION,
+            "stage": stage,
+            "success": bool(workflow_result.get("success")),
+            "summary": stage_result.get("summary"),
+            "artifacts": {
+                "stage_result": "stage_result.json",
+                "stage_events": "stage_events.jsonl",
+                "operations": "operations.jsonl",
+            },
+        }
+        if stage in {"build_top_module", "write_assertions", "propose_bugfix"}:
+            handoff["source_snapshot"] = {
+                "before_manifest": "snapshot_manifest_before.json",
+                "after_manifest": "snapshot_manifest_after.json",
+            }
+        if stage == "build_top_module":
+            handoff["build"] = {
+                "generated_files": stage_result.get("generated_files", []),
+                "top_module": stage_result.get("top_module"),
+                "verification_passed": stage_result.get("verification_passed"),
+            }
+        elif stage == "write_assertions":
+            handoff["assertions"] = {
+                "assertion_map": "assertion_map.json",
+                "generated_assertion_scan": "generated_assertion_scan.json",
+                "verification_passed": stage_result.get("verification_passed"),
+            }
+        elif stage == "invoke_verification":
+            handoff["verification"] = {
+                "verification_passed": stage_result.get("verification_passed"),
+                "counterexample_path": stage_result.get("counterexample_path"),
+                "cex_count": stage_result.get("cex_count"),
+                "formal_result": "formal_result.json",
+                "property_status": "property_status.json",
+            }
+        elif stage == "waveform_explanation":
+            handoff["diagnosis"] = {
+                "error_type": stage_result.get("error_type"),
+                "root_cause": stage_result.get("root_cause"),
+                "counterexample_path": stage_result.get("counterexample_path"),
+                "diagnosis": "diagnosis.json",
+                "counterexample_analysis": "counterexample_analysis.md",
+            }
+        elif stage == "propose_bugfix":
+            repair = stage_result.get("repair_loop") or stage_result
+            handoff["repair"] = {
+                "repair_success": repair.get("repair_success") if isinstance(repair, dict) else None,
+                "repair_result": "repair_result.json",
+                "repair_history": "repair_history.json",
+            }
+        return handoff
 
     def _write_run_cost_summary(self) -> None:
         """Persist token/cost metrics if the configured LLM exposes usage."""

@@ -29,9 +29,9 @@ class LLMRouter:
         **client_kwargs: Any,
     ):
         overrides = get_endpoint_overrides()
-        legacy_model = overrides["llm_model"]
-        pro_model = overrides["llm_model_pro"] or legacy_model
-        flash_model = overrides["llm_model_flash"] or legacy_model
+        default_model = overrides["llm_model"]
+        pro_model = overrides["llm_model_pro"] or default_model
+        flash_model = overrides["llm_model_flash"] or default_model
 
         common_kwargs = dict(client_kwargs)
         common_kwargs.setdefault("logger", logger)

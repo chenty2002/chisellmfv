@@ -11,6 +11,9 @@ TOOL_RESULT_SCHEMA_VERSION = "tool_result.v1"
 STAGE_RESULT_SCHEMA_VERSION = "stage_result.v1"
 STAGE_EVENT_SCHEMA_VERSION = "stage_event.v1"
 RUN_COST_SUMMARY_SCHEMA_VERSION = "run_cost_summary.v1"
+OPERATION_SCHEMA_VERSION = "operation.v1"
+STAGE_INPUTS_SCHEMA_VERSION = "stage_inputs.v1"
+STAGE_HANDOFF_SCHEMA_VERSION = "stage_handoff.v1"
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,7 @@ class StageEventRecord:
 
 
 def normalize_tool_result(result: Dict[str, Any]) -> Dict[str, Any]:
-    """Add stable schema, metrics, and artifact fields without dropping legacy keys."""
+    """Add stable schema, metrics, and artifact fields to a tool result."""
     if result.get("schema_version") == TOOL_RESULT_SCHEMA_VERSION:
         return result
 

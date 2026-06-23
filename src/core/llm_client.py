@@ -416,7 +416,7 @@ class LLMClient:
         miss_tokens: int,
         reasoning_tokens: int,
     ) -> None:
-        """Aggregate LLM usage by stage/prompt/tool key for benchmark analysis."""
+        """Aggregate LLM usage by stage/prompt/tool key for run analysis."""
         metadata = dict(request_metadata or {})
         metadata.setdefault("model", self.model)
         if self.model_role:

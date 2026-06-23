@@ -16,6 +16,9 @@ from .indexer import generate_indexes
 from .skills import install_context_assets, stage_rule_paths, stage_skill_paths
 
 
+STAGE_INPUTS_SCHEMA_VERSION = "stage_inputs.v1"
+
+
 COUPLEDL2_STAGES = [
     "build_top_module",
     "write_assertions",
@@ -61,6 +64,7 @@ class StageContext:
         return {
             "stage": self.stage,
             "stage_dir": str(self.stage_dir),
+            "stage_inputs_path": str(self.stage_dir / "stage_inputs.json"),
             "snapshot_dir": str(self.snapshot_dir),
             "skills": [_rel_to_workspace(path, workspace_dir) for path in self.skills],
             "rules": [_rel_to_workspace(path, workspace_dir) for path in self.rules],
@@ -127,6 +131,7 @@ def initialize_stage_context(workspace: CoupledL2Workspace, stage: str) -> Stage
         rules=stage_rule_paths(workspace.workspace_dir, stage),
         context_indexes=context_indexes,
     )
+    _write_stage_inputs(workspace, ctx)
     _append_jsonl(workspace.logs_dir / "events.jsonl", {
         "event": "stage_initialized",
         "stage": stage,
@@ -183,6 +188,37 @@ def _load_stage_indexes(indexes_dir: Path, stage: str) -> Dict[str, Dict[str, An
         name: json.loads((indexes_dir / f"{name}.json").read_text(encoding="utf-8"))
         for name in required
     }
+
+
+def _write_stage_inputs(workspace: CoupledL2Workspace, ctx: StageContext) -> None:
+    """Persist the stable input contract for one stage."""
+    payload = {
+        "schema_version": STAGE_INPUTS_SCHEMA_VERSION,
+        "stage": ctx.stage,
+        "stage_dir": str(ctx.stage_dir),
+        "snapshot_dir": str(ctx.snapshot_dir),
+        "skills": [_rel_to_workspace(path, workspace.workspace_dir) for path in ctx.skills],
+        "rules": [_rel_to_workspace(path, workspace.workspace_dir) for path in ctx.rules],
+        "context_indexes": sorted(ctx.context_indexes.keys()),
+        "previous_stage_handoffs": _load_previous_handoffs(workspace, ctx.stage),
+        "case_name": workspace.config.case_name,
+        "verify_mode": workspace.config.verify_mode,
+        "input_mode": workspace.config.input_mode,
+        "property_category": workspace.config.property_category,
+    }
+    _write_json(ctx.stage_dir / "stage_inputs.json", payload)
+
+
+def _load_previous_handoffs(workspace: CoupledL2Workspace, stage: str) -> List[Dict[str, Any]]:
+    """Load completed handoff records from stages before the current stage."""
+    current_index = COUPLEDL2_STAGES.index(stage)
+    handoffs: List[Dict[str, Any]] = []
+    for index, previous_stage in enumerate(COUPLEDL2_STAGES[:current_index], start=1):
+        path = workspace.results_dir / "by_stage" / f"{index:02d}_{previous_stage}" / "handoff.json"
+        if not path.is_file():
+            continue
+        handoffs.append(json.loads(path.read_text(encoding="utf-8")))
+    return handoffs
 
 
 def _rel_to_workspace(path: Path, workspace_dir: Path) -> str:
