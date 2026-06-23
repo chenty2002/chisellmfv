@@ -373,6 +373,7 @@ def _build_coupledl2_stage_prompt(stage: str) -> list:
             "",
             "## Actions",
             "Read `coupledl2_build.md`, `coupledl2_harness.md`, and the listed rules before editing.",
+            "If the existing VerifyTop harness already matches the build contract and can emit formal RTL, do not edit source files; call `complete_stage` with inspected harness and build evidence.",
             "Use `edit_file` only for focused workspace edits, then call `complete_stage` with build evidence.",
             "",
         ],
