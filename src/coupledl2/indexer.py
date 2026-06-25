@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .config import CoupledL2RunConfig
 
@@ -57,6 +57,7 @@ def build_build_contract(case_workspace: Path, config: CoupledL2RunConfig) -> Di
             "VERIFY_MODE": config.verify_mode,
             "VERIFY_INPUT_MODE": config.input_mode,
         },
+        "chisel": detect_chisel_compatibility(chisel_dir, case_workspace),
         "generated_verilog_globs": [
             "workspace/case/Chisel/generated/**/*.sv",
             "workspace/case/Chisel/generated/**/*.v",
@@ -70,11 +71,13 @@ def build_formal_surface(case_workspace: Path) -> Dict[str, Any]:
     assertion_records: List[Dict[str, Any]] = []
     uses_chiselfv = False
     uses_boring_utils = False
+    uses_ltl = False
 
     for path in sorted(chisel_dir.rglob("*.scala")):
         text = path.read_text(encoding="utf-8", errors="ignore")
         uses_chiselfv = uses_chiselfv or "chiselFv" in text or "Formal." in text
         uses_boring_utils = uses_boring_utils or "BoringUtils" in text
+        uses_ltl = uses_ltl or "chisel3.ltl" in text or "AssertProperty" in text
         for line_no, line in enumerate(text.splitlines(), start=1):
             if _looks_like_assertion(line):
                 assertion_records.append({
@@ -89,6 +92,94 @@ def build_formal_surface(case_workspace: Path) -> Dict[str, Any]:
         "assertions": assertion_records,
         "uses_chiselfv": uses_chiselfv,
         "uses_boring_utils": uses_boring_utils,
+        "uses_ltl": uses_ltl,
+    }
+
+
+def detect_chisel_compatibility(chisel_dir: Path, case_workspace: Path) -> Dict[str, Any]:
+    """Infer the Chisel compatibility family from local build files."""
+    candidates = [
+        chisel_dir / "build.sc",
+        chisel_dir / "common.sc",
+        chisel_dir / "build.sbt",
+    ]
+    detected_from: List[str] = []
+    deps: List[Dict[str, Optional[str]]] = []
+    family = "unknown"
+    version: Optional[str] = None
+    scala_version: Optional[str] = None
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        rel = _rel(path, case_workspace)
+        file_matched = False
+
+        chisel6 = re.search(r'ivy"org\.chipsalliance::chisel:([^"]+)"', text)
+        if chisel6:
+            family = "chisel6"
+            version = chisel6.group(1)
+            deps.append({"organization": "org.chipsalliance", "artifact": "chisel", "version": version})
+            file_matched = True
+
+        chisel3 = re.search(r'ivy"edu\.berkeley\.cs::chisel3:([^"]+)"', text)
+        if chisel3:
+            family = "chisel3"
+            version = chisel3.group(1)
+            deps.append({"organization": "edu.berkeley.cs", "artifact": "chisel3", "version": version})
+            file_matched = True
+
+        default_chisel3 = re.search(r'"chisel3"\s*->\s*"([^"]+)"', text)
+        if default_chisel3 and family == "unknown":
+            family = "chisel3"
+            version = default_chisel3.group(1)
+            deps.append({"organization": "edu.berkeley.cs", "artifact": "chisel3", "version": version})
+            file_matched = True
+
+        scala_literal = re.search(r'override\s+def\s+scalaVersion\s*=\s*"([^"]+)"', text)
+        scala_default = re.search(r'"scala"\s*->\s*"([^"]+)"', text)
+        if scala_literal:
+            scala_version = scala_literal.group(1)
+            file_matched = True
+        elif scala_default:
+            scala_version = scala_default.group(1)
+            file_matched = True
+
+        if file_matched and rel not in detected_from:
+            detected_from.append(rel)
+
+    major_version = _major_version(version)
+    if family == "unknown" and major_version == 3:
+        family = "chisel3"
+    elif family == "unknown" and major_version and major_version >= 6:
+        family = "chisel6"
+
+    assertion_skill = (
+        "skills/chiselfv_chisel3_assertions.md"
+        if family == "chisel3"
+        else "skills/chiselfv_assertions.md"
+    )
+    forbidden_apis = []
+    if family == "chisel3":
+        forbidden_apis = [
+            "chisel3.ltl",
+            "AssertProperty",
+            "Sequence",
+            "fvAssert",
+            "one-argument BoringUtils.bore(source)",
+        ]
+
+    return {
+        "family": family,
+        "version": version,
+        "major_version": major_version,
+        "scala_version": scala_version,
+        "detected_from": detected_from,
+        "dependencies": deps,
+        "assertion_skill": assertion_skill,
+        "forbidden_apis": forbidden_apis,
+        "version_check": "read build.sc/common.sc/build.sbt to choose the versioned assertion skill before choosing assertion APIs",
     }
 
 
@@ -102,6 +193,13 @@ def _select_make_target(config: CoupledL2RunConfig) -> str:
 
 def _looks_like_assertion(line: str) -> bool:
     return bool(re.search(r"\b(assert|assume)\b|Formal\.(assert|assume)", line))
+
+
+def _major_version(version: Optional[str]) -> Optional[int]:
+    if not version:
+        return None
+    match = re.match(r"(\d+)", version)
+    return int(match.group(1)) if match else None
 
 
 def _rel(path: Path, case_workspace: Path) -> str:

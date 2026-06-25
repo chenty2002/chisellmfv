@@ -37,7 +37,7 @@ from .prompt_builder import (
     build_tool_result_message,
     build_compilation_error_message
 )
-from .context_manager import EvidenceNotebook, compact_messages_with_notebook
+from .context_manager import EvidenceNotebook, StageNotebook, compact_messages_with_notebook
 from .escape_policy import EscapePolicy
 from .records import (
     OPERATION_SCHEMA_VERSION,
@@ -224,7 +224,7 @@ class FormalWorkflow:
             "input_mode": self.run_context.config.input_mode,
             "property_category": self.run_context.config.property_category,
             "stage_context": (
-                stage_context.to_dict(self.run_context.workspace_dir)
+                stage_context.to_dict(self.run_context.run_dir)
                 if stage_context is not None
                 else None
             ),
@@ -263,7 +263,30 @@ class FormalWorkflow:
         
         # invoke_verification stage runs automatically without LLM.
         # propose_bugfix is now a bounded repair-regression loop.
-        if stage == "invoke_verification":
+        if stage == "build_top_module":
+            precheck = self.build_ops.run_build_only()
+            if precheck.get("success"):
+                stage_result = {
+                    "success": True,
+                    "summary": "Existing VerifyTop harness builds successfully.",
+                    "verification_passed": True,
+                    "counterexample_path": None,
+                    "root_cause": None,
+                    "generated_files": precheck.get("generated_files", []),
+                    "top_module": precheck.get("top_module"),
+                    "build_result": precheck,
+                    "iterations": [],
+                }
+            else:
+                context.setdefault("environment", {})["initial_build_result"] = {
+                    "success": False,
+                    "error": precheck.get("error"),
+                    "target": precheck.get("command", [None, None])[-1],
+                    "generated_files": precheck.get("generated_files", []),
+                    "top_module": precheck.get("top_module"),
+                }
+                stage_result = self._run_stage(context, stage)
+        elif stage == "invoke_verification":
             stage_result = self.build_ops.run_full_verification_flow()
             self.last_verification_result = stage_result
         elif stage == "propose_bugfix":
@@ -558,10 +581,13 @@ class FormalWorkflow:
         
         iterations = []
         iteration_count = 0
-        waveform_notebook = (
+        stage_notebook = (
             EvidenceNotebook()
             if stage == "waveform_explanation"
             and "no_waveform_notebook" not in self.ablation_modes
+            else StageNotebook(stage=stage)
+            if stage != "waveform_explanation"
+            and "no_stage_notebook" not in self.ablation_modes
             else None
         )
         self.escape_policy = EscapePolicy()
@@ -637,16 +663,16 @@ class FormalWorkflow:
                     if result.get("completed"):
                         return result["result"]
 
-                    self._maybe_compact_waveform_context(
-                        stage, context, messages, waveform_notebook
+                    self._maybe_compact_stage_context(
+                        stage, context, messages, stage_notebook
                     )
                 else:
                     # LLM returned text instead of tool calls - add error message and retry
                     iteration_count = self._handle_text_response(
                         response, stage, context, iterations, iteration_count, messages
                     )
-                    self._maybe_compact_waveform_context(
-                        stage, context, messages, waveform_notebook
+                    self._maybe_compact_stage_context(
+                        stage, context, messages, stage_notebook
                     )
                     
             except TokenBudgetExceeded:
@@ -662,8 +688,8 @@ class FormalWorkflow:
                     "role": "user",
                     "content": f"Error occurred: {str(e)}. Please try again with tool calls only."
                 })
-                self._maybe_compact_waveform_context(
-                    stage, context, messages, waveform_notebook
+                self._maybe_compact_stage_context(
+                    stage, context, messages, stage_notebook
                 )
         
         return {
@@ -839,15 +865,15 @@ class FormalWorkflow:
         
         return {"completed": False, "iteration_count": iteration_count}
 
-    def _maybe_compact_waveform_context(
+    def _maybe_compact_stage_context(
         self,
         stage: str,
         context: Dict[str, Any],
         messages: List[Dict[str, Any]],
-        notebook: Optional[EvidenceNotebook],
+        notebook: Optional[StageNotebook],
     ) -> None:
         """Compact long waveform histories into a deterministic evidence notebook."""
-        if stage != "waveform_explanation" or notebook is None:
+        if notebook is None:
             return
 
         iterations = context.get("iterations", [])
@@ -857,7 +883,7 @@ class FormalWorkflow:
         changed = compact_messages_with_notebook(messages, notebook)
         if changed:
             self.logger.info(
-                "Compacted waveform_explanation message history into evidence notebook "
+                f"Compacted {stage} message history into evidence notebook "
                 f"({len(messages)} messages retained)."
             )
 
@@ -1081,7 +1107,7 @@ class FormalWorkflow:
             read_file_func=self.read_file,
             write_file_func=self.write_file,
             logger=self.logger,
-            workspace_root=str(self.run_context.workspace_dir) if self.run_context is not None else None,
+            workspace_root=str(self.run_context.run_dir) if self.run_context is not None else None,
         )
         self._record_stage_operations(stage, actions, results, edit_snapshots)
         return results
@@ -1091,7 +1117,7 @@ class FormalWorkflow:
         if self.run_context is None:
             return {}
         snapshots: Dict[str, Dict[str, Any]] = {}
-        workspace_root = str(self.run_context.workspace_dir)
+        workspace_root = str(self.run_context.run_dir)
         for action in actions:
             if action.get("type") != "edit_file":
                 continue

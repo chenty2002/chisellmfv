@@ -21,6 +21,9 @@ from ..causal_analysis import CausalAnalysisActions
 from .records import normalize_tool_result
 
 
+DEFAULT_READ_FILE_MAX_CHARS = 4000
+
+
 def _coerce_file_paths(action: Dict[str, Any]) -> List[str]:
     """Accept common read_files path shapes without depending on model exactness."""
     file_paths = action.get("file_paths")
@@ -73,10 +76,17 @@ def _resolve_workspace_path(path: str, workspace_root: str, work_dir: Optional[s
         candidate = raw.resolve()
     else:
         first = raw.parts[0] if raw.parts else ""
-        if first in {"workspace", "case", "skills", "rules", "memories", "indexes", "results", "logs"}:
+        if first == "workspace":
             candidate = (root / raw).resolve()
-            if first == "workspace" and not (root / "workspace").exists():
+            if not (root / "workspace").exists():
                 candidate = (root / Path(*raw.parts[1:])).resolve()
+        elif first in {"case", "skills", "rules", "memories"}:
+            if (root / "workspace").is_dir() and not (root / first).exists():
+                candidate = (root / "workspace" / raw).resolve()
+            else:
+                candidate = (root / raw).resolve()
+        elif first in {"indexes", "results", "logs"}:
+            candidate = (root / raw).resolve()
         else:
             candidate = (work / raw).resolve()
     if candidate != root and root not in candidate.parents:
@@ -85,7 +95,23 @@ def _resolve_workspace_path(path: str, workspace_root: str, work_dir: Optional[s
 
 
 def _workspace_relative(path: Path, workspace_root: str) -> str:
-    return path.resolve().relative_to(Path(workspace_root).resolve()).as_posix()
+    resolved = path.resolve()
+    root = Path(workspace_root).resolve()
+    workspace = root / "workspace"
+    if workspace.is_dir() and (resolved == workspace or workspace in resolved.parents):
+        return resolved.relative_to(workspace).as_posix()
+    return resolved.relative_to(root).as_posix()
+
+
+def _resolve_readable_path(path: str, workspace_root: str, work_dir: str) -> Path:
+    resolved = _resolve_workspace_path(path, workspace_root, work_dir)
+    if resolved.exists() or resolved.suffix:
+        return resolved
+    for suffix in (".json", ".jsonl", ".md"):
+        candidate = resolved.with_suffix(suffix)
+        if candidate.exists():
+            return candidate
+    return resolved
 
 
 def _with_md_suffix(name: str) -> str:
@@ -185,11 +211,16 @@ def _execute_read_files(
     line_start = action.get("line_start")
     line_end = action.get("line_end")
     max_chars = action.get("max_chars")
+    if max_chars is None:
+        max_chars = DEFAULT_READ_FILE_MAX_CHARS
     files_result = []
     
     for fp in file_paths:
         try:
-            fp = _resolve_work_path(fp, work_dir, workspace_root)
+            if workspace_root:
+                fp = str(_resolve_readable_path(fp, workspace_root, work_dir))
+            else:
+                fp = _resolve_work_path(fp, work_dir, workspace_root)
             content = read_file_func(fp)
             success = "Error reading file" not in content
         except Exception as exc:

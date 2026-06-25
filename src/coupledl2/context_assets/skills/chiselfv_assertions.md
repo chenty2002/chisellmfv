@@ -1,7 +1,9 @@
 # ChiselFV Assertions
 
-Prefer the existing `chiselFv.Formal` API and native Chisel assertions already
-used by the case. Assertions must be emitted into generated Verilog.
+Use this skill when `build_contract.chisel.family` is `chisel6`, or when
+`case/Chisel/build.sc` uses `org.chipsalliance::chisel`.
+
+Assertions must be emitted into generated Verilog.
 
 ## Placement Rules
 
@@ -41,23 +43,25 @@ class VerifyTop extends Module with Formal {
 
 Common APIs in trait `Formal`:
 
-- `fvAssert(cond: Bool, msg: String = "")`
-- `assertAt(n: UInt, cond: Bool, msg: String = "")`
-- `assertAfterNStepWhen(cond: Bool, n: Int, asert: Bool, msg: String = "")`
-- `assertNextStepWhen(cond: Bool, asert: Bool, msg: String = "")`
-- `assertAlwaysAfterNStepWhen(cond: Bool, n: Int, asert: Bool, msg: String = "")`
-- `astLiveness(req: Bool, resp: Bool, msg: String = "")`
-- `astRelaxedLiveness(req: Bool, resp: Bool, n: Int, msg: String = "")`
-- `assertLivenessTimer(cond: Bool, reset: Bool, n: Int, msg: String = "")`
-- `assertMutex(conds: Seq[Bool], msg: String = "")`
-- `assertOneHot(signal: UInt, msg: String = "")`
-- `assertOneHot0(signal: UInt, msg: String = "")`
-- `assertStable(signal: UInt, msg: String = "")`
-- `assertStableWhen(en: Bool, signal: UInt, msg: String = "")`
-- `assertOnRise(signal: Bool, cond: Bool, msg: String = "")`
-- `assertOnFall(signal: Bool, cond: Bool, msg: String = "")`
-- `assertImplies(antecedent: Bool, consequent: Bool, msg: String = "")`
-- `assertImpliesDelay(antecedent: Bool, consequent: Bool, n: Int, msg: String = "")`
+```scala
+def fvAssert(cond: Bool, msg: String = ""): Unit
+def assertAt(n: UInt, cond: Bool, msg: String = ""): Unit
+def assertAfterNStepWhen(cond: Bool, n: Int, asert: Bool, msg: String = ""): Unit
+def assertNextStepWhen(cond: Bool, asert: Bool, msg: String = ""): Unit
+def assertAlwaysAfterNStepWhen(cond: Bool, n: Int, asert: Bool, msg: String = ""): Unit
+def astLiveness(req: Bool, resp: Bool, msg: String = ""): Unit
+def astRelaxedLiveness(req: Bool, resp: Bool, n: Int, msg: String = ""): Unit
+def assertLivenessTimer(cond: Bool, reset: Bool, n: Int, msg: String = ""): Unit
+def assertMutex(conds: Seq[Bool], msg: String = ""): Unit
+def assertOneHot(signal: UInt, msg: String = ""): Unit
+def assertOneHot0(signal: UInt, msg: String = ""): Unit
+def assertStable(signal: UInt, msg: String = ""): Unit
+def assertStableWhen(en: Bool, signal: UInt, msg: String = ""): Unit
+def assertOnRise(signal: Bool, cond: Bool, msg: String = ""): Unit
+def assertOnFall(signal: Bool, cond: Bool, msg: String = ""): Unit
+def assertImplies(antecedent: Bool, consequent: Bool, msg: String = ""): Unit
+def assertImpliesDelay(antecedent: Bool, consequent: Bool, n: Int, msg: String = ""): Unit
+```
 
 These ChiselFV APIs accept Chisel `Bool` conditions, not LTL formulas.
 
@@ -73,6 +77,25 @@ For liveness checks, integrate the active condition into request and response:
 ```scala
 astRelaxedLiveness(active && request_valid, done || !active, 1000, "progress")
 ```
+
+## Chisel 6 BoringUtils Reference
+
+For Chisel 6 CoupledL2 cases, use the one-argument bore form when exposing an
+internal signal as a local value:
+
+```scala
+val signal = BoringUtils.bore(source)
+```
+
+For named cross-module wiring, use explicit source/sink names:
+
+```scala
+BoringUtils.addSource(source, "stateArray_0", disableDedup = true)
+BoringUtils.addSink(sink, "stateArray_0")
+```
+
+Do not use the Chisel 3-only `BoringUtils.bore(source, Seq(sink))` helper style
+unless the selected skill is `chiselfv_chisel3_assertions.md`.
 
 ## Chisel 6 LTL Assertion API Reference
 

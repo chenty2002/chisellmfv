@@ -19,7 +19,7 @@ import os
 from ..utils.llm_properties import MAX_ITERATIONS, WAVEFORM_MAX_ITER
 
 
-PROMPT_VERSION = "coupledl2-v1-skill-light"
+PROMPT_VERSION = "coupledl2-v2-chisel-compat"
 
 def build_system_prompt(
     stage: str = "build_top_module",
@@ -53,6 +53,7 @@ def build_system_prompt(
         "- Use `complete_stage` when it is available to declare the stage ready for deterministic validation.",
         "- Treat paths, indexes, skills, and rules in the user message as retrieved CoupledL2 run context.",
         "- Read listed rules and relevant stage skills before making source edits or diagnosis claims.",
+        "- Before using Chisel, ChiselFV, LTL, or BoringUtils APIs, derive the case compatibility from `build_contract.chisel` and the versioned assertion skill.",
         "- Read exact source slices with line-limited tools before modifying files.",
         "- Keep edits inside the run workspace and cite concrete evidence in completion summaries.",
         "",
@@ -71,6 +72,8 @@ def _display_path(path: Optional[str], workspace_dir: Optional[str]) -> str:
     """Prefer stable relative paths in prompts while keeping unknown paths intact."""
     if not path:
         return ""
+    if not os.path.isabs(path):
+        return path
     if workspace_dir:
         try:
             return os.path.relpath(path, workspace_dir)
@@ -143,7 +146,31 @@ def build_user_prompt(
     sections.extend(["", "### Stage Rules"])
     for path in stage_context.get("rules", []):
         sections.append(f"- `{path}`")
+    context_index_paths = stage_context.get("context_index_paths") or {}
+    if context_index_paths:
+        sections.extend(["", "### Context Index Paths"])
+        for name, path in sorted(context_index_paths.items()):
+            sections.append(f"- `{name}`: `{path}`")
     context_indexes = stage_context.get("context_indexes")
+    chisel_compatibility = _extract_chisel_compatibility(stage_context)
+    formal_surface_summary = _extract_formal_surface_summary(stage_context)
+    if chisel_compatibility or formal_surface_summary:
+        sections.extend([
+            "",
+            "## Chisel Compatibility",
+            "Use this summary only as a routing hint. Take exact Formal and BoringUtils API rules from the listed versioned assertion skill, not from ad hoc source inference.",
+            "```json",
+            json.dumps(
+                {
+                    "chisel": chisel_compatibility,
+                    "formal_surface": formal_surface_summary,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "```",
+        ])
     if context_indexes:
         sections.extend([
             "",
@@ -382,7 +409,8 @@ def _build_coupledl2_stage_prompt(stage: str) -> list:
             "Add high-value CoupledL2 formal properties in the emitted design.",
             "",
             "## Actions",
-            "Read `chiselfv_assertions.md`, `bounded_liveness.md`, `tilelink_protocol.md`, and the listed rules before editing.",
+            "Determine the case Chisel version from `build_contract.chisel`, then read the listed assertion compatibility skill, `bounded_liveness.md`, `tilelink_protocol.md`, and the listed rules before editing.",
+            "If `build_contract.chisel` is missing or unclear, inspect only build files such as `case/Chisel/build.sc`, `case/Chisel/common.sc`, or `case/Chisel/build.sbt` to choose the versioned assertion skill.",
             "Use retrieved indexes to choose source slices, then call `complete_stage` with assertion and build evidence.",
             "",
         ],
@@ -415,3 +443,30 @@ def _build_coupledl2_stage_prompt(stage: str) -> list:
     }
     
     return stage_prompts.get(stage, ["## Unknown Stage", ""])
+
+
+def _extract_chisel_compatibility(stage_context: Dict[str, Any]) -> Any:
+    compatibility = stage_context.get("chisel_compatibility")
+    if compatibility:
+        return compatibility
+    context_indexes = stage_context.get("context_indexes")
+    if isinstance(context_indexes, dict):
+        return context_indexes.get("build_contract", {}).get("chisel")
+    return None
+
+
+def _extract_formal_surface_summary(stage_context: Dict[str, Any]) -> Any:
+    summary = stage_context.get("formal_surface_summary")
+    if summary:
+        return summary
+    context_indexes = stage_context.get("context_indexes")
+    if not isinstance(context_indexes, dict):
+        return None
+    formal_surface = context_indexes.get("formal_surface")
+    if not isinstance(formal_surface, dict):
+        return None
+    return {
+        "uses_chiselfv": formal_surface.get("uses_chiselfv"),
+        "uses_boring_utils": formal_surface.get("uses_boring_utils"),
+        "uses_ltl": formal_surface.get("uses_ltl"),
+    }

@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .config import CoupledL2RunConfig
 from .indexer import generate_indexes
+from .preprocess import preprocess_coupledl2_workspace
 from .skills import install_context_assets, stage_rule_paths, stage_skill_paths
 
 
@@ -60,16 +61,26 @@ class StageContext:
     rules: List[Path]
     context_indexes: Dict[str, Dict[str, Any]]
 
-    def to_dict(self, workspace_dir: Path) -> Dict[str, Any]:
-        return {
+    def to_dict(self, tool_root: Path) -> Dict[str, Any]:
+        payload = {
             "stage": self.stage,
-            "stage_dir": str(self.stage_dir),
-            "stage_inputs_path": str(self.stage_dir / "stage_inputs.json"),
-            "snapshot_dir": str(self.snapshot_dir),
-            "skills": [_rel_to_workspace(path, workspace_dir) for path in self.skills],
-            "rules": [_rel_to_workspace(path, workspace_dir) for path in self.rules],
+            "stage_dir": _rel_to_tool_root(self.stage_dir, tool_root),
+            "stage_inputs_path": _rel_to_tool_root(self.stage_dir / "stage_inputs.json", tool_root),
+            "snapshot_dir": _rel_to_tool_root(self.snapshot_dir, tool_root),
+            "skills": [_rel_to_tool_root(path, tool_root) for path in self.skills],
+            "rules": [_rel_to_tool_root(path, tool_root) for path in self.rules],
             "context_indexes": sorted(self.context_indexes.keys()),
+            "context_index_paths": {
+                name: f"indexes/{name}.json" for name in sorted(self.context_indexes.keys())
+            },
         }
+        chisel = self.context_indexes.get("build_contract", {}).get("chisel")
+        if chisel:
+            payload["chisel_compatibility"] = chisel
+        formal_surface = self.context_indexes.get("formal_surface")
+        if formal_surface:
+            payload["formal_surface_summary"] = _formal_surface_summary(formal_surface)
+        return payload
 
 
 def create_coupledl2_workspace(config: CoupledL2RunConfig) -> CoupledL2Workspace:
@@ -85,11 +96,13 @@ def create_coupledl2_workspace(config: CoupledL2RunConfig) -> CoupledL2Workspace
         directory.mkdir(parents=True, exist_ok=True)
 
     shutil.copytree(config.case_path, case_workspace, ignore=_ignore_copy_entries)
+    preprocess_summary = preprocess_coupledl2_workspace(case_workspace)
     install_context_assets(workspace_dir)
     _create_stage_dirs(results_dir)
 
     manifest_path = run_dir / "manifest.json"
     manifest = _build_manifest(config, run_dir, workspace_dir, case_workspace)
+    manifest["preprocess"] = preprocess_summary
     _write_json(manifest_path, manifest)
 
     generate_indexes(run_dir, case_workspace, config)
@@ -127,7 +140,7 @@ def initialize_stage_context(workspace: CoupledL2Workspace, stage: str) -> Stage
         stage=stage,
         stage_dir=stage_dir,
         snapshot_dir=snapshot_dir,
-        skills=stage_skill_paths(workspace.workspace_dir, stage),
+        skills=stage_skill_paths(workspace.workspace_dir, stage, context_indexes),
         rules=stage_rule_paths(workspace.workspace_dir, stage),
         context_indexes=context_indexes,
     )
@@ -205,6 +218,7 @@ def _write_stage_inputs(workspace: CoupledL2Workspace, ctx: StageContext) -> Non
         "verify_mode": workspace.config.verify_mode,
         "input_mode": workspace.config.input_mode,
         "property_category": workspace.config.property_category,
+        "chisel_compatibility": ctx.context_indexes.get("build_contract", {}).get("chisel"),
     }
     _write_json(ctx.stage_dir / "stage_inputs.json", payload)
 
@@ -223,6 +237,23 @@ def _load_previous_handoffs(workspace: CoupledL2Workspace, stage: str) -> List[D
 
 def _rel_to_workspace(path: Path, workspace_dir: Path) -> str:
     return path.relative_to(workspace_dir).as_posix()
+
+
+def _rel_to_tool_root(path: Path, tool_root: Path) -> str:
+    root = tool_root.resolve()
+    resolved = path.resolve()
+    workspace = root / "workspace"
+    if workspace.is_dir() and (resolved == workspace or workspace in resolved.parents):
+        return resolved.relative_to(workspace).as_posix()
+    return resolved.relative_to(root).as_posix()
+
+
+def _formal_surface_summary(formal_surface: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "uses_chiselfv": formal_surface.get("uses_chiselfv"),
+        "uses_boring_utils": formal_surface.get("uses_boring_utils"),
+        "uses_ltl": formal_surface.get("uses_ltl"),
+    }
 
 
 def _write_json(path: Path, value: Dict[str, Any]) -> None:

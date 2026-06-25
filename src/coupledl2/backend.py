@@ -18,6 +18,7 @@ from .workspace import CoupledL2Workspace
 
 
 INCONCLUSIVE_STATUSES = {"undetermined", "unknown", "error"}
+MILL_VERSION = "0.11.5"
 
 
 class CoupledL2BuildOperations:
@@ -101,6 +102,7 @@ class CoupledL2BuildOperations:
         command = ["make", str(target)]
         env = os.environ.copy()
         env.update({str(k): str(v) for k, v in self.build_contract.get("env", {}).items()})
+        self._prepare_mill_env(env)
 
         try:
             completed = subprocess.run(
@@ -394,6 +396,36 @@ class CoupledL2BuildOperations:
     def _tail(text: str, max_lines: int = 40) -> str:
         lines = text.splitlines()
         return "\n".join(lines[-max_lines:])
+
+    def _prepare_mill_env(self, env: Dict[str, str]) -> None:
+        """Make case-local Makefiles resolve a pinned Mill launcher."""
+        mill = self._find_mill_executable()
+        if not mill:
+            return
+
+        wrapper_dir = self.workspace.run_dir / "tool_wrappers"
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        wrapper = wrapper_dir / "mill"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            f'exec "{mill}" --mill-version "{MILL_VERSION}" "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        existing_path = env.get("PATH", "")
+        env["PATH"] = str(wrapper_dir) + (os.pathsep + existing_path if existing_path else "")
+        env["CHISELLMFV_MILL"] = str(mill)
+        env["CHISELLMFV_MILL_VERSION"] = MILL_VERSION
+
+    @staticmethod
+    def _find_mill_executable() -> Optional[Path]:
+        found = shutil.which("mill")
+        if found:
+            return Path(found).resolve()
+        home_mill = Path.home() / "mill"
+        if home_mill.is_file() and os.access(home_mill, os.X_OK):
+            return home_mill.resolve()
+        return None
 
 
 def parse_jaspergold_report(log_text: str, trace_dir: Optional[Path] = None) -> Dict[str, Any]:

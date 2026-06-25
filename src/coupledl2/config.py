@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-VALID_VERIFY_MODES = {"small", "large"}
-VALID_INPUT_MODES = {"msggen", "coupledl2asl1"}
+VALID_VERIFY_MODES = {"small"}
+VALID_INPUT_MODES = {"coupledl2asl1"}
 VALID_PROPERTY_CATEGORIES = {"deadlock", "write_read", "copy_equality", "peer_l2", "custom"}
 
 
@@ -17,7 +17,7 @@ class CoupledL2RunConfig:
 
     case_path: Path
     verify_mode: str = "small"
-    input_mode: str = "msggen"
+    input_mode: str = "coupledl2asl1"
     property_category: str = "deadlock"
     run_root: Path = Path("runs")
     copy_strategy: str = "copy"

@@ -154,7 +154,7 @@ READ_FILES_TOOL = {
             },
             "max_chars": {
                 "type": "integer",
-                "description": "Optional maximum characters to return per file after line filtering",
+                "description": "Optional maximum characters to return per file after line filtering. Omit for the workflow default bounded preview; use line_start/line_end for precise source inspection.",
             },
             "reason": {
                 "type": "string",

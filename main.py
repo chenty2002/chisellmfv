@@ -466,6 +466,9 @@ def main_coupledl2_run(args):
     from src.coupledl2.backend import CoupledL2BuildOperations
     from src.coupledl2.config import CoupledL2RunConfig
     from src.coupledl2.workspace import create_coupledl2_workspace, initialize_stage_context
+    from src.core.tool_schemas import FORMAL_STAGES
+    from src.core.llm_router import LLMRouter
+    from src.core.workflow import FormalWorkflow
     from src.utils.logger import get_logger
 
     config = CoupledL2RunConfig(
@@ -475,9 +478,11 @@ def main_coupledl2_run(args):
         property_category=args.property_category,
         run_root=Path(args.run_root),
     )
-    workspace = create_coupledl2_workspace(config)
     stage = args.stage or args.start_stage or "build_top_module"
-    initialize_stage_context(workspace, stage)
+
+    if args.dry_run_init or args.build_only:
+        workspace = create_coupledl2_workspace(config)
+        initialize_stage_context(workspace, stage)
 
     if args.dry_run_init:
         print("prepared CoupledL2 workspace only")
@@ -487,15 +492,14 @@ def main_coupledl2_run(args):
         print(f"results: {workspace.results_dir}")
         return
 
-    logger = get_logger(
-        __name__,
-        console_output=False,
-        clear_log=True,
-        base_name=f"application-coupledl2-{stage}.log",
-    )
-    backend = CoupledL2BuildOperations(workspace, logger)
-
     if args.build_only:
+        logger = get_logger(
+            __name__,
+            console_output=False,
+            clear_log=True,
+            base_name=f"application-coupledl2-{stage}.log",
+        )
+        backend = CoupledL2BuildOperations(workspace, logger)
         result = backend.run_build_only()
         print("build-only completed" if result.get("success") else "build-only failed")
         print(json.dumps({
@@ -510,7 +514,61 @@ def main_coupledl2_run(args):
             sys.exit(1)
         return
 
-    print("错误: CoupledL2 run currently supports --dry-run-init or --build-only")
+    if args.full or args.stage:
+        logger = get_logger(
+            __name__,
+            console_output=False,
+            clear_log=True,
+            base_name=f"application-coupledl2-{stage}.log",
+        )
+        llm_client = LLMRouter(
+            max_token_budget=getattr(args, "max_tokens", None),
+            logger=logger,
+        )
+        workflow = FormalWorkflow(
+            llm_client=llm_client,
+            chisel_dir=".",
+            workspace_dir=os.path.abspath("."),
+            logger=logger,
+            stage=stage,
+            target=config.case_name,
+            max_repair_rounds=args.max_repair_rounds,
+            coupledl2_config=config,
+        )
+
+        stages = [args.stage] if args.stage else FORMAL_STAGES[FORMAL_STAGES.index(stage):]
+        completed_stage = None
+        success = True
+        for current_stage in stages:
+            workflow.current_stage = current_stage
+            result = workflow.process_task(
+                user_query=get_default_query(stage=current_stage, target=config.case_name),
+            )
+            completed_stage = current_stage
+            if not result.get("success", False):
+                success = False
+                break
+
+            if current_stage == "invoke_verification":
+                detail = result.get("stage_result", {})
+                workflow.last_verification_result = detail
+                if detail.get("counterexample_path"):
+                    workflow.waveform_path = detail.get("counterexample_path")
+                if detail.get("verification_passed", False):
+                    break
+
+        llm_client.print_token_usage(logger)
+        print("CoupledL2 workflow completed" if success else "CoupledL2 workflow failed")
+        print(json.dumps({
+            "run_dir": str(workflow.run_context.run_dir),
+            "success": success,
+            "completed_stage": completed_stage,
+        }, indent=2, ensure_ascii=False))
+        if not success:
+            sys.exit(1)
+        return
+
+    print("错误: CoupledL2 run currently supports --dry-run-init, --build-only, --stage, or --full")
     sys.exit(2)
 
 
@@ -682,11 +740,11 @@ def parse_args():
     run_parser = subparsers.add_parser('run', help='CoupledL2 五阶段形式化验证工作流')
     run_parser.add_argument('--case', type=str, required=True,
                             help='CoupledL2 case 目录')
-    run_parser.add_argument('--mode', type=str, default='small', choices=['small', 'large'],
+    run_parser.add_argument('--mode', type=str, default='small', choices=['small'],
                             help='VERIFY_MODE（默认: small）')
-    run_parser.add_argument('--input-mode', type=str, default='msggen',
-                            choices=['msggen', 'coupledl2asl1'],
-                            help='VERIFY_INPUT_MODE（默认: msggen）')
+    run_parser.add_argument('--input-mode', type=str, default='coupledl2asl1',
+                            choices=['coupledl2asl1'],
+                            help='VERIFY_INPUT_MODE（默认: coupledl2asl1）')
     run_parser.add_argument('--property', dest='property_category', type=str, default='deadlock',
                             choices=['deadlock', 'write_read', 'copy_equality', 'peer_l2', 'custom'],
                             help='属性类别（默认: deadlock）')
@@ -708,6 +766,10 @@ def parse_args():
                             help='仅执行 workflow/stage 初始化并退出')
     run_parser.add_argument('--build-only', action='store_true',
                             help='执行 CoupledL2 case-local Makefile 构建并写入 stage 1 artifacts')
+    run_parser.add_argument('--max-tokens', type=int, default=None,
+                            help='Token 总量限制（所有 API 调用累计，超出后停止）')
+    run_parser.add_argument('--max-repair-rounds', type=int, default=3,
+                            help='stage 5 repair-regression loop 最大轮数（默认: 3）')
 
     return parser.parse_args()
 
