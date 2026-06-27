@@ -12,21 +12,12 @@ from typing import Any, Dict, List
 from uuid import uuid4
 
 from .config import CoupledL2RunConfig
-from .indexer import generate_indexes
-from .preprocess import preprocess_coupledl2_workspace
 from .skills import install_context_assets, stage_rule_paths, stage_skill_paths
+from .stages import COUPLEDL2_STAGES, STAGE_SPECS, get_stage_spec
 
 
 STAGE_INPUTS_SCHEMA_VERSION = "stage_inputs.v1"
 
-
-COUPLEDL2_STAGES = [
-    "build_top_module",
-    "write_assertions",
-    "invoke_verification",
-    "waveform_explanation",
-    "propose_bugfix",
-]
 
 IGNORED_COPY_ENTRIES = {
     ".git",
@@ -84,7 +75,7 @@ class StageContext:
 
 
 def create_coupledl2_workspace(config: CoupledL2RunConfig) -> CoupledL2Workspace:
-    """Create an isolated run workspace and minimal indexes for a CoupledL2 case."""
+    """Create one isolated run workspace; preflight populates indexes afterwards."""
     run_dir = _allocate_run_dir(config.run_root, config.case_name)
     workspace_dir = run_dir / "workspace"
     case_workspace = workspace_dir / "case"
@@ -96,16 +87,13 @@ def create_coupledl2_workspace(config: CoupledL2RunConfig) -> CoupledL2Workspace
         directory.mkdir(parents=True, exist_ok=True)
 
     shutil.copytree(config.case_path, case_workspace, ignore=_ignore_copy_entries)
-    preprocess_summary = preprocess_coupledl2_workspace(case_workspace)
     install_context_assets(workspace_dir)
     _create_stage_dirs(results_dir)
 
     manifest_path = run_dir / "manifest.json"
     manifest = _build_manifest(config, run_dir, workspace_dir, case_workspace)
-    manifest["preprocess"] = preprocess_summary
     _write_json(manifest_path, manifest)
 
-    generate_indexes(run_dir, case_workspace, config)
     _append_jsonl(logs_dir / "events.jsonl", {
         "event": "workflow_initialized",
         "case_name": config.case_name,
@@ -125,12 +113,9 @@ def create_coupledl2_workspace(config: CoupledL2RunConfig) -> CoupledL2Workspace
 
 
 def initialize_stage_context(workspace: CoupledL2Workspace, stage: str) -> StageContext:
-    """Load the stage-specific context slice for the five-stage workflow."""
-    if stage not in COUPLEDL2_STAGES:
-        raise ValueError(f"unknown CoupledL2 stage: {stage}")
-
-    index = COUPLEDL2_STAGES.index(stage) + 1
-    stage_dir = workspace.results_dir / "by_stage" / f"{index:02d}_{stage}"
+    """Load the stage-specific context slice for the active workflow."""
+    spec = get_stage_spec(stage)
+    stage_dir = workspace.results_dir / "by_stage" / spec.directory_name
     stage_dir.mkdir(parents=True, exist_ok=True)
     snapshot_dir = stage_dir / "source_snapshot"
     snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -165,8 +150,8 @@ def _ignore_copy_entries(_directory: str, names: List[str]) -> set:
 
 
 def _create_stage_dirs(results_dir: Path) -> None:
-    for index, stage in enumerate(COUPLEDL2_STAGES, start=1):
-        (results_dir / "by_stage" / f"{index:02d}_{stage}").mkdir(parents=True, exist_ok=True)
+    for spec in STAGE_SPECS:
+        (results_dir / "by_stage" / spec.directory_name).mkdir(parents=True, exist_ok=True)
 
 
 def _build_manifest(
@@ -186,12 +171,15 @@ def _build_manifest(
         "input_mode": config.input_mode,
         "property_category": config.property_category,
         "stages": COUPLEDL2_STAGES,
+        "entry_stage": "write_assertions",
+        "skipped_stages": ["build_top_module"],
+        "preflight_result": "results/preflight/preflight_result.json",
+        "preflight_status": "pending",
     }
 
 
 def _load_stage_indexes(indexes_dir: Path, stage: str) -> Dict[str, Dict[str, Any]]:
     required = {
-        "build_top_module": ["project_tree", "build_contract", "formal_surface"],
         "write_assertions": ["build_contract", "formal_surface"],
         "invoke_verification": ["build_contract", "formal_surface"],
         "waveform_explanation": ["build_contract", "formal_surface"],
@@ -220,6 +208,12 @@ def _write_stage_inputs(workspace: CoupledL2Workspace, ctx: StageContext) -> Non
         "property_category": workspace.config.property_category,
         "chisel_compatibility": ctx.context_indexes.get("build_contract", {}).get("chisel"),
     }
+    if ctx.stage == "write_assertions":
+        payload["preflight"] = {
+            "result": "results/preflight/preflight_result.json",
+            "baseline_build": "results/preflight/baseline_build_result.json",
+            "generated_assertion_scan": "results/preflight/generated_assertion_scan.json",
+        }
     _write_json(ctx.stage_dir / "stage_inputs.json", payload)
 
 
@@ -227,8 +221,13 @@ def _load_previous_handoffs(workspace: CoupledL2Workspace, stage: str) -> List[D
     """Load completed handoff records from stages before the current stage."""
     current_index = COUPLEDL2_STAGES.index(stage)
     handoffs: List[Dict[str, Any]] = []
-    for index, previous_stage in enumerate(COUPLEDL2_STAGES[:current_index], start=1):
-        path = workspace.results_dir / "by_stage" / f"{index:02d}_{previous_stage}" / "handoff.json"
+    for previous_stage in COUPLEDL2_STAGES[:current_index]:
+        path = (
+            workspace.results_dir
+            / "by_stage"
+            / get_stage_spec(previous_stage).directory_name
+            / "handoff.json"
+        )
         if not path.is_file():
             continue
         handoffs.append(json.loads(path.read_text(encoding="utf-8")))

@@ -2,7 +2,6 @@
 Workflow for Chisel formal verification - Single Stage Mode Only.
 
 Supports running one stage at a time:
-1. build_top_module - Generate TestTop.scala
 2. write_assertions - Add deadlock detection assertions
 3. invoke_verification - Compile and run formal verification
 4. waveform_explanation - Analyze counterexample waveforms
@@ -62,11 +61,9 @@ from .repair_loop import (
     snapshot_waveform_artifacts,
     write_repair_json,
 )
-from ..coupledl2.config import CoupledL2RunConfig
 from ..coupledl2.workspace import (
     CoupledL2Workspace,
     StageContext,
-    create_coupledl2_workspace,
     initialize_stage_context,
 )
 from ..causal_analysis import (
@@ -92,12 +89,12 @@ class FormalWorkflow:
         workspace_dir: str,
         logger: logging.Logger,
         waveform_path: Optional[str] = None,
-        stage: str = "build_top_module",
+        stage: str = "write_assertions",
         target: str = "gigamax",
         ablation_modes: Optional[List[str]] = None,
         max_repair_rounds: int = DEFAULT_MAX_REPAIR_ROUNDS,
         initial_verification_result: Optional[Dict[str, Any]] = None,
-        coupledl2_config: Optional[CoupledL2RunConfig] = None,
+        run_context: Optional[CoupledL2Workspace] = None,
     ):
         """
         Initialize the formal verification workflow for a single stage.
@@ -124,25 +121,27 @@ class FormalWorkflow:
         self.max_repair_rounds = max(0, int(max_repair_rounds))
         self.last_verification_result = initial_verification_result
         self.causal_actions: Optional[CausalAnalysisActions] = None
-        self.coupledl2_config = coupledl2_config
-        self.run_context: Optional[CoupledL2Workspace] = None
+        self.run_context = run_context
         self.stage_context: Optional[StageContext] = None
 
-        if self.coupledl2_config is None:
-            raise ValueError("FormalWorkflow now requires a CoupledL2RunConfig")
+        if self.run_context is None:
+            raise ValueError("FormalWorkflow requires a preflighted CoupledL2Workspace")
+        manifest = json.loads(self.run_context.manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("preflight_status") != "success":
+            raise ValueError("FormalWorkflow requires successful CoupledL2 preflight")
         
         # Initialize paths based on target
         self._init_paths()
         
         # Initialize helper classes
         self._init_helpers()
-        
+
         # Initialize waveform actions if waveform path provided
         self._init_waveform_actions()
     
     def _init_paths(self) -> None:
         """Initialize directory paths based on target."""
-        self.run_context = create_coupledl2_workspace(self.coupledl2_config)
+        assert self.run_context is not None
         self.work_dir = str(self.run_context.case_workspace)
         self.verify_src_dir = str(self.run_context.case_workspace / "Chisel")
         self.generated_dir = str(self.run_context.case_workspace / "Chisel" / "generated")
@@ -261,32 +260,9 @@ class FormalWorkflow:
         self.logger.info(f"=== Running stage: {stage} ===")
         print(f"\n=== Running stage: {stage} ===")
         
-        # invoke_verification stage runs automatically without LLM.
-        # propose_bugfix is now a bounded repair-regression loop.
-        if stage == "build_top_module":
-            precheck = self.build_ops.run_build_only()
-            if precheck.get("success"):
-                stage_result = {
-                    "success": True,
-                    "summary": "Existing VerifyTop harness builds successfully.",
-                    "verification_passed": True,
-                    "counterexample_path": None,
-                    "root_cause": None,
-                    "generated_files": precheck.get("generated_files", []),
-                    "top_module": precheck.get("top_module"),
-                    "build_result": precheck,
-                    "iterations": [],
-                }
-            else:
-                context.setdefault("environment", {})["initial_build_result"] = {
-                    "success": False,
-                    "error": precheck.get("error"),
-                    "target": precheck.get("command", [None, None])[-1],
-                    "generated_files": precheck.get("generated_files", []),
-                    "top_module": precheck.get("top_module"),
-                }
-                stage_result = self._run_stage(context, stage)
-        elif stage == "invoke_verification":
+        # invoke_verification runs automatically without LLM.
+        # propose_bugfix is a bounded repair-regression loop.
+        if stage == "invoke_verification":
             stage_result = self.build_ops.run_full_verification_flow()
             self.last_verification_result = stage_result
         elif stage == "propose_bugfix":
@@ -534,7 +510,7 @@ class FormalWorkflow:
             ablation_modes=sorted(self.ablation_modes),
             max_repair_rounds=self.max_repair_rounds,
             initial_verification_result=self.last_verification_result,
-            coupledl2_config=self.coupledl2_config,
+            run_context=self.run_context,
         )
         result = workflow.process_task(
             "Analyze the selected post-repair counterexample for the next repair round."
@@ -958,7 +934,7 @@ class FormalWorkflow:
             return None
         
         # Stages that require compilation verification
-        if stage in ["build_top_module", "write_assertions", "propose_bugfix"]:
+        if stage in ["write_assertions", "propose_bugfix"]:
             compile_result = self.build_ops.verify_compilation(
                 require_assertions=(
                     stage == "write_assertions"
@@ -1273,10 +1249,9 @@ class FormalWorkflow:
     def _coupledl2_stage_dir(self, stage: str) -> Optional[Path]:
         if self.run_context is None:
             return None
-        from ..coupledl2.workspace import COUPLEDL2_STAGES
+        from ..coupledl2.stages import get_stage_spec
 
-        index = COUPLEDL2_STAGES.index(stage) + 1
-        path = self.run_context.results_dir / "by_stage" / f"{index:02d}_{stage}"
+        path = self.run_context.results_dir / "by_stage" / get_stage_spec(stage).directory_name
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -1370,18 +1345,12 @@ class FormalWorkflow:
                 "operations": "operations.jsonl",
             },
         }
-        if stage in {"build_top_module", "write_assertions", "propose_bugfix"}:
+        if stage in {"write_assertions", "propose_bugfix"}:
             handoff["source_snapshot"] = {
                 "before_manifest": "snapshot_manifest_before.json",
                 "after_manifest": "snapshot_manifest_after.json",
             }
-        if stage == "build_top_module":
-            handoff["build"] = {
-                "generated_files": stage_result.get("generated_files", []),
-                "top_module": stage_result.get("top_module"),
-                "verification_passed": stage_result.get("verification_passed"),
-            }
-        elif stage == "write_assertions":
+        if stage == "write_assertions":
             handoff["assertions"] = {
                 "assertion_map": "assertion_map.json",
                 "generated_assertion_scan": "generated_assertion_scan.json",

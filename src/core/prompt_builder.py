@@ -1,7 +1,6 @@
 """
 Prompt builder for Chisel formal verification workflow.
-Builds prompts for each of the 5 stages:
-  1. build_top_module
+Builds prompts for active CoupledL2 stages:
   2. write_assertions
   3. invoke_verification
   4. waveform_explanation
@@ -22,7 +21,7 @@ from ..utils.llm_properties import MAX_ITERATIONS, WAVEFORM_MAX_ITER
 PROMPT_VERSION = "coupledl2-v2-chisel-compat"
 
 def build_system_prompt(
-    stage: str = "build_top_module",
+    stage: str = "write_assertions",
     target: str = "",
     chisel_dir: str = "",
     workspace_dir: str = "",
@@ -84,7 +83,7 @@ def _display_path(path: Optional[str], workspace_dir: Optional[str]) -> str:
 
 def build_user_prompt(
     context: Dict[str, Any],
-    stage: str = "build_top_module",
+    stage: str = "write_assertions",
     scala_sources: Optional[Dict[str, str]] = None,
     analysis_report: Optional[str] = None
 ) -> str:
@@ -394,16 +393,6 @@ following errors:
 def _build_coupledl2_stage_prompt(stage: str) -> list:
     """Generate lightweight CoupledL2 stage instructions."""
     stage_prompts = {
-        "build_top_module": [
-            "## Objective",
-            "Prepare or repair the CoupledL2 verification harness so the configured build target can emit formal RTL.",
-            "",
-            "## Actions",
-            "Read `coupledl2_build.md`, `coupledl2_harness.md`, and the listed rules before editing.",
-            "If the existing VerifyTop harness already matches the build contract and can emit formal RTL, do not edit source files; call `complete_stage` with inspected harness and build evidence.",
-            "Use `edit_file` only for focused workspace edits, then call `complete_stage` with build evidence.",
-            "",
-        ],
         "write_assertions": [
             "## Objective",
             "Add high-value CoupledL2 formal properties in the emitted design.",

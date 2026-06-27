@@ -33,16 +33,24 @@ class CoupledL2BuildOperations:
         self.generated_dir = str(self.chisel_dir / "generated")
         self.verilog_dir = str(self.case_dir / "Verilog")
         self.workspace_dir = str(workspace.workspace_dir)
-        self.build_contract = self._load_json(workspace.indexes_dir / "build_contract.json")
+        self._build_contract: Optional[Dict[str, Any]] = None
+
+    @property
+    def build_contract(self) -> Dict[str, Any]:
+        if self._build_contract is None:
+            self._build_contract = self._load_json(
+                self.workspace.indexes_dir / "build_contract.json"
+            )
+        return self._build_contract
 
     def run_make(self, target: Optional[str] = None) -> Tuple[bool, str]:
         """Run the configured CoupledL2 build target and return a compact status tuple."""
-        result = self.run_build_only(target=target)
+        result = self.run_compilation(target=target)
         return bool(result.get("success")), str(result.get("output") or result.get("error") or "")
 
     def verify_compilation(self, require_assertions: bool = False) -> Dict[str, Any]:
         """Run the configured CoupledL2 build target and collect generated Verilog."""
-        result = self.run_build_only()
+        result = self.run_compilation()
         if require_assertions and result.get("success"):
             scan = self.scan_generated_assertions()
             if not scan["success"]:
@@ -54,7 +62,7 @@ class CoupledL2BuildOperations:
 
     def run_full_verification_flow(self) -> Dict[str, Any]:
         """Run build, prepare run-local JasperGold inputs, and launch JasperGold."""
-        build = self.run_build_only()
+        build = self._run_build(self._stage_dir("invoke_verification"))
         if not build.get("success"):
             return {
                 "success": False,
@@ -90,14 +98,39 @@ class CoupledL2BuildOperations:
             "counterexample_path": formal.get("counterexample_path"),
         }
 
-    def run_build_only(
+    def run_baseline_build(
         self,
         target: Optional[str] = None,
         timeout_s: int = 1800,
     ) -> Dict[str, Any]:
-        """Run the case-local Makefile target under the configured VERIFY env."""
-        stage_dir = self._stage_dir("build_top_module")
-        stage_dir.mkdir(parents=True, exist_ok=True)
+        """Build the cleaned workspace before any LLM stage is allowed to run."""
+        return self._run_build(
+            self.workspace.results_dir / "preflight",
+            target=target,
+            timeout_s=timeout_s,
+            result_filename="baseline_build_result.json",
+        )
+
+    def run_compilation(
+        self,
+        target: Optional[str] = None,
+        timeout_s: int = 1800,
+    ) -> Dict[str, Any]:
+        """Compile edits made by an agent stage."""
+        return self._run_build(
+            self._stage_dir("write_assertions"),
+            target=target,
+            timeout_s=timeout_s,
+        )
+
+    def _run_build(
+        self,
+        artifact_dir: Path,
+        target: Optional[str] = None,
+        timeout_s: int = 1800,
+        result_filename: str = "build_result.json",
+    ) -> Dict[str, Any]:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
         target = target or self.build_contract.get("recommended_make_target") or "auto"
         command = ["make", str(target)]
         env = os.environ.copy()
@@ -131,7 +164,7 @@ class CoupledL2BuildOperations:
                 "generated_files": [],
                 "top_module": None,
             }
-            self._write_build_artifacts(stage_dir, result, output)
+            self._write_build_artifacts(artifact_dir, result, output, result_filename)
             return result
 
         generated_files = self.discover_generated_verilog_files()
@@ -151,7 +184,7 @@ class CoupledL2BuildOperations:
         elif not generated_files:
             result["error"] = "build succeeded but no generated Verilog/SystemVerilog files were found"
 
-        self._write_build_artifacts(stage_dir, result, output)
+        self._write_build_artifacts(artifact_dir, result, output, result_filename)
         return result
 
     def discover_generated_verilog_files(self) -> List[Path]:
@@ -356,10 +389,9 @@ class CoupledL2BuildOperations:
         return result
 
     def _stage_dir(self, stage: str) -> Path:
-        from .workspace import COUPLEDL2_STAGES
+        from .stages import get_stage_spec
 
-        index = COUPLEDL2_STAGES.index(stage) + 1
-        return self.workspace.results_dir / "by_stage" / f"{index:02d}_{stage}"
+        return self.workspace.results_dir / "by_stage" / get_stage_spec(stage).directory_name
 
     def _resolve_workspace_case_pattern(self, pattern: str) -> Path:
         return self.case_dir / self._strip_workspace_case(pattern)
@@ -381,9 +413,15 @@ class CoupledL2BuildOperations:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
 
-    def _write_build_artifacts(self, stage_dir: Path, result: Dict[str, Any], output: str) -> None:
+    def _write_build_artifacts(
+        self,
+        stage_dir: Path,
+        result: Dict[str, Any],
+        output: str,
+        result_filename: str = "build_result.json",
+    ) -> None:
         (stage_dir / "build.log").write_text(output, encoding="utf-8")
-        self._write_json(stage_dir / "build_result.json", result)
+        self._write_json(stage_dir / result_filename, result)
         self._write_json(
             stage_dir / "generated_files.json",
             {

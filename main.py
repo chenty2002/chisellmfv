@@ -4,8 +4,8 @@ ChiselLMFV - 统一入口
 
 基于 LLM 的 Chisel 形式化验证工具，提供两种工作流：
 
-1. 形式化验证 (Formal Verification)：五阶段自动化工作流
-   - build_top_module → write_assertions → invoke_verification
+1. 形式化验证 (Formal Verification)：四阶段自动化工作流
+   - preflight → write_assertions → invoke_verification
    - → waveform_explanation (结合 VerilogCausalAnalysis 因果分析)
    - → propose_bugfix
 2. Verilog→Chisel 转换 (Verilog2Chisel)：自动将 Verilog 代码转换为 Chisel
@@ -103,7 +103,7 @@ def main_formal(args):
         )
 
         if args.full:
-            start_stage = args.start_stage if args.start_stage else FORMAL_STAGES[0]
+            start_stage = FORMAL_STAGES[0]
             logger.info(f"Starting full workflow from stage: {start_stage}")
 
             start_idx = FORMAL_STAGES.index(start_stage)
@@ -287,7 +287,7 @@ def _run_stage_batched_formal(
     formal_stages: List[str],
 ) -> bool:
     """Run full formal workflow stage-first across targets for prompt-cache locality."""
-    start_stage = args.start_stage if args.start_stage else formal_stages[0]
+    start_stage = formal_stages[0]
     start_idx = formal_stages.index(start_stage)
     active: Dict[str, bool] = {target: True for target in targets}
     failed: Dict[str, str] = {}
@@ -462,10 +462,11 @@ def main_quality(args):
 
 
 def main_coupledl2_run(args):
-    """Initialize a CoupledL2 run workspace for the refactored workflow."""
+    """Run deterministic preflight and the active CoupledL2 stages."""
     from src.coupledl2.backend import CoupledL2BuildOperations
     from src.coupledl2.config import CoupledL2RunConfig
-    from src.coupledl2.workspace import create_coupledl2_workspace, initialize_stage_context
+    from src.coupledl2.preflight import CoupledL2Preflight
+    from src.coupledl2.workspace import create_coupledl2_workspace
     from src.core.tool_schemas import FORMAL_STAGES
     from src.core.llm_router import LLMRouter
     from src.core.workflow import FormalWorkflow
@@ -478,49 +479,44 @@ def main_coupledl2_run(args):
         property_category=args.property_category,
         run_root=Path(args.run_root),
     )
-    stage = args.stage or args.start_stage or "build_top_module"
+    stage = args.stage or "write_assertions"
+    if not (args.preflight_only or args.full or args.stage):
+        print("错误: CoupledL2 run requires --preflight-only, --stage, or --full")
+        sys.exit(2)
+    if args.stage and args.stage != "write_assertions":
+        print("错误: fresh run 只能从 write_assertions 开始；后续阶段恢复将在 runner commit 中提供")
+        sys.exit(2)
 
-    if args.dry_run_init or args.build_only:
-        workspace = create_coupledl2_workspace(config)
-        initialize_stage_context(workspace, stage)
+    logger = get_logger(
+        __name__,
+        console_output=False,
+        clear_log=True,
+        base_name=(
+            "application-coupledl2-preflight.log"
+            if args.preflight_only
+            else f"application-coupledl2-{stage}.log"
+        ),
+    )
+    workspace = create_coupledl2_workspace(config)
+    preflight = CoupledL2Preflight(
+        workspace,
+        CoupledL2BuildOperations(workspace, logger),
+    ).run()
 
-    if args.dry_run_init:
-        print("prepared CoupledL2 workspace only")
+    if args.preflight_only:
+        print("CoupledL2 preflight completed" if preflight["success"] else "CoupledL2 preflight failed")
         print(f"run_dir: {workspace.run_dir}")
-        print(f"manifest: {workspace.manifest_path}")
-        print(f"indexes: {workspace.indexes_dir}")
-        print(f"results: {workspace.results_dir}")
-        return
-
-    if args.build_only:
-        logger = get_logger(
-            __name__,
-            console_output=False,
-            clear_log=True,
-            base_name=f"application-coupledl2-{stage}.log",
-        )
-        backend = CoupledL2BuildOperations(workspace, logger)
-        result = backend.run_build_only()
-        print("build-only completed" if result.get("success") else "build-only failed")
-        print(json.dumps({
-            "run_dir": str(workspace.run_dir),
-            "success": result.get("success"),
-            "target": result.get("command", [None, None])[-1],
-            "top_module": result.get("top_module"),
-            "generated_files": result.get("generated_files", []),
-            "error": result.get("error"),
-        }, indent=2, ensure_ascii=False))
-        if not result.get("success"):
+        print(json.dumps(preflight, indent=2, ensure_ascii=False))
+        if not preflight["success"]:
             sys.exit(1)
         return
 
+    if not preflight["success"]:
+        print(f"CoupledL2 preflight failed: {preflight['termination_reason']}")
+        print(f"run_dir: {workspace.run_dir}")
+        sys.exit(1)
+
     if args.full or args.stage:
-        logger = get_logger(
-            __name__,
-            console_output=False,
-            clear_log=True,
-            base_name=f"application-coupledl2-{stage}.log",
-        )
         llm_client = LLMRouter(
             max_token_budget=getattr(args, "max_tokens", None),
             logger=logger,
@@ -533,10 +529,10 @@ def main_coupledl2_run(args):
             stage=stage,
             target=config.case_name,
             max_repair_rounds=args.max_repair_rounds,
-            coupledl2_config=config,
+            run_context=workspace,
         )
 
-        stages = [args.stage] if args.stage else FORMAL_STAGES[FORMAL_STAGES.index(stage):]
+        stages = [args.stage] if args.stage else FORMAL_STAGES
         completed_stage = None
         success = True
         for current_stage in stages:
@@ -568,7 +564,7 @@ def main_coupledl2_run(args):
             sys.exit(1)
         return
 
-    print("错误: CoupledL2 run currently supports --dry-run-init, --build-only, --stage, or --full")
+    print("错误: CoupledL2 run requires --preflight-only, --stage, or --full")
     sys.exit(2)
 
 
@@ -606,10 +602,6 @@ def get_default_query(stage: Optional[str] = None, target: str = "gigamax") -> s
         Default query string
     """
     benchmark_queries = {
-        "build_top_module": (
-            "Verify the existing Chisel test harness module. "
-            "If it already exists and is correct, confirm it. Otherwise, create or fix it."
-        ),
         "write_assertions": (
             "Add formal verification assertions to the design using ChiselFV or Chisel LTL. "
             "Place assertions directly inside the original DUT module/class emitted by VerilogGenerator, "
@@ -649,15 +641,13 @@ def parse_args():
     subparsers = parser.add_subparsers(dest='command', help='选择工作流')
 
     # 形式化验证
-    formal_parser = subparsers.add_parser('formal', help='五阶段形式化验证工作流')
+    formal_parser = subparsers.add_parser('formal', help='四阶段形式化验证工作流')
     formal_parser.add_argument('--full', action='store_true', help='运行完整工作流')
     formal_parser.add_argument('--stage', type=str,
-                               choices=['build_top_module', 'write_assertions',
+                               choices=['write_assertions',
                                         'invoke_verification', 'waveform_explanation',
                                         'propose_bugfix'],
                                help='运行单个阶段')
-    formal_parser.add_argument('--start-stage', type=str, default=None,
-                               help='从指定阶段开始（仅 --full 模式）')
     formal_parser.add_argument('--chisel-dir', type=str, default='chisel',
                                help='Chisel 项目目录（默认: chisel）')
     formal_parser.add_argument('--workspace-dir', type=str, default=os.path.abspath('.'),
@@ -737,7 +727,7 @@ def parse_args():
                                 help='单个 JasperGold 阶段的进程超时秒数')
 
     # CoupledL2 refactored workflow entrypoint
-    run_parser = subparsers.add_parser('run', help='CoupledL2 五阶段形式化验证工作流')
+    run_parser = subparsers.add_parser('run', help='CoupledL2 preflight + Stage 2-5 工作流')
     run_parser.add_argument('--case', type=str, required=True,
                             help='CoupledL2 case 目录')
     run_parser.add_argument('--mode', type=str, default='small', choices=['small'],
@@ -751,21 +741,14 @@ def parse_args():
     run_parser.add_argument('--run-root', type=str, default='runs',
                             help='run workspace 根目录（默认: runs）')
     run_parser.add_argument('--full', action='store_true',
-                            help='预留：运行完整五阶段流程')
+                            help='运行 Stage 2-5 完整流程')
     run_parser.add_argument('--stage', type=str, default=None,
-                            choices=['build_top_module', 'write_assertions',
+                            choices=['write_assertions',
                                      'invoke_verification', 'waveform_explanation',
                                      'propose_bugfix'],
-                            help='预留：运行单个阶段')
-    run_parser.add_argument('--start-stage', type=str, default=None,
-                            choices=['build_top_module', 'write_assertions',
-                                     'invoke_verification', 'waveform_explanation',
-                                     'propose_bugfix'],
-                            help='预留：从指定阶段开始')
-    run_parser.add_argument('--dry-run-init', action='store_true',
-                            help='仅执行 workflow/stage 初始化并退出')
-    run_parser.add_argument('--build-only', action='store_true',
-                            help='执行 CoupledL2 case-local Makefile 构建并写入 stage 1 artifacts')
+                            help='运行单个阶段')
+    run_parser.add_argument('--preflight-only', action='store_true',
+                            help='仅执行清理、索引、baseline build 和零旧断言 gate')
     run_parser.add_argument('--max-tokens', type=int, default=None,
                             help='Token 总量限制（所有 API 调用累计，超出后停止）')
     run_parser.add_argument('--max-repair-rounds', type=int, default=3,

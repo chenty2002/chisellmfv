@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional
 
 
 STAGE_SKILLS: Dict[str, List[str]] = {
-    "build_top_module": ["coupledl2_build.md", "coupledl2_harness.md"],
     "write_assertions": ["tilelink_protocol.md", "bounded_liveness.md", "chiselfv_assertions.md"],
     "invoke_verification": ["jaspergold.md"],
     "waveform_explanation": ["waveform_diagnosis.md"],
@@ -17,7 +16,6 @@ STAGE_SKILLS: Dict[str, List[str]] = {
 COMPATIBILITY_SKILLS = ["chiselfv_chisel3_assertions.md"]
 
 STAGE_RULES: Dict[str, List[str]] = {
-    "build_top_module": ["agent_rules.md"],
     "write_assertions": ["agent_rules.md"],
     "invoke_verification": ["agent_rules.md"],
     "waveform_explanation": ["agent_rules.md"],

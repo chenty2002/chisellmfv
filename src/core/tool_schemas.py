@@ -1,26 +1,17 @@
 """
 CoupledL2 formal workflow tool schemas.
 
-The formal workflow exposes only workspace-scoped CoupledL2 tools:
-  1. build_top_module
-  2. write_assertions
-  3. invoke_verification
-  4. waveform_explanation
-  5. propose_bugfix
+The formal workflow exposes only workspace-scoped CoupledL2 tools for stages 2-5.
 """
 
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Set
 
+from ..coupledl2.stages import COUPLEDL2_STAGES
 
-FORMAL_STAGES = [
-    "build_top_module",
-    "write_assertions",
-    "invoke_verification",
-    "waveform_explanation",
-    "propose_bugfix",
-]
+
+FORMAL_STAGES = COUPLEDL2_STAGES
 
 
 @dataclass(frozen=True)
@@ -445,7 +436,7 @@ def get_default_tool_registry() -> ToolRegistry:
     """Build the stage-aware registry for CoupledL2 workflow tools."""
     registry = ToolRegistry()
     all_stages = set(FORMAL_STAGES)
-    source_write_stages = {"build_top_module", "write_assertions", "propose_bugfix"}
+    source_write_stages = {"write_assertions", "propose_bugfix"}
 
     _register_many(registry, WORKSPACE_CONTEXT_TOOLS, all_stages)
     _register_many(registry, [READ_FILES_TOOL], all_stages)
@@ -465,20 +456,20 @@ def get_default_tool_registry() -> ToolRegistry:
     _register_many(
         registry,
         [COMPLETE_STAGE_TOOL],
-        {"build_top_module", "write_assertions", "waveform_explanation", "propose_bugfix"},
+        {"write_assertions", "waveform_explanation", "propose_bugfix"},
         audit_level="completion",
     )
     return registry
 
 
-def get_coupledl2_tool_schemas(formal_stage: str = "build_top_module") -> List[Dict[str, Any]]:
+def get_coupledl2_tool_schemas(formal_stage: str = "write_assertions") -> List[Dict[str, Any]]:
     """Return CoupledL2-only tools."""
-    stage = formal_stage if formal_stage in FORMAL_STAGES else "build_top_module"
+    stage = formal_stage if formal_stage in FORMAL_STAGES else "write_assertions"
     return get_default_tool_registry().get_tool_schemas(stage)
 
 
 def get_tool_schemas(
-    formal_stage: str = "build_top_module",
+    formal_stage: str = "write_assertions",
     target: Optional[str] = None,
     coupledl2: bool = False,
 ) -> List[Dict[str, Any]]:
