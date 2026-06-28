@@ -29,7 +29,6 @@ from .llm_client import (
     estimate_chat_request_tokens,
 )
 from .llm_router import LLMRouter
-from ..utils.llm_properties import MAX_ITERATIONS, WAVEFORM_MAX_ITER
 from ..utils.llm_logging import LLMLogger
 from ..utils.file_utils import *
 from .prompt_builder import (
@@ -38,8 +37,10 @@ from .prompt_builder import (
     build_user_prompt,
     build_assistant_tool_call_message,
     build_tool_result_message,
-    build_compilation_error_message
+    build_compilation_error_message,
+    build_budget_directive,
 )
+from .budget import BudgetViolation, StageBudget
 from .context_compactor import FlashContextCompactor
 from .escape_policy import EscapePolicy
 from .records import (
@@ -53,7 +54,10 @@ try:
     from .waveform_actions import WaveformActions
 except ModuleNotFoundError:
     WaveformActions = None
-from .tool_schemas import get_tool_schemas, convert_tool_call_to_action
+from .tool_schemas import (
+    convert_tool_call_to_action,
+    get_budgeted_tool_schemas,
+)
 from .actions import execute_stage_actions, _resolve_workspace_path, _workspace_relative
 from ..coupledl2.backend import CoupledL2BuildOperations
 from .repair_loop import (
@@ -554,12 +558,14 @@ class FormalWorkflow:
         Uses message history with roles: system, user, assistant, tool
         This replaces the previous iteration-in-prompt approach.
         """
-        # Use stage-specific max iterations
-        if stage == "waveform_explanation":
-            max_iterations = WAVEFORM_MAX_ITER
-        else:
-            max_iterations = MAX_ITERATIONS
-        
+        spec = get_stage_spec(stage)
+        stage_budget = StageBudget(
+            stage=stage,
+            tool_call_limit=spec.tool_budget,
+            discovery_limit=spec.discovery_budget,
+            finalization_reserve=spec.finalization_reserve,
+            model_turn_limit=spec.model_turn_budget,
+        )
         iterations = []
         iteration_count = 0
         stage_dir = self._coupledl2_stage_dir(stage)
@@ -572,13 +578,6 @@ class FormalWorkflow:
             else None
         )
         self.escape_policy = EscapePolicy()
-        
-        tool_schemas = get_tool_schemas(
-            stage,
-            target=self.target,
-            coupledl2=self.run_context is not None,
-        )
-        cache_metadata = self._build_prompt_cache_metadata(stage, tool_schemas)
         
         # Load analysis report for propose_bugfix stage
         analysis_report = self._load_analysis_report(stage)
@@ -619,12 +618,39 @@ class FormalWorkflow:
         # Build initial message history
         messages = self._build_initial_messages(context, stage, None, analysis_report)
         
-        for i in range(1, max_iterations + 1):
+        for i in range(1, spec.model_turn_budget + 1):
+            forced_finalization = stage_budget.begin_model_turn()
+            budget_snapshot = stage_budget.snapshot()
+            self._record_budget_event(
+                stage,
+                "forced_finalization" if forced_finalization else "budget_state",
+                stage_budget,
+            )
+            force_completion = (
+                forced_finalization
+                or budget_snapshot.completion_required
+                or budget_snapshot.tool_calls_remaining == 1
+            )
+            tool_schemas = get_budgeted_tool_schemas(
+                stage,
+                phase=budget_snapshot.phase,
+                tool_calls_remaining=budget_snapshot.tool_calls_remaining,
+                forced_finalization=forced_finalization,
+                completion_required=budget_snapshot.completion_required,
+            )
+            cache_metadata = self._build_prompt_cache_metadata(stage, tool_schemas)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": build_budget_directive(budget_snapshot),
+                }
+            )
             compaction_error = self._maybe_compact_stage_context(
                 stage,
                 context,
                 messages,
                 context_compactor,
+                stage_budget=stage_budget,
                 force=self._stage_request_needs_compaction(
                     stage,
                     messages,
@@ -645,6 +671,19 @@ class FormalWorkflow:
                 task_type="stage_loop",
                 prompt_cache_key=cache_metadata["prompt_cache_key"],
                 usage_metadata=cache_metadata,
+                tool_choice=(
+                    {
+                        "type": "function",
+                        "function": {"name": "complete_stage"},
+                    }
+                    if force_completion
+                    else "required"
+                ),
+                enable_thinking=(
+                    False
+                    if force_completion
+                    else None
+                ),
             )
             
             try:
@@ -652,7 +691,14 @@ class FormalWorkflow:
                 
                 if response["type"] == "function_calls":
                     result = self._handle_function_calls(
-                        response, stage, context, iterations, iteration_count, messages
+                        response,
+                        stage,
+                        context,
+                        iterations,
+                        iteration_count,
+                        messages,
+                        stage_budget,
+                        {schema["name"] for schema in tool_schemas},
                     )
                     iteration_count = result["iteration_count"]
                     
@@ -660,7 +706,11 @@ class FormalWorkflow:
                         return result["result"]
 
                     compaction_error = self._maybe_compact_stage_context(
-                        stage, context, messages, context_compactor
+                        stage,
+                        context,
+                        messages,
+                        context_compactor,
+                        stage_budget=stage_budget,
                     )
                     if compaction_error:
                         return self._context_compaction_failure(
@@ -672,7 +722,11 @@ class FormalWorkflow:
                         response, stage, context, iterations, iteration_count, messages
                     )
                     compaction_error = self._maybe_compact_stage_context(
-                        stage, context, messages, context_compactor
+                        stage,
+                        context,
+                        messages,
+                        context_compactor,
+                        stage_budget=stage_budget,
                     )
                     if compaction_error:
                         return self._context_compaction_failure(
@@ -693,18 +747,24 @@ class FormalWorkflow:
                     "content": f"Error occurred: {str(e)}. Please try again with tool calls only."
                 })
                 compaction_error = self._maybe_compact_stage_context(
-                    stage, context, messages, context_compactor
+                    stage,
+                    context,
+                    messages,
+                    context_compactor,
+                    stage_budget=stage_budget,
                 )
                 if compaction_error:
                     return self._context_compaction_failure(
                         iterations, compaction_error
                     )
         
-        return {
-            "success": False,
-            "iterations": iterations,
-            "error": "Max iterations reached",
-        }
+        snapshot = stage_budget.snapshot()
+        reason = (
+            "model_turn_budget_exhausted_after_completion_attempt"
+            if snapshot.completion_attempted
+            else "completion_not_attempted_internal_error"
+        )
+        return self._budget_failure(reason, iterations, stage_budget)
 
     def _build_prompt_cache_metadata(
         self,
@@ -733,6 +793,8 @@ class FormalWorkflow:
         task_type: str,
         prompt_cache_key: Optional[str],
         usage_metadata: Dict[str, str],
+        tool_choice: Any = "required",
+        enable_thinking: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Call either LLMRouter or a single LLMClient."""
         metadata = dict(usage_metadata)
@@ -744,6 +806,8 @@ class FormalWorkflow:
                 task_type=task_type,
                 prompt_cache_key=prompt_cache_key,
                 usage_metadata=metadata,
+                tool_choice=tool_choice,
+                enable_thinking=enable_thinking,
             )
         if self.llm is None:
             raise ValueError("LLM client is not configured for model-backed stage execution")
@@ -753,6 +817,8 @@ class FormalWorkflow:
             tool_schemas,
             prompt_cache_key=prompt_cache_key,
             usage_metadata=metadata,
+            tool_choice=tool_choice,
+            enable_thinking=enable_thinking,
         )
     
     def _build_initial_messages(
@@ -807,6 +873,8 @@ class FormalWorkflow:
         iterations: list,
         iteration_count: int,
         messages: List[Dict[str, Any]],
+        stage_budget: StageBudget,
+        available_tools: set,
     ) -> Dict[str, Any]:
         """
         Handle function call responses from LLM.
@@ -817,6 +885,39 @@ class FormalWorkflow:
         """
         function_calls = response["function_calls"]
         raw_message = response.get("raw_message", {})
+        if not hasattr(self, "escape_policy"):
+            self.escape_policy = EscapePolicy()
+
+        tool_names = [call["name"] for call in function_calls]
+        try:
+            stage_budget.consume_batch(
+                tool_names,
+                available_tools=available_tools,
+            )
+        except BudgetViolation as exc:
+            self._record_budget_event(
+                stage,
+                "budget_violation",
+                stage_budget,
+                success=False,
+                data={"error": str(exc), "tool_names": tool_names},
+            )
+            return {
+                "completed": True,
+                "result": self._budget_failure(
+                    "tool_budget_violation",
+                    iterations,
+                    stage_budget,
+                    error=str(exc),
+                ),
+                "iteration_count": iteration_count,
+            }
+        self._record_budget_event(
+            stage,
+            "tool_budget_consumed",
+            stage_budget,
+            data={"tool_names": tool_names},
+        )
         
         actions = [convert_tool_call_to_action(fc["name"], fc["arguments"]) 
                   for fc in function_calls]
@@ -826,8 +927,30 @@ class FormalWorkflow:
         self.logger.info(f"Stage {stage} Iteration {iteration_count} Actions: {[a['type'] for a in actions]}")
         print(f"  Iteration {iteration_count}: {[a['type'] for a in actions]}")
         
-        # Execute actions
-        action_results = self._execute_stage_actions(actions, stage)
+        # Execute actions, replacing known no-progress repeats with compact
+        # rejection results instead of replaying the underlying operation.
+        action_results = []
+        for function_call, action in zip(function_calls, actions):
+            rejection = self.escape_policy.rejection_for(stage, function_call)
+            if rejection:
+                rejected_result = {
+                    "type": action["type"],
+                    "success": False,
+                    "error": rejection,
+                    "no_progress_rejected": True,
+                }
+                self._record_stage_operations(
+                    stage,
+                    [action],
+                    [rejected_result],
+                    {},
+                )
+                action_results.append(rejected_result)
+            else:
+                action_results.extend(self._execute_stage_actions([action], stage))
+        budget_payload = stage_budget.snapshot().to_dict()
+        for action_result in action_results:
+            action_result["_budget"] = budget_payload
         
         # Store iteration data
         iteration = {
@@ -865,9 +988,41 @@ class FormalWorkflow:
                     args, stage, context, iterations, iteration_count, messages
                 )
                 if result:
+                    stage_budget.mark_completion(True)
+                    self._record_budget_event(
+                        stage,
+                        "completion_gate",
+                        stage_budget,
+                        success=True,
+                    )
+                    result.update(
+                        {
+                            "completion_attempted": True,
+                            "completion_accepted": True,
+                            "termination_reason": "completed",
+                            "budget": stage_budget.snapshot().to_dict(),
+                        }
+                    )
                     return {
                         "completed": True,
                         "result": result,
+                        "iteration_count": iteration_count,
+                    }
+                stage_budget.mark_completion(False)
+                self._record_budget_event(
+                    stage,
+                    "completion_gate",
+                    stage_budget,
+                    success=False,
+                )
+                if stage_budget.tool_calls_remaining == 0 or stage_budget.forced_finalization:
+                    return {
+                        "completed": True,
+                        "result": self._budget_failure(
+                            "completion_gate_failed_after_budget_finalization",
+                            iterations,
+                            stage_budget,
+                        ),
                         "iteration_count": iteration_count,
                     }
         
@@ -880,6 +1035,7 @@ class FormalWorkflow:
         messages: List[Dict[str, Any]],
         compactor: Optional[FlashContextCompactor],
         *,
+        stage_budget: Optional[StageBudget] = None,
         force: bool = False,
     ) -> Optional[str]:
         """Use Flash to compact old turns without losing the raw audit trail."""
@@ -887,14 +1043,23 @@ class FormalWorkflow:
             return None
 
         spec = get_stage_spec(stage)
-        tool_calls_used = sum(
-            len(iteration.get("function_calls", []) or [])
-            for iteration in context.get("iterations", [])
+        stage_snapshot = stage_budget.snapshot() if stage_budget is not None else None
+        tool_calls_used = (
+            stage_snapshot.tool_calls_used
+            if stage_snapshot is not None
+            else sum(
+                len(iteration.get("function_calls", []) or [])
+                for iteration in context.get("iterations", [])
+            )
         )
         ledger = getattr(self.llm, "budget_ledger", None)
         budget_snapshot = {
             "tool_calls_used": tool_calls_used,
-            "tool_calls_remaining": max(0, spec.tool_budget - tool_calls_used),
+            "tool_calls_remaining": (
+                stage_snapshot.tool_calls_remaining
+                if stage_snapshot is not None
+                else max(0, spec.tool_budget - tool_calls_used)
+            ),
             "tokens_remaining": (
                 ledger.tokens_remaining(stage)
                 if ledger is not None
@@ -920,6 +1085,53 @@ class FormalWorkflow:
                 result.tokens_after,
             )
         return result.error
+
+    def _record_budget_event(
+        self,
+        stage: str,
+        event: str,
+        stage_budget: StageBudget,
+        *,
+        success: Optional[bool] = None,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        stage_dir = self._coupledl2_stage_dir(stage)
+        if stage_dir is None:
+            return
+        payload = dict(data or {})
+        payload["budget"] = stage_budget.snapshot().to_dict()
+        self._append_jsonl(
+            stage_dir / "stage_events.jsonl",
+            make_stage_event(
+                event=event,
+                stage=stage,
+                success=success,
+                data=payload,
+            ),
+        )
+
+    @staticmethod
+    def _budget_failure(
+        termination_reason: str,
+        iterations: List[Dict[str, Any]],
+        stage_budget: StageBudget,
+        *,
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        snapshot = stage_budget.snapshot()
+        result = {
+            "success": False,
+            "iterations": iterations,
+            "completion_attempted": snapshot.completion_attempted,
+            "completion_accepted": snapshot.completion_accepted,
+            "termination_reason": termination_reason,
+            "budget": snapshot.to_dict(),
+            "recoverable": termination_reason
+            != "completion_not_attempted_internal_error",
+        }
+        if error:
+            result["error"] = error
+        return result
 
     def _stage_request_needs_compaction(
         self,

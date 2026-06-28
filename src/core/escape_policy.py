@@ -30,6 +30,15 @@ class EscapePolicy:
         self.config = config or EscapePolicyConfig()
         self._counts: Dict[str, int] = {}
         self._notified: Set[str] = set()
+        self._blocked_calls: Dict[str, str] = {}
+
+    def rejection_for(
+        self,
+        stage: str,
+        function_call: Dict[str, Any],
+    ) -> Optional[str]:
+        """Return a stable rejection reason for a known no-progress call."""
+        return self._blocked_calls.get(self._call_key(stage, function_call))
 
     def observe(
         self,
@@ -45,10 +54,24 @@ class EscapePolicy:
             action = self._observe_repeated_waveform_value(stage, function_call, result)
             if action is not None:
                 actions.append(action)
+                self._blocked_calls[self._call_key(stage, function_call)] = (
+                    "rejected because the identical waveform query made no progress"
+                )
 
             action = self._observe_empty_rg(function_call, result)
             if action is not None:
                 actions.append(action)
+                self._blocked_calls[self._call_key(stage, function_call)] = (
+                    "rejected because the repeated empty rg search made no progress"
+                )
+
+            if (
+                function_call.get("name") in {"read_skill", "read_rule"}
+                and result.get("success")
+            ):
+                self._blocked_calls[self._call_key(stage, function_call)] = (
+                    f"{function_call.get('name')} content is already loaded"
+                )
 
         if messages is not None and len(messages) >= self.config.compact_after_messages:
             actions.append(
@@ -158,3 +181,13 @@ class EscapePolicy:
     @staticmethod
     def _count_key(parts: Dict[str, Any]) -> str:
         return json.dumps(parts, ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def _call_key(cls, stage: str, function_call: Dict[str, Any]) -> str:
+        return cls._count_key(
+            {
+                "stage": stage,
+                "tool": function_call.get("name"),
+                "arguments": function_call.get("arguments") or {},
+            }
+        )

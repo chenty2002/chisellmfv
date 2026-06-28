@@ -13,6 +13,8 @@ class StageSpec:
     execution_kind: str
     required_predecessor: Optional[str]
     tool_budget: int
+    discovery_budget: int
+    finalization_reserve: int
     model_turn_budget: int
     token_budget: Optional[int]
     completion_gate: str
@@ -30,7 +32,9 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         execution_kind="agent",
         required_predecessor="preflight",
         tool_budget=24,
-        model_turn_budget=10,
+        discovery_budget=12,
+        finalization_reserve=4,
+        model_turn_budget=12,
         token_budget=48000,
         completion_gate="assertion_compilation",
         artifact_contract=("assertion_map.json", "generated_assertion_scan.json"),
@@ -41,6 +45,8 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         execution_kind="deterministic",
         required_predecessor="write_assertions",
         tool_budget=0,
+        discovery_budget=0,
+        finalization_reserve=0,
         model_turn_budget=0,
         token_budget=None,
         completion_gate="formal_result",
@@ -51,8 +57,10 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         ordinal=4,
         execution_kind="agent",
         required_predecessor="invoke_verification",
-        tool_budget=18,
-        model_turn_budget=8,
+        tool_budget=36,
+        discovery_budget=24,
+        finalization_reserve=3,
+        model_turn_budget=30,
         token_budget=64000,
         completion_gate="diagnosis",
         artifact_contract=("diagnosis.json", "counterexample_analysis.md"),
@@ -62,8 +70,10 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         ordinal=5,
         execution_kind="agent",
         required_predecessor="waveform_explanation",
-        tool_budget=18,
-        model_turn_budget=10,
+        tool_budget=20,
+        discovery_budget=10,
+        finalization_reserve=4,
+        model_turn_budget=12,
         token_budget=40000,
         completion_gate="repair_regression",
         artifact_contract=("repair_result.json", "repair_history.json"),

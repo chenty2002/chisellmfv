@@ -525,6 +525,7 @@ class LLMClient:
                         max_tokens: int = DEFAULT_CHAT_MAX_TOKENS,
                         temperature: float = 0.5,
                         tool_choice: Optional[Union[str, Dict[str, Any]]] = "required",
+                        enable_thinking: Optional[bool] = None,
                         prompt_cache_key: Optional[str] = None,
                         prompt_cache_retention: Optional[str] = None,
                         usage_metadata: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -569,6 +570,10 @@ class LLMClient:
             # fields belong at the top level rather than under SDK-only
             # wrappers such as `extra_body`.
             payload.update(self.llm_extra_body)
+        if enable_thinking is not None and self._is_deepseek_endpoint():
+            payload["thinking"] = {
+                "type": "enabled" if enable_thinking else "disabled"
+            }
         self._adjust_payload_for_provider(payload)
 
         # Count tokens in all messages

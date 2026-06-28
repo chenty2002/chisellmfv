@@ -8,6 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Set
 
+from .budget import BudgetPhase
 from ..coupledl2.stages import COUPLEDL2_STAGES
 
 
@@ -466,6 +467,41 @@ def get_coupledl2_tool_schemas(formal_stage: str = "write_assertions") -> List[D
     """Return CoupledL2-only tools."""
     stage = formal_stage if formal_stage in FORMAL_STAGES else "write_assertions"
     return get_default_tool_registry().get_tool_schemas(stage)
+
+
+def get_budgeted_tool_schemas(
+    formal_stage: str,
+    *,
+    phase: BudgetPhase,
+    tool_calls_remaining: int,
+    forced_finalization: bool = False,
+    completion_required: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return the runtime tool surface allowed by the current budget phase."""
+    schemas = get_coupledl2_tool_schemas(formal_stage)
+    if forced_finalization or completion_required or tool_calls_remaining <= 1:
+        allowed = {"complete_stage"}
+    elif phase is BudgetPhase.DISCOVERY:
+        return schemas
+    elif formal_stage in {"write_assertions", "propose_bugfix"}:
+        allowed = (
+            {"read_files", "edit_file", "complete_stage"}
+            if phase is BudgetPhase.EXECUTION
+            else {"edit_file", "complete_stage"}
+        )
+    elif formal_stage == "waveform_explanation":
+        evidence_tools = {
+            schema["name"]
+            for schema in WAVEFORM_TOOLS + CAUSAL_TOOLS
+        }
+        allowed = (
+            evidence_tools | {"read_files", "write_report", "complete_stage"}
+            if phase is BudgetPhase.EXECUTION
+            else {"write_report", "complete_stage"}
+        )
+    else:
+        allowed = set()
+    return [schema for schema in schemas if schema["name"] in allowed]
 
 
 def get_tool_schemas(

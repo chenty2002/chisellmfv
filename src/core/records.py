@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 
 TOOL_RESULT_SCHEMA_VERSION = "tool_result.v1"
-STAGE_RESULT_SCHEMA_VERSION = "stage_result.v1"
+STAGE_RESULT_SCHEMA_VERSION = "stage_result.v2"
 STAGE_EVENT_SCHEMA_VERSION = "stage_event.v1"
 RUN_COST_SUMMARY_SCHEMA_VERSION = "run_cost_summary.v1"
 OPERATION_SCHEMA_VERSION = "operation.v1"

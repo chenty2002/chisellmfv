@@ -15,10 +15,12 @@ This module provides:
 from typing import Dict, Any, Optional, List
 import json
 import os
-from ..utils.llm_properties import MAX_ITERATIONS, WAVEFORM_MAX_ITER
+
+from .budget import StageBudgetSnapshot
+from ..coupledl2.stages import get_stage_spec
 
 
-PROMPT_VERSION = "coupledl2-v2-chisel-compat"
+PROMPT_VERSION = "coupledl2-v3-stage-budget"
 
 def build_system_prompt(
     stage: str = "write_assertions",
@@ -33,10 +35,7 @@ def build_system_prompt(
     Stage-specific details live in workspace skills/rules listed by the user
     prompt. This keeps the main workflow prompt small and stable.
     """
-    if stage == "waveform_explanation":
-        max_iter = WAVEFORM_MAX_ITER
-    else:
-        max_iter = MAX_ITERATIONS
+    spec = get_stage_spec(stage)
 
     base_prompt = [
         "# CoupledL2 Formal Verification Assistant",
@@ -56,15 +55,35 @@ def build_system_prompt(
         "- Read exact source slices with line-limited tools before modifying files.",
         "- Keep edits inside the run workspace and cite concrete evidence in completion summaries.",
         "",
+        "## Budget Contract",
+        "- Tool calls are a hard budget, counted per call rather than per response.",
+        "- Preserve the finalization reserve; never spend the last reserved call on reading, searching, or editing.",
+        "- A stage has no result until `complete_stage` is accepted by the deterministic gate.",
+        "- When FINALIZATION begins, stop broad investigation and produce the smallest evidence-backed edit or report.",
+        "- When only one call remains, call `complete_stage`. Do not request any other tool.",
+        "",
         "## Stage Instructions",
         f"## Current Stage: {stage.replace('_', ' ').title()}",
         "",
-        f"## Iteration Limit",
-        f"Maximum iterations allowed: {max_iter}. Make each iteration count.",
+        "## Model Turn Limit",
+        f"Maximum model turns allowed: {spec.model_turn_budget}.",
         "",
     ]
 
     return "\n".join(base_prompt + _build_coupledl2_stage_prompt(stage))
+
+
+def build_budget_directive(snapshot: StageBudgetSnapshot) -> str:
+    """Build the short runtime directive appended before each model turn."""
+    return (
+        "## Runtime Budget\n"
+        f"phase={snapshot.phase.value}; "
+        f"tool_calls_used={snapshot.tool_calls_used}; "
+        f"tool_calls_remaining={snapshot.tool_calls_remaining}; "
+        f"non_completion_calls_remaining={snapshot.non_completion_calls_remaining}; "
+        f"model_turns_remaining={snapshot.model_turns_remaining}; "
+        f"required_next_action={snapshot.required_next_action}."
+    )
 
 
 def _display_path(path: Optional[str], workspace_dir: Optional[str]) -> str:
