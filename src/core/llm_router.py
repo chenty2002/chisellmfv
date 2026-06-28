@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
+from .budget import RunBudgetLedger
 from .llm_client import LLMClient
 from ..utils.config import get_endpoint_overrides
 
@@ -25,6 +26,7 @@ class LLMRouter:
         *,
         logger: Optional[logging.Logger] = None,
         max_token_budget: Optional[int] = None,
+        stage_token_limits: Optional[Mapping[str, int]] = None,
         client_cls=LLMClient,
         **client_kwargs: Any,
     ):
@@ -32,10 +34,14 @@ class LLMRouter:
         default_model = overrides["llm_model"]
         pro_model = overrides["llm_model_pro"] or default_model
         flash_model = overrides["llm_model_flash"] or default_model
+        self.budget_ledger = RunBudgetLedger(
+            max_token_budget,
+            stage_token_limits=stage_token_limits,
+        )
 
         common_kwargs = dict(client_kwargs)
         common_kwargs.setdefault("logger", logger)
-        common_kwargs.setdefault("max_token_budget", max_token_budget)
+        common_kwargs.setdefault("budget_ledger", self.budget_ledger)
 
         self.pro_client = client_cls(
             model=pro_model,
@@ -110,20 +116,30 @@ class LLMRouter:
             "pro": self.pro_client.model,
             "flash": self.flash_client.model,
         }
+        merged["budget"] = self.budget_ledger.snapshot().to_dict()
         return merged
 
     def print_token_usage(
         self,
         logger: Optional[logging.Logger] = None,
-        include_cache_breakdown: bool = True,
     ) -> None:
+        usage = self.get_token_usage()
+        snapshot = usage["budget"]
+        message = (
+            "Combined PRO+FLASH token usage: "
+            f"calls={usage.get('llm_calls', 0)}, "
+            f"prompt={usage.get('llm_prompt_tokens', 0)}, "
+            f"completion={usage.get('llm_completion_tokens', 0)}, "
+            f"total={usage.get('llm_total_tokens', 0)}, "
+            f"hard_limit={snapshot.get('hard_token_limit')}, "
+            f"remaining={snapshot.get('tokens_remaining')}"
+        )
         if logger:
-            logger.info("PRO model token usage:")
-        self.pro_client.print_token_usage(logger, include_cache_breakdown)
-        if logger:
-            logger.info("FLASH model token usage:")
-        self.flash_client.print_token_usage(logger, include_cache_breakdown)
+            logger.info(message)
+        else:
+            print(message)
 
     def reset_token_usage(self) -> None:
         self.pro_client.reset_token_usage()
         self.flash_client.reset_token_usage()
+        self.budget_ledger.reset()

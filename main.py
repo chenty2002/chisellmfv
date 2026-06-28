@@ -466,6 +466,7 @@ def main_coupledl2_run(args):
     from src.coupledl2.backend import CoupledL2BuildOperations
     from src.coupledl2.config import CoupledL2RunConfig
     from src.coupledl2.preflight import CoupledL2Preflight
+    from src.coupledl2.stages import STAGE_SPECS
     from src.coupledl2.workspace import create_coupledl2_workspace
     from src.core.tool_schemas import FORMAL_STAGES
     from src.core.llm_router import LLMRouter
@@ -519,6 +520,11 @@ def main_coupledl2_run(args):
     if args.full or args.stage:
         llm_client = LLMRouter(
             max_token_budget=getattr(args, "max_tokens", None),
+            stage_token_limits={
+                spec.name: spec.token_budget
+                for spec in STAGE_SPECS
+                if spec.token_budget is not None
+            },
             logger=logger,
         )
         workflow = FormalWorkflow(

@@ -174,6 +174,7 @@ def build_run_cost_summary(token_usage: Optional[Dict[str, Any]]) -> Dict[str, A
             "output_tokens": int(usage.get("reranker_output_tokens", 0) or 0),
         },
         "model_roles": model_roles,
+        "budget": dict(usage.get("budget") or {}),
     }
 
 

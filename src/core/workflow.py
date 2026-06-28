@@ -23,7 +23,11 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import logging
 
-from .llm_client import LLMClient, TokenBudgetExceeded
+from .llm_client import (
+    LLMClient,
+    TokenBudgetExceeded,
+    estimate_chat_request_tokens,
+)
 from .llm_router import LLMRouter
 from ..utils.llm_properties import MAX_ITERATIONS, WAVEFORM_MAX_ITER
 from ..utils.llm_logging import LLMLogger
@@ -36,7 +40,7 @@ from .prompt_builder import (
     build_tool_result_message,
     build_compilation_error_message
 )
-from .context_manager import EvidenceNotebook, StageNotebook, compact_messages_with_notebook
+from .context_compactor import FlashContextCompactor
 from .escape_policy import EscapePolicy
 from .records import (
     OPERATION_SCHEMA_VERSION,
@@ -66,6 +70,7 @@ from ..coupledl2.workspace import (
     StageContext,
     initialize_stage_context,
 )
+from ..coupledl2.stages import get_stage_spec
 from ..causal_analysis import (
     CausalAnalysisActions,
     run_causal_analysis_result_if_available,
@@ -557,13 +562,13 @@ class FormalWorkflow:
         
         iterations = []
         iteration_count = 0
-        stage_notebook = (
-            EvidenceNotebook()
-            if stage == "waveform_explanation"
-            and "no_waveform_notebook" not in self.ablation_modes
-            else StageNotebook(stage=stage)
-            if stage != "waveform_explanation"
-            and "no_stage_notebook" not in self.ablation_modes
+        stage_dir = self._coupledl2_stage_dir(stage)
+        context_compactor = (
+            FlashContextCompactor(
+                self.llm,
+                stage_dir / "context_compactions.jsonl",
+            )
+            if isinstance(self.llm, LLMRouter) and stage_dir is not None
             else None
         )
         self.escape_policy = EscapePolicy()
@@ -615,6 +620,21 @@ class FormalWorkflow:
         messages = self._build_initial_messages(context, stage, None, analysis_report)
         
         for i in range(1, max_iterations + 1):
+            compaction_error = self._maybe_compact_stage_context(
+                stage,
+                context,
+                messages,
+                context_compactor,
+                force=self._stage_request_needs_compaction(
+                    stage,
+                    messages,
+                    tool_schemas,
+                ),
+            )
+            if compaction_error:
+                return self._context_compaction_failure(
+                    iterations, compaction_error
+                )
             self._log_llm_request(stage, i, [messages[0], messages[-1]], tool_schemas)
             
             # Use chat_with_tools for agent loop style API call
@@ -639,17 +659,25 @@ class FormalWorkflow:
                     if result.get("completed"):
                         return result["result"]
 
-                    self._maybe_compact_stage_context(
-                        stage, context, messages, stage_notebook
+                    compaction_error = self._maybe_compact_stage_context(
+                        stage, context, messages, context_compactor
                     )
+                    if compaction_error:
+                        return self._context_compaction_failure(
+                            iterations, compaction_error
+                        )
                 else:
                     # LLM returned text instead of tool calls - add error message and retry
                     iteration_count = self._handle_text_response(
                         response, stage, context, iterations, iteration_count, messages
                     )
-                    self._maybe_compact_stage_context(
-                        stage, context, messages, stage_notebook
+                    compaction_error = self._maybe_compact_stage_context(
+                        stage, context, messages, context_compactor
                     )
+                    if compaction_error:
+                        return self._context_compaction_failure(
+                            iterations, compaction_error
+                        )
                     
             except TokenBudgetExceeded:
                 raise  # Always propagate token budget errors
@@ -664,9 +692,13 @@ class FormalWorkflow:
                     "role": "user",
                     "content": f"Error occurred: {str(e)}. Please try again with tool calls only."
                 })
-                self._maybe_compact_stage_context(
-                    stage, context, messages, stage_notebook
+                compaction_error = self._maybe_compact_stage_context(
+                    stage, context, messages, context_compactor
                 )
+                if compaction_error:
+                    return self._context_compaction_failure(
+                        iterations, compaction_error
+                    )
         
         return {
             "success": False,
@@ -846,22 +878,74 @@ class FormalWorkflow:
         stage: str,
         context: Dict[str, Any],
         messages: List[Dict[str, Any]],
-        notebook: Optional[StageNotebook],
-    ) -> None:
-        """Compact long waveform histories into a deterministic evidence notebook."""
-        if notebook is None:
-            return
+        compactor: Optional[FlashContextCompactor],
+        *,
+        force: bool = False,
+    ) -> Optional[str]:
+        """Use Flash to compact old turns without losing the raw audit trail."""
+        if compactor is None:
+            return None
 
-        iterations = context.get("iterations", [])
-        if iterations:
-            notebook.record_iteration(iterations[-1])
-
-        changed = compact_messages_with_notebook(messages, notebook)
-        if changed:
+        spec = get_stage_spec(stage)
+        tool_calls_used = sum(
+            len(iteration.get("function_calls", []) or [])
+            for iteration in context.get("iterations", [])
+        )
+        ledger = getattr(self.llm, "budget_ledger", None)
+        budget_snapshot = {
+            "tool_calls_used": tool_calls_used,
+            "tool_calls_remaining": max(0, spec.tool_budget - tool_calls_used),
+            "tokens_remaining": (
+                ledger.tokens_remaining(stage)
+                if ledger is not None
+                else None
+            ),
+        }
+        result = compactor.compact(
+            messages,
+            stage=stage,
+            stage_contract={
+                "objective": stage,
+                "completion_gate": spec.completion_gate,
+                "artifact_contract": list(spec.artifact_contract),
+            },
+            budget_snapshot=budget_snapshot,
+            force=force,
+        )
+        if result.compacted:
             self.logger.info(
-                f"Compacted {stage} message history into evidence notebook "
-                f"({len(messages)} messages retained)."
+                "Compacted %s history with Flash (%d -> %d estimated tokens).",
+                stage,
+                result.tokens_before,
+                result.tokens_after,
             )
+        return result.error
+
+    def _stage_request_needs_compaction(
+        self,
+        stage: str,
+        messages: List[Dict[str, Any]],
+        tool_schemas: List[Dict[str, Any]],
+    ) -> bool:
+        ledger = getattr(self.llm, "budget_ledger", None)
+        if ledger is None:
+            return False
+        remaining = ledger.tokens_remaining(stage)
+        if remaining is None:
+            return False
+        return estimate_chat_request_tokens(messages, tool_schemas) > remaining
+
+    @staticmethod
+    def _context_compaction_failure(
+        iterations: List[Dict[str, Any]],
+        error: str,
+    ) -> Dict[str, Any]:
+        return {
+            "success": False,
+            "iterations": iterations,
+            "termination_reason": "context_compaction_failed",
+            "error": error,
+        }
 
     def _handle_repeated_tool_calls(
         self,

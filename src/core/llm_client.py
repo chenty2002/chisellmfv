@@ -12,20 +12,11 @@ except ImportError:  # pragma: no cover - exercised only in minimal envs
 
 from ..utils.llm_properties import *
 from ..utils.config import get_endpoint_overrides
+from .budget import RunBudgetLedger, TokenBudgetExceeded
 
 # Global tokenizer instance for efficiency
 _tokenizer_cache: Dict[str, Any] = {}
-
-
-class TokenBudgetExceeded(Exception):
-    """Raised when cumulative token usage exceeds the configured budget."""
-
-    def __init__(self, budget: int, used: int):
-        self.budget = budget
-        self.used = used
-        super().__init__(
-            f"Token budget exceeded: used {used} tokens, budget is {budget} tokens"
-        )
+DEFAULT_CHAT_MAX_TOKENS = 16384
 
 
 _MISSING_API_KEY_MSG = (
@@ -49,7 +40,8 @@ class LLMClient:
                  embedding_model: Optional[str] = None,
                  reranker_model: Optional[str] = None,
                  llm_extra_body: Optional[Dict[str, Any]] = None,
-                 model_role: Optional[str] = None):
+                 model_role: Optional[str] = None,
+                 budget_ledger: Optional[RunBudgetLedger] = None):
         """
         Initialize the LLM client.
 
@@ -64,6 +56,7 @@ class LLMClient:
             embedding_model / reranker_model: Optional model overrides
             llm_extra_body: Optional extra request fields for chat completion API
             model_role: Optional logical role for usage attribution
+            budget_ledger: Shared run-wide token ledger
         """
         overrides = get_endpoint_overrides()
 
@@ -102,7 +95,16 @@ class LLMClient:
         self.embedding_api_key = embedding_api_key or EMBEDDING_API_KEY
         self.reranker_api_key = reranker_api_key or RERANKER_API_KEY
         self.logger = logger
-        self.max_token_budget = max_token_budget
+        if (
+            budget_ledger is not None
+            and max_token_budget is not None
+            and budget_ledger.hard_token_limit != max_token_budget
+        ):
+            raise ValueError(
+                "max_token_budget conflicts with the shared budget ledger"
+            )
+        self._owns_budget_ledger = budget_ledger is None
+        self.budget_ledger = budget_ledger or RunBudgetLedger(max_token_budget)
 
         # Initialize token usage tracking
         self.token_usage = {
@@ -403,8 +405,11 @@ class LLMClient:
                 self.token_usage["reranker_input_tokens"] += tokens.get("input_tokens", 0)
                 self.token_usage["reranker_output_tokens"] += tokens.get("output_tokens", 0)
         
-        # Check token budget after updating usage
-        self._check_token_budget()
+        self._record_shared_budget_usage(
+            api_type=api_type,
+            result=result,
+            request_metadata=request_metadata,
+        )
         
         return result
 
@@ -478,29 +483,34 @@ class LLMClient:
 
         return int(cached or 0), int(miss or 0)
     
-    def _check_token_budget(self) -> None:
-        """Check if cumulative token usage exceeds the configured budget.
-        
-        Raises:
-            TokenBudgetExceeded: If total tokens used exceeds max_token_budget.
-        """
-        if self.max_token_budget is None:
+    def _record_shared_budget_usage(
+        self,
+        *,
+        api_type: str,
+        result: Dict[str, Any],
+        request_metadata: Optional[Dict[str, str]],
+    ) -> None:
+        metadata = dict(request_metadata or {})
+        role = metadata.get("model_role") or self.model_role or api_type
+        stage = metadata.get("stage")
+        if api_type in {"llm", "embedding"}:
+            usage = result.get("usage") or {}
+            self.budget_ledger.record_usage(
+                role=role,
+                stage=stage,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+            )
             return
-        
-        total_used = (
-            self.token_usage["llm_total_tokens"]
-            + self.token_usage["embedding_total_tokens"]
-            + self.token_usage["reranker_input_tokens"]
-            + self.token_usage["reranker_output_tokens"]
+        tokens = result.get("tokens") or {}
+        self.budget_ledger.record_usage(
+            role=role,
+            stage=stage,
+            other_tokens=(
+                int(tokens.get("input_tokens", 0) or 0)
+                + int(tokens.get("output_tokens", 0) or 0)
+            ),
         )
-        
-        if total_used > self.max_token_budget:
-            msg = (f"Token budget exceeded: used {total_used} tokens, "
-                   f"budget is {self.max_token_budget} tokens")
-            print(f"WARNING: {msg}")
-            if self.logger:
-                self.logger.warning(msg)
-            raise TokenBudgetExceeded(self.max_token_budget, total_used)
     
     def _create_headers(self, api_key: str) -> dict:
         """Create standard API request headers."""
@@ -512,7 +522,7 @@ class LLMClient:
     def chat_with_tools(self, 
                         messages: List[Dict[str, Any]],
                         tools: List[Dict[str, Any]],
-                        max_tokens: int = 16384, 
+                        max_tokens: int = DEFAULT_CHAT_MAX_TOKENS,
                         temperature: float = 0.5,
                         tool_choice: Optional[Union[str, Dict[str, Any]]] = "required",
                         prompt_cache_key: Optional[str] = None,
@@ -564,6 +574,12 @@ class LLMClient:
         # Count tokens in all messages
         prompt_tokens = count_tokens(json.dumps(messages, ensure_ascii=False, default=str))
         tool_tokens = count_tokens(json.dumps(payload.get("tools", []), ensure_ascii=False, sort_keys=True))
+        metadata = dict(usage_metadata or {})
+        self.budget_ledger.check_request(
+            estimated_tokens=prompt_tokens + tool_tokens + max_tokens,
+            role=metadata.get("model_role") or self.model_role or "llm",
+            stage=metadata.get("stage"),
+        )
         print(f'LLM chat_with_tools request: ~{prompt_tokens + tool_tokens} prompt/tool tokens '
               f'({prompt_tokens} message, {tool_tokens} tool) and {len(tools)} tools')
 
@@ -671,6 +687,10 @@ class LLMClient:
             "input": text,
             "dimensions": EMBEDDING_DIMENSION
         }
+        self.budget_ledger.check_request(
+            estimated_tokens=count_tokens(text),
+            role="embedding",
+        )
 
         result = self._make_api_request(
             self.embedding_url,
@@ -719,6 +739,14 @@ class LLMClient:
             "documents": documents,
             "top_n": top_k
         }
+        self.budget_ledger.check_request(
+            estimated_tokens=(
+                count_tokens(query)
+                + sum(count_tokens(document) for document in documents)
+                + max(32, top_k * 16)
+            ),
+            role="reranker",
+        )
 
         result = self._make_api_request(
             self.reranker_url,
@@ -815,25 +843,21 @@ class LLMClient:
         for key in self.token_usage:
             self.token_usage[key] = 0
         self.llm_usage_by_key.clear()
-
-    def get_total_tokens_used(self) -> int:
-        """Return total tokens used across all API types (LLM + embedding + reranker)."""
-        u = self.token_usage
-        return (
-            u.get("llm_total_tokens", 0)
-            + u.get("embedding_total_tokens", 0)
-            + u.get("reranker_input_tokens", 0)
-            + u.get("reranker_output_tokens", 0)
-        )
+        if self._owns_budget_ledger:
+            self.budget_ledger.reset()
 
     def get_remaining_budget_pct(self) -> float:
         """Return remaining token budget as percentage (0.0–100.0).
         Returns 100.0 if no budget is set."""
-        if self.max_token_budget is None or self.max_token_budget <= 0:
+        if self.budget_ledger.hard_token_limit is None:
             return 100.0
-        used = self.get_total_tokens_used()
-        remaining = self.max_token_budget - used
-        return max(0.0, remaining / self.max_token_budget * 100.0)
+        snapshot = self.budget_ledger.snapshot()
+        return max(
+            0.0,
+            (snapshot.tokens_remaining or 0)
+            / snapshot.hard_token_limit
+            * 100.0,
+        )
 
 
 def get_tokenizer(model: str = "cl100k_base") -> Any:
@@ -914,3 +938,17 @@ def count_tokens_batch(texts: List[str], model: str = "cl100k_base") -> List[int
     
     tokenizer = get_tokenizer(model)
     return [len(tokenizer.encode(text)) for text in texts]
+
+
+def estimate_chat_request_tokens(
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    max_tokens: int = DEFAULT_CHAT_MAX_TOKENS,
+) -> int:
+    """Estimate the maximum tokens charged by one chat-with-tools request."""
+    wire_tools = [{"type": "function", "function": tool} for tool in tools]
+    return (
+        count_tokens(json.dumps(messages, ensure_ascii=False, default=str))
+        + count_tokens(json.dumps(wire_tools, ensure_ascii=False, sort_keys=True))
+        + max_tokens
+    )
