@@ -337,6 +337,31 @@ class RunBudgetLedger:
             )
         return min(remaining) if remaining else None
 
+    def restore(self, snapshot: Mapping[str, Any]) -> None:
+        """Restore persisted counters before continuing the same run."""
+        tokens_used = int(snapshot.get("tokens_used", 0) or 0)
+        calls = int(snapshot.get("calls", 0) or 0)
+        if tokens_used < 0 or calls < 0:
+            raise ValueError("persisted budget counters must not be negative")
+        persisted_limit = snapshot.get("hard_token_limit")
+        if self.hard_token_limit is None and persisted_limit is not None:
+            self.hard_token_limit = int(persisted_limit)
+        if self.hard_token_limit is not None and tokens_used > self.hard_token_limit:
+            raise TokenBudgetExceeded(self.hard_token_limit, tokens_used)
+        stage_usage = {
+            str(stage): int(value or 0)
+            for stage, value in (snapshot.get("stage_tokens_used") or {}).items()
+        }
+        if any(value < 0 for value in stage_usage.values()):
+            raise ValueError("persisted stage token counters must not be negative")
+        for stage, used in stage_usage.items():
+            limit = self.stage_token_limits.get(stage)
+            if limit is not None and used > limit:
+                raise TokenBudgetExceeded(limit, used)
+        self.tokens_used = tokens_used
+        self.calls = calls
+        self.usage_by_stage = stage_usage
+
     def reset(self) -> None:
         self.tokens_used = 0
         self.calls = 0

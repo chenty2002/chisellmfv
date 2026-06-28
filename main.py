@@ -462,32 +462,26 @@ def main_quality(args):
 
 
 def main_coupledl2_run(args):
-    """Run deterministic preflight and the active CoupledL2 stages."""
-    from src.coupledl2.backend import CoupledL2BuildOperations
+    """Create or resume one CoupledL2 run through the lifecycle runner."""
     from src.coupledl2.config import CoupledL2RunConfig
-    from src.coupledl2.preflight import CoupledL2Preflight
+    from src.coupledl2.runner import CoupledL2Runner
     from src.coupledl2.stages import STAGE_SPECS
-    from src.coupledl2.workspace import create_coupledl2_workspace
-    from src.core.tool_schemas import FORMAL_STAGES
+    from src.coupledl2.workspace import (
+        create_coupledl2_workspace,
+        load_coupledl2_workspace,
+    )
     from src.core.llm_router import LLMRouter
-    from src.core.workflow import FormalWorkflow
     from src.utils.logger import get_logger
 
-    config = CoupledL2RunConfig(
-        case_path=Path(args.case),
-        verify_mode=args.mode,
-        input_mode=args.input_mode,
-        property_category=args.property_category,
-        run_root=Path(args.run_root),
-    )
-    stage = args.stage or "write_assertions"
     if not (args.preflight_only or args.full or args.stage):
         print("错误: CoupledL2 run requires --preflight-only, --stage, or --full")
         sys.exit(2)
-    if args.stage and args.stage != "write_assertions":
-        print("错误: fresh run 只能从 write_assertions 开始；后续阶段恢复将在 runner commit 中提供")
+    resume_run = getattr(args, "resume_run", None)
+    if resume_run and (args.preflight_only or args.full or not args.stage):
+        print("错误: --resume-run 必须与一个显式 --stage 一起使用")
         sys.exit(2)
 
+    stage = args.stage or "write_assertions"
     logger = get_logger(
         __name__,
         console_output=False,
@@ -498,80 +492,74 @@ def main_coupledl2_run(args):
             else f"application-coupledl2-{stage}.log"
         ),
     )
-    workspace = create_coupledl2_workspace(config)
-    preflight = CoupledL2Preflight(
-        workspace,
-        CoupledL2BuildOperations(workspace, logger),
-    ).run()
-
-    if args.preflight_only:
-        print("CoupledL2 preflight completed" if preflight["success"] else "CoupledL2 preflight failed")
-        print(f"run_dir: {workspace.run_dir}")
-        print(json.dumps(preflight, indent=2, ensure_ascii=False))
+    if resume_run:
+        workspace = load_coupledl2_workspace(Path(resume_run))
+    else:
+        config = CoupledL2RunConfig(
+            case_path=Path(args.case),
+            verify_mode=args.mode,
+            input_mode=args.input_mode,
+            property_category=args.property_category,
+            run_root=Path(args.run_root),
+        )
+        workspace = create_coupledl2_workspace(config)
+        preflight_runner = CoupledL2Runner(
+            workspace=workspace,
+            logger=logger,
+            llm_client=None,
+        )
+        preflight = preflight_runner.preflight()
+        if args.preflight_only:
+            print("CoupledL2 preflight completed" if preflight["success"] else "CoupledL2 preflight failed")
+            print(f"run_dir: {workspace.run_dir}")
+            print(json.dumps(preflight, indent=2, ensure_ascii=False))
+            if not preflight["success"]:
+                sys.exit(1)
+            return
         if not preflight["success"]:
+            print(f"CoupledL2 preflight failed: {preflight['termination_reason']}")
+            print(f"run_dir: {workspace.run_dir}")
             sys.exit(1)
-        return
 
-    if not preflight["success"]:
-        print(f"CoupledL2 preflight failed: {preflight['termination_reason']}")
-        print(f"run_dir: {workspace.run_dir}")
+    budget_snapshot = None
+    if resume_run:
+        cost_path = workspace.results_dir / "run_cost_summary.json"
+        if cost_path.is_file():
+            budget_snapshot = json.loads(cost_path.read_text(encoding="utf-8")).get("budget")
+    max_token_budget = getattr(args, "max_tokens", None)
+    if max_token_budget is None and budget_snapshot:
+        max_token_budget = budget_snapshot.get("hard_token_limit")
+    llm_client = LLMRouter(
+        max_token_budget=max_token_budget,
+        stage_token_limits={
+            spec.name: spec.token_budget
+            for spec in STAGE_SPECS
+            if spec.token_budget is not None
+        },
+        budget_snapshot=budget_snapshot,
+        logger=logger,
+    )
+    runner = CoupledL2Runner(
+        workspace=workspace,
+        logger=logger,
+        llm_client=llm_client,
+        query_for_stage=lambda current_stage, case_name: get_default_query(
+            stage=current_stage,
+            target=case_name,
+        ),
+        max_repair_rounds=args.max_repair_rounds,
+        resumed=bool(resume_run),
+    )
+    try:
+        result = runner.run(stage=args.stage, full=args.full)
+    except ValueError as exc:
+        print(f"错误: {exc}")
+        sys.exit(2)
+    llm_client.print_token_usage(logger)
+    print("CoupledL2 workflow completed" if result["success"] else "CoupledL2 workflow failed")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    if not result["success"]:
         sys.exit(1)
-
-    if args.full or args.stage:
-        llm_client = LLMRouter(
-            max_token_budget=getattr(args, "max_tokens", None),
-            stage_token_limits={
-                spec.name: spec.token_budget
-                for spec in STAGE_SPECS
-                if spec.token_budget is not None
-            },
-            logger=logger,
-        )
-        workflow = FormalWorkflow(
-            llm_client=llm_client,
-            chisel_dir=".",
-            workspace_dir=os.path.abspath("."),
-            logger=logger,
-            stage=stage,
-            target=config.case_name,
-            max_repair_rounds=args.max_repair_rounds,
-            run_context=workspace,
-        )
-
-        stages = [args.stage] if args.stage else FORMAL_STAGES
-        completed_stage = None
-        success = True
-        for current_stage in stages:
-            workflow.current_stage = current_stage
-            result = workflow.process_task(
-                user_query=get_default_query(stage=current_stage, target=config.case_name),
-            )
-            completed_stage = current_stage
-            if not result.get("success", False):
-                success = False
-                break
-
-            if current_stage == "invoke_verification":
-                detail = result.get("stage_result", {})
-                workflow.last_verification_result = detail
-                if detail.get("counterexample_path"):
-                    workflow.waveform_path = detail.get("counterexample_path")
-                if detail.get("verification_passed", False):
-                    break
-
-        llm_client.print_token_usage(logger)
-        print("CoupledL2 workflow completed" if success else "CoupledL2 workflow failed")
-        print(json.dumps({
-            "run_dir": str(workflow.run_context.run_dir),
-            "success": success,
-            "completed_stage": completed_stage,
-        }, indent=2, ensure_ascii=False))
-        if not success:
-            sys.exit(1)
-        return
-
-    print("错误: CoupledL2 run requires --preflight-only, --stage, or --full")
-    sys.exit(2)
 
 
 def _split_csv(value: Optional[str]) -> List[str]:
@@ -734,8 +722,11 @@ def parse_args():
 
     # CoupledL2 refactored workflow entrypoint
     run_parser = subparsers.add_parser('run', help='CoupledL2 preflight + Stage 2-5 工作流')
-    run_parser.add_argument('--case', type=str, required=True,
-                            help='CoupledL2 case 目录')
+    run_source = run_parser.add_mutually_exclusive_group(required=True)
+    run_source.add_argument('--case', type=str,
+                            help='新建 run 使用的 CoupledL2 case 目录')
+    run_source.add_argument('--resume-run', type=str, default=None,
+                            help='恢复已有 run 目录；必须同时指定 --stage')
     run_parser.add_argument('--mode', type=str, default='small', choices=['small'],
                             help='VERIFY_MODE（默认: small）')
     run_parser.add_argument('--input-mode', type=str, default='coupledl2asl1',

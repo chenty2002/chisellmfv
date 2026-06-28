@@ -13,7 +13,7 @@ VALID_PROPERTY_CATEGORIES = {"deadlock", "write_read", "copy_equality", "peer_l2
 
 @dataclass(frozen=True)
 class CoupledL2RunConfig:
-    """Configuration needed before the five-stage workflow starts."""
+    """Configuration needed before preflight and the four active stages."""
 
     case_path: Path
     verify_mode: str = "small"

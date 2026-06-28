@@ -12,8 +12,8 @@ JasperGold quality evaluator, and the Verilog-to-Chisel converter. Treat
 
 ## What This Version Provides
 
-- Five-stage formal workflow:
-  `build_top_module -> write_assertions -> invoke_verification -> waveform_explanation -> propose_bugfix`.
+- Preflight-gated four-stage formal workflow:
+  `write_assertions -> invoke_verification -> waveform_explanation -> propose_bugfix`.
 - CoupledL2 run isolation under `runs/<timestamp>-<case>-<id>/`.
 - Stage-local context files, skills, rules, source snapshots, tool operation
   ledgers, stage results, handoff files, and run cost summaries.
@@ -131,16 +131,16 @@ least:
 The workflow copies the case into a new run directory. The original case is
 not edited by the model-facing tools.
 
-### Initialize A Run
+### Preflight A New Run
 
-Use this first to verify that ChiseLLMFV can copy the case, preprocess it,
-install stage assets, and generate indexes:
+Preflight copies and cleans the case, generates indexes, performs the baseline
+build, and rejects residual source or generated assertions before any LLM call:
 
 ```bash
 .venv/bin/python main.py run \
   --case CoupledL2-Verification/<case-name> \
   --property deadlock \
-  --dry-run-init
+  --preflight-only
 ```
 
 Useful options:
@@ -155,54 +155,46 @@ Useful options:
 The current checked-in configuration accepts `small` mode and
 `coupledl2asl1` input mode.
 
-### Build-Only Smoke
-
-Run the case-local CoupledL2 build and write stage-1 artifacts:
-
-```bash
-.venv/bin/python main.py run \
-  --case CoupledL2-Verification/<case-name> \
-  --property deadlock \
-  --build-only
-```
-
-The build backend reads the generated `indexes/build_contract.json`, runs the
-case-local `Chisel/Makefile` target, and writes build artifacts under
-`results/by_stage/01_build_top_module/`.
-
-### Run One Stage
-
-```bash
-.venv/bin/python main.py run \
-  --case CoupledL2-Verification/<case-name> \
-  --property deadlock \
-  --stage build_top_module \
-  --max-tokens 200000
-```
-
-Valid stages are:
-
-```text
-build_top_module
-write_assertions
-invoke_verification
-waveform_explanation
-propose_bugfix
-```
-
-### Run From A Stage Through Completion
+### Run A New Workflow
 
 ```bash
 .venv/bin/python main.py run \
   --case CoupledL2-Verification/<case-name> \
   --property deadlock \
   --full \
-  --start-stage build_top_module \
+  --max-tokens 160000 \
   --max-repair-rounds 3
+```
+
+Fresh runs can execute only `write_assertions` as a single stage; later stages
+must resume a run whose predecessor handoff succeeded:
+
+```bash
+.venv/bin/python main.py run \
+  --case CoupledL2-Verification/<case-name> \
+  --property deadlock \
+  --stage write_assertions \
+  --max-tokens 160000
 ```
 
 If `invoke_verification` proves all assertions, the workflow stops without
 running counterexample diagnosis or repair.
+
+### Resume A Verified Handoff
+
+Resume uses the existing workspace and validates its hash plus the predecessor
+handoff before starting the requested stage:
+
+```bash
+.venv/bin/python main.py run \
+  --resume-run runs/<timestamp>-<case-name>-<id> \
+  --stage invoke_verification \
+  --max-tokens 160000
+```
+
+Valid stages are `write_assertions`, `invoke_verification`,
+`waveform_explanation`, and `propose_bugfix`. `waveform_explanation` additionally
+requires a Stage 3 counterexample path.
 
 ## CoupledL2 Run Artifacts
 
@@ -220,9 +212,10 @@ indexes/project_tree.json
 indexes/build_contract.json
 indexes/formal_surface.json
 logs/events.jsonl
+results/preflight/preflight_result.json
+results/preflight/baseline_build_result.json
 results/run_cost_summary.json
 results/final_result.json
-results/by_stage/01_build_top_module/
 results/by_stage/02_write_assertions/
 results/by_stage/03_invoke_verification/
 results/by_stage/04_waveform_explanation/
@@ -246,14 +239,15 @@ Stage-specific artifacts include:
 
 | Stage | Typical artifacts |
 |---|---|
-| `build_top_module` | build log/result, generated Verilog list, top module |
 | `write_assertions` | assertion scan, assertion map/plan, source snapshots |
 | `invoke_verification` | `verify.tcl`, `formal_result.json`, `property_status.json`, traces |
 | `waveform_explanation` | causal/waveform evidence, `diagnosis.json`, `counterexample_analysis.md` |
 | `propose_bugfix` | repair result, repair history, final result |
 
 Downstream stages read earlier `handoff.json` files through
-`stage_inputs.json`; they do not rely on transient in-memory state alone.
+`stage_inputs.json`; successful edit stages refresh the indexes and bind the
+workspace/index hashes into their handoffs. `run_cost_summary.json` aggregates
+PRO, FLASH, context compaction, token budget, and stage tool-budget use.
 
 ## Legacy Formal Workflow
 
@@ -381,6 +375,7 @@ pytest -q \
   tests/test_coupledl2_backend.py \
   tests/test_coupledl2_commit3_context_tools.py \
   tests/test_coupledl2_commit4_acceptance.py \
+  tests/test_coupledl2_runner.py \
   tests/test_optimization_p0.py \
   tests/test_optimization_p1.py \
   tests/test_optimization_p2.py

@@ -27,6 +27,7 @@ class LLMRouter:
         logger: Optional[logging.Logger] = None,
         max_token_budget: Optional[int] = None,
         stage_token_limits: Optional[Mapping[str, int]] = None,
+        budget_snapshot: Optional[Mapping[str, Any]] = None,
         client_cls=LLMClient,
         **client_kwargs: Any,
     ):
@@ -38,6 +39,8 @@ class LLMRouter:
             max_token_budget,
             stage_token_limits=stage_token_limits,
         )
+        if budget_snapshot:
+            self.budget_ledger.restore(budget_snapshot)
 
         common_kwargs = dict(client_kwargs)
         common_kwargs.setdefault("logger", logger)

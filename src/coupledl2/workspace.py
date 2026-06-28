@@ -112,6 +112,38 @@ def create_coupledl2_workspace(config: CoupledL2RunConfig) -> CoupledL2Workspace
     )
 
 
+def load_coupledl2_workspace(run_dir: Path) -> CoupledL2Workspace:
+    """Load an existing run without copying the original case again."""
+    run_dir = Path(run_dir).resolve()
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"CoupledL2 manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    config = CoupledL2RunConfig(
+        case_path=Path(manifest["original_case_path"]),
+        verify_mode=manifest["verify_mode"],
+        input_mode=manifest["input_mode"],
+        property_category=manifest["property_category"],
+        run_root=run_dir.parent,
+        copy_strategy=manifest["copy_strategy"],
+    )
+    workspace_dir = run_dir / "workspace"
+    case_workspace = workspace_dir / "case"
+    expected_case = Path(manifest["workspace_case_path"]).resolve()
+    if case_workspace.resolve() != expected_case or not case_workspace.is_dir():
+        raise ValueError("manifest workspace path does not match the resume run directory")
+    return CoupledL2Workspace(
+        run_dir=run_dir,
+        workspace_dir=workspace_dir,
+        case_workspace=case_workspace,
+        indexes_dir=run_dir / "indexes",
+        logs_dir=run_dir / "logs",
+        results_dir=run_dir / "results",
+        manifest_path=manifest_path,
+        config=config,
+    )
+
+
 def initialize_stage_context(workspace: CoupledL2Workspace, stage: str) -> StageContext:
     """Load the stage-specific context slice for the active workflow."""
     spec = get_stage_spec(stage)

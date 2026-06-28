@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 
 TOOL_RESULT_SCHEMA_VERSION = "tool_result.v1"
@@ -118,7 +118,12 @@ def make_stage_event(
     ).to_dict()
 
 
-def build_run_cost_summary(token_usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def build_run_cost_summary(
+    token_usage: Optional[Dict[str, Any]],
+    *,
+    stage_results: Optional[Iterable[Dict[str, Any]]] = None,
+    compactions: Optional[Iterable[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """Convert raw client token usage into a compact run cost artifact."""
     usage = dict(token_usage or {})
     prompt_tokens = int(usage.get("llm_prompt_tokens", 0) or 0)
@@ -152,6 +157,24 @@ def build_run_cost_summary(token_usage: Optional[Dict[str, Any]]) -> Dict[str, A
         ):
             model_bucket[metric] += int(bucket.get(metric, 0) or 0)
 
+    stage_results = list(stage_results or [])
+    compactions = list(compactions or [])
+    stage_budgets = {
+        str(result.get("stage")): dict(result["budget"])
+        for result in stage_results
+        if result.get("stage") and isinstance(result.get("budget"), dict)
+    }
+    successful_compactions = [
+        item for item in compactions if item.get("success") is True
+    ]
+    compaction_before = sum(
+        int(item.get("tokens_before", 0) or 0)
+        for item in successful_compactions
+    )
+    compaction_after = sum(
+        int(item.get("tokens_after", 0) or 0)
+        for item in successful_compactions
+    )
     return {
         "schema_version": RUN_COST_SUMMARY_SCHEMA_VERSION,
         "llm": {
@@ -175,7 +198,104 @@ def build_run_cost_summary(token_usage: Optional[Dict[str, Any]]) -> Dict[str, A
         },
         "model_roles": model_roles,
         "budget": dict(usage.get("budget") or {}),
+        "compaction": {
+            "calls": len(successful_compactions),
+            "attempts": len(compactions),
+            "tokens_before": compaction_before,
+            "tokens_after": compaction_after,
+            "tokens_removed": max(0, compaction_before - compaction_after),
+        },
+        "tool_budget": {
+            "tool_calls_used": sum(
+                int(value.get("tool_calls_used", 0) or 0)
+                for value in stage_budgets.values()
+            ),
+            "stages": stage_budgets,
+        },
+        "termination_reasons": {
+            str(result["stage"]): str(result["termination_reason"])
+            for result in stage_results
+            if result.get("stage") and result.get("termination_reason")
+        },
     }
+
+
+def merge_run_cost_summaries(
+    previous: Optional[Dict[str, Any]],
+    current: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge persisted metrics with one resumed invocation's metrics."""
+    if not previous:
+        return current
+    merged = dict(current)
+    additive_sections = {
+        "llm": (
+            "calls",
+            "prompt_tokens",
+            "cached_prompt_tokens",
+            "cache_miss_prompt_tokens",
+            "completion_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+        ),
+        "embedding": ("calls", "total_tokens"),
+        "reranker": ("calls", "input_tokens", "output_tokens"),
+        "compaction": (
+            "calls",
+            "attempts",
+            "tokens_before",
+            "tokens_after",
+            "tokens_removed",
+        ),
+    }
+    for section, metrics in additive_sections.items():
+        combined = dict(current.get(section) or {})
+        before = previous.get(section) or {}
+        for metric in metrics:
+            combined[metric] = int(before.get(metric, 0) or 0) + int(
+                combined.get(metric, 0) or 0
+            )
+        merged[section] = combined
+    prompt_tokens = merged["llm"]["prompt_tokens"]
+    merged["llm"]["cache_hit_rate"] = (
+        merged["llm"]["cached_prompt_tokens"] / prompt_tokens
+        if prompt_tokens
+        else 0.0
+    )
+
+    roles: Dict[str, Dict[str, Any]] = {}
+    role_metrics = (
+        "prompt_tokens",
+        "cached_prompt_tokens",
+        "cache_miss_prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    )
+    for source in (previous.get("model_roles") or {}, current.get("model_roles") or {}):
+        for role, values in source.items():
+            target = roles.setdefault(role, {"model": values.get("model")})
+            if not target.get("model") and values.get("model"):
+                target["model"] = values["model"]
+            for metric in role_metrics:
+                target[metric] = int(target.get(metric, 0) or 0) + int(
+                    values.get(metric, 0) or 0
+                )
+    merged["model_roles"] = roles
+
+    stages = dict((previous.get("tool_budget") or {}).get("stages") or {})
+    stages.update((current.get("tool_budget") or {}).get("stages") or {})
+    merged["tool_budget"] = {
+        "tool_calls_used": sum(
+            int(value.get("tool_calls_used", 0) or 0)
+            for value in stages.values()
+        ),
+        "stages": stages,
+    }
+    reasons = dict(previous.get("termination_reasons") or {})
+    reasons.update(current.get("termination_reasons") or {})
+    merged["termination_reasons"] = reasons
+    return merged
 
 
 def _parse_usage_key(key: str) -> Dict[str, str]:

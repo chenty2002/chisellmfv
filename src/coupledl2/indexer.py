@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import CoupledL2RunConfig
+from .workspace import CoupledL2Workspace
 
 
 def generate_indexes(run_dir: Path, case_workspace: Path, config: CoupledL2RunConfig) -> Dict[str, Dict[str, Any]]:
@@ -23,6 +25,81 @@ def generate_indexes(run_dir: Path, case_workspace: Path, config: CoupledL2RunCo
     for name, value in indexes.items():
         _write_json(indexes_dir / f"{name}.json", value)
     return indexes
+
+
+def refresh_indexes(workspace: CoupledL2Workspace) -> Dict[str, Any]:
+    """Regenerate indexes and bind their hashes to the current source workspace."""
+    indexes = generate_indexes(
+        workspace.run_dir,
+        workspace.case_workspace,
+        workspace.config,
+    )
+    index_hashes = {
+        name: _sha256_json(value)
+        for name, value in indexes.items()
+    }
+    state = {
+        "workspace_hash": compute_workspace_hash(workspace.case_workspace),
+        "index_hashes": index_hashes,
+    }
+    manifest = json.loads(workspace.manifest_path.read_text(encoding="utf-8"))
+    manifest.update(state)
+    _write_json(workspace.manifest_path, manifest)
+    return state
+
+
+def compute_index_hashes(indexes_dir: Path) -> Dict[str, str]:
+    """Hash the canonical JSON value of every persisted project index."""
+    return {
+        path.stem: _sha256_json(
+            json.loads(path.read_text(encoding="utf-8"))
+        )
+        for path in sorted(indexes_dir.glob("*.json"))
+    }
+
+
+def compute_workspace_hash(case_workspace: Path) -> str:
+    """Hash source/configuration files while excluding generated build products."""
+    digest = hashlib.sha256()
+    ignored_parts = {
+        "generated",
+        "out",
+        "target",
+        ".mill",
+        ".bsp",
+        ".metals",
+        "repair_loop",
+    }
+    source_suffixes = {".scala", ".sc", ".sbt", ".py", ".sh"}
+    for path in sorted(case_workspace.rglob("*")):
+        relative_path = path.relative_to(case_workspace)
+        if (
+            not path.is_file()
+            or not relative_path.parts
+            or relative_path.parts[0] != "Chisel"
+            or ignored_parts.intersection(relative_path.parts)
+            or (
+                path.name != "Makefile"
+                and path.suffix.lower() not in source_suffixes
+            )
+        ):
+            continue
+        relative = relative_path.as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _sha256_json(value: Dict[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def build_project_tree(case_workspace: Path) -> Dict[str, Any]:
