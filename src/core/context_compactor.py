@@ -203,6 +203,20 @@ class CompactionResult:
     error: Optional[str] = None
 
 
+class ContextCompactionError(ValueError):
+    """A classified compaction response failure with provider metadata."""
+
+    def __init__(
+        self,
+        error_kind: str,
+        *,
+        finish_reason: Optional[str] = None,
+    ):
+        super().__init__(error_kind)
+        self.error_kind = error_kind
+        self.finish_reason = finish_reason
+
+
 class FlashContextCompactor:
     """Replace old raw turns only after a valid Flash digest is returned."""
 
@@ -321,6 +335,8 @@ class FlashContextCompactor:
                     tokens_before=tokens_before,
                     tokens_after=tokens_before,
                     error=error,
+                    error_kind=getattr(exc, "error_kind", None),
+                    finish_reason=getattr(exc, "finish_reason", None),
                     usage={"total_tokens": _usage_total(self.llm_router) - usage_before},
                 )
 
@@ -398,6 +414,12 @@ class FlashContextCompactor:
                 },
             },
         )
+        finish_reason = response.get("finish_reason")
+        if finish_reason == "length" and response.get("tool_parse_errors"):
+            raise ContextCompactionError(
+                "context_digest_truncated",
+                finish_reason=finish_reason,
+            )
         calls = response.get("function_calls") if response.get("type") == "function_calls" else None
         if not calls or len(calls) != 1 or calls[0].get("name") != "submit_context_digest":
             raise ValueError("Flash must return exactly one submit_context_digest call")
@@ -414,6 +436,8 @@ class FlashContextCompactor:
         tokens_after: int,
         digest: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
+        error_kind: Optional[str] = None,
+        finish_reason: Optional[str] = None,
         usage: Optional[Dict[str, int]] = None,
     ) -> None:
         client = getattr(self.llm_router, "flash_client", None)
@@ -436,6 +460,8 @@ class FlashContextCompactor:
             "usage": dict(usage or {}),
             "digest": digest,
             "error": error,
+            "error_kind": error_kind,
+            "finish_reason": finish_reason,
         }
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         with self.audit_path.open("a", encoding="utf-8") as handle:

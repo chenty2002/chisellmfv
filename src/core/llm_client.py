@@ -604,6 +604,7 @@ class LLMClient:
 
         # Parse response
         choice = result["choices"][0]
+        finish_reason = choice.get("finish_reason")
         message = choice["message"]
         
         if "tool_calls" in message and message["tool_calls"]:
@@ -627,17 +628,20 @@ class LLMClient:
                     "content": error_text,
                     "raw_message": message,
                     "tool_parse_errors": parse_errors,
+                    "finish_reason": finish_reason,
                 }
             return {
                 "type": "function_calls",
                 "function_calls": function_calls,
-                "raw_message": message  # Include raw message for building history
+                "raw_message": message,  # Include raw message for building history
+                "finish_reason": finish_reason,
             }
         else:
             return {
                 "type": "text",
                 "content": message.get("content", ""),
-                "raw_message": message
+                "raw_message": message,
+                "finish_reason": finish_reason,
             }
 
     @staticmethod
