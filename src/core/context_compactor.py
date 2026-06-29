@@ -7,14 +7,17 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from .llm_client import count_tokens
 
 
-CONTEXT_DIGEST_SCHEMA_VERSION = "context_digest.v1"
-COMPACTION_PROMPT_VERSION = "context-compaction-v1"
+CONTEXT_DIGEST_SCHEMA_VERSION = "context_digest.v2"
+COMPACTION_PROMPT_VERSION = "context-compaction-v2"
 CONTEXT_DIGEST_MARKER = "## Validated Context Digest\n"
+DEFAULT_COMPACTION_TARGET_TOKENS = 1200
+DEFAULT_DIGEST_TOKEN_LIMIT = 1600
+DEFAULT_RETRY_CANDIDATE_TOKENS = 8000
 
 _DIGEST_KEYS = (
     "schema_version",
@@ -40,31 +43,94 @@ SUBMIT_CONTEXT_DIGEST_TOOL = {
         "properties": {
             "schema_version": {"type": "string", "enum": [CONTEXT_DIGEST_SCHEMA_VERSION]},
             "stage": {"type": "string"},
-            "objective": {"type": "string"},
-            "established_facts": {"type": "array", "items": {"type": "string"}},
+            "objective": {"type": "string", "maxLength": 240},
+            "established_facts": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {"type": "string", "maxLength": 200},
+            },
             "files_inspected": {
                 "type": "array",
+                "maxItems": 10,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string"},
-                        "ranges": {"type": "array", "items": {"type": "string"}},
-                        "finding": {"type": "string"},
+                        "path": {"type": "string", "maxLength": 400},
+                        "ranges": {
+                            "type": "array",
+                            "maxItems": 4,
+                            "items": {"type": "string", "maxLength": 40},
+                        },
+                        "finding": {"type": "string", "maxLength": 200},
                     },
                     "required": ["path", "ranges", "finding"],
                     "additionalProperties": False,
                 },
             },
-            "changes": {"type": "array", "items": {}},
-            "tool_outcomes": {"type": "array", "items": {}},
-            "errors": {"type": "array", "items": {}},
-            "rejected_paths": {"type": "array", "items": {}},
-            "pending_questions": {"type": "array", "items": {}},
+            "changes": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "maxLength": 400},
+                        "summary": {"type": "string", "maxLength": 240},
+                        "status": {
+                            "type": "string",
+                            "enum": ["planned", "applied", "verified", "failed"],
+                        },
+                    },
+                    "required": ["path", "summary", "status"],
+                    "additionalProperties": False,
+                },
+            },
+            "tool_outcomes": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string", "maxLength": 120},
+                        "success": {"type": "boolean"},
+                        "summary": {"type": "string", "maxLength": 200},
+                    },
+                    "required": ["tool", "success", "summary"],
+                    "additionalProperties": False,
+                },
+            },
+            "errors": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string", "maxLength": 120},
+                        "summary": {"type": "string", "maxLength": 240},
+                        "blocking": {"type": "boolean"},
+                    },
+                    "required": ["source", "summary", "blocking"],
+                    "additionalProperties": False,
+                },
+            },
+            "rejected_paths": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {"type": "string", "maxLength": 200},
+            },
+            "pending_questions": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {"type": "string", "maxLength": 200},
+            },
             "completion_readiness": {
                 "type": "object",
                 "properties": {
                     "ready": {"type": "boolean"},
-                    "missing": {"type": "array", "items": {"type": "string"}},
+                    "missing": {
+                        "type": "array",
+                        "maxItems": 6,
+                        "items": {"type": "string", "maxLength": 160},
+                    },
                 },
                 "required": ["ready", "missing"],
                 "additionalProperties": False,
@@ -83,7 +149,11 @@ SUBMIT_CONTEXT_DIGEST_TOOL = {
                 ],
                 "additionalProperties": False,
             },
-            "next_actions": {"type": "array", "items": {"type": "string"}},
+            "next_actions": {
+                "type": "array",
+                "maxItems": 5,
+                "items": {"type": "string", "maxLength": 180},
+            },
         },
         "required": list(_DIGEST_KEYS),
         "additionalProperties": False,
@@ -98,7 +168,54 @@ gate, exact files and line ranges, edits, errors, successful and failed tool
 outcomes, rejected investigation paths, pending questions, completion
 readiness, and budget state. Keep conflicting evidence and label the conflict.
 Never claim completion unless the input contains a gate-accepted completion.
-Return exactly one submit_context_digest call using context_digest.v1."""
+Return exactly one submit_context_digest call using context_digest.v2.
+
+The digest must target at most {target_tokens} estimated tokens. Keep at most:
+12 facts, 10 inspected files with 4 ranges each, 8 changes, 10 tool outcomes,
+6 errors, 6 rejected paths, 6 pending questions, 6 readiness gaps, and 5 next
+actions. Do not copy source code, raw tool output, full compiler logs, or
+duplicate facts. Detailed evidence remains in the workflow operation log."""
+
+
+class ContextCompactionError(ValueError):
+    """A classified compaction response failure with provider metadata."""
+
+    def __init__(
+        self,
+        error_kind: str,
+        *,
+        detail: Optional[str] = None,
+        finish_reason: Optional[str] = None,
+    ):
+        message = f"{error_kind}: {detail}" if detail else error_kind
+        super().__init__(message)
+        self.error_kind = error_kind
+        self.finish_reason = finish_reason
+
+
+def _schema_failure(detail: str) -> None:
+    raise ContextCompactionError(
+        "context_digest_schema_invalid",
+        detail=detail,
+    )
+
+
+def _validate_string(value: Any, field: str, max_length: int) -> None:
+    if not isinstance(value, str) or len(value) > max_length:
+        _schema_failure(f"{field} must be a string of at most {max_length} characters")
+
+
+def _validate_string_list(
+    value: Any,
+    field: str,
+    *,
+    max_items: int,
+    max_length: int,
+) -> None:
+    if not isinstance(value, list) or len(value) > max_items:
+        _schema_failure(f"{field} must contain at most {max_items} items")
+    for index, item in enumerate(value):
+        _validate_string(item, f"{field}[{index}]", max_length)
 
 
 @dataclass(frozen=True)
@@ -106,76 +223,150 @@ class ContextDigest:
     payload: Dict[str, Any]
 
     @classmethod
-    def from_payload(cls, payload: Dict[str, Any], stage: str) -> "ContextDigest":
+    def from_payload(
+        cls,
+        payload: Dict[str, Any],
+        stage: str,
+        *,
+        digest_token_limit: int = DEFAULT_DIGEST_TOKEN_LIMIT,
+    ) -> "ContextDigest":
         if not isinstance(payload, dict):
-            raise ValueError("context digest must be an object")
+            _schema_failure("context digest must be an object")
         missing = [key for key in _DIGEST_KEYS if key not in payload]
         extra = [key for key in payload if key not in _DIGEST_KEYS]
         if missing or extra:
-            raise ValueError(
-                "context digest keys are invalid: "
-                f"missing={missing}, extra={extra}"
+            _schema_failure(
+                f"context digest keys are invalid: missing={missing}, extra={extra}"
             )
         if payload["schema_version"] != CONTEXT_DIGEST_SCHEMA_VERSION:
-            raise ValueError("unsupported context digest schema")
+            _schema_failure("unsupported context digest schema")
         if payload["stage"] != stage:
-            raise ValueError("context digest stage does not match request")
-        if not isinstance(payload["objective"], str):
-            raise ValueError("context digest objective must be a string")
-        for key in (
-            "established_facts",
-            "files_inspected",
-            "changes",
-            "tool_outcomes",
-            "errors",
-            "rejected_paths",
-            "pending_questions",
-            "next_actions",
+            _schema_failure("context digest stage does not match request")
+
+        digest_tokens = count_tokens(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        )
+        if digest_tokens > digest_token_limit:
+            raise ContextCompactionError(
+                "context_digest_oversized",
+                detail=f"{digest_tokens} tokens exceeds limit {digest_token_limit}",
+            )
+
+        _validate_string(payload["objective"], "objective", 240)
+        for key, max_items, max_length in (
+            ("established_facts", 12, 200),
+            ("rejected_paths", 6, 200),
+            ("pending_questions", 6, 200),
+            ("next_actions", 5, 180),
         ):
-            if not isinstance(payload[key], list):
-                raise ValueError(f"context digest {key} must be a list")
-        for key in (
-            "established_facts",
-            "pending_questions",
-            "next_actions",
-        ):
-            if not all(isinstance(item, str) for item in payload[key]):
-                raise ValueError(f"context digest {key} must contain strings")
-        for item in payload["files_inspected"]:
-            if (
-                not isinstance(item, dict)
-                or set(item) != {"path", "ranges", "finding"}
-                or not isinstance(item["path"], str)
-                or not isinstance(item["finding"], str)
-                or not isinstance(item["ranges"], list)
-                or not all(isinstance(value, str) for value in item["ranges"])
-            ):
-                raise ValueError("context digest files_inspected is invalid")
+            _validate_string_list(
+                payload[key],
+                key,
+                max_items=max_items,
+                max_length=max_length,
+            )
+
+        list_limits = {
+            "files_inspected": 10,
+            "changes": 8,
+            "tool_outcomes": 10,
+            "errors": 6,
+        }
+        for key, max_items in list_limits.items():
+            if not isinstance(payload[key], list) or len(payload[key]) > max_items:
+                _schema_failure(f"{key} must contain at most {max_items} items")
+
+        for index, item in enumerate(payload["files_inspected"]):
+            if not isinstance(item, dict) or set(item) != {
+                "path",
+                "ranges",
+                "finding",
+            }:
+                _schema_failure(f"files_inspected[{index}] has invalid fields")
+            _validate_string(item["path"], f"files_inspected[{index}].path", 400)
+            _validate_string_list(
+                item["ranges"],
+                f"files_inspected[{index}].ranges",
+                max_items=4,
+                max_length=40,
+            )
+            _validate_string(
+                item["finding"],
+                f"files_inspected[{index}].finding",
+                200,
+            )
+
+        for index, item in enumerate(payload["changes"]):
+            if not isinstance(item, dict) or set(item) != {
+                "path",
+                "summary",
+                "status",
+            }:
+                _schema_failure(f"changes[{index}] has invalid fields")
+            _validate_string(item["path"], f"changes[{index}].path", 400)
+            _validate_string(item["summary"], f"changes[{index}].summary", 240)
+            if item["status"] not in {"planned", "applied", "verified", "failed"}:
+                _schema_failure(f"changes[{index}].status is invalid")
+
+        for index, item in enumerate(payload["tool_outcomes"]):
+            if not isinstance(item, dict) or set(item) != {
+                "tool",
+                "success",
+                "summary",
+            }:
+                _schema_failure(f"tool_outcomes[{index}] has invalid fields")
+            _validate_string(item["tool"], f"tool_outcomes[{index}].tool", 120)
+            if not isinstance(item["success"], bool):
+                _schema_failure(f"tool_outcomes[{index}].success must be boolean")
+            _validate_string(
+                item["summary"],
+                f"tool_outcomes[{index}].summary",
+                200,
+            )
+
+        for index, item in enumerate(payload["errors"]):
+            if not isinstance(item, dict) or set(item) != {
+                "source",
+                "summary",
+                "blocking",
+            }:
+                _schema_failure(f"errors[{index}] has invalid fields")
+            _validate_string(item["source"], f"errors[{index}].source", 120)
+            _validate_string(item["summary"], f"errors[{index}].summary", 240)
+            if not isinstance(item["blocking"], bool):
+                _schema_failure(f"errors[{index}].blocking must be boolean")
+
         readiness = payload["completion_readiness"]
-        if (
-            not isinstance(readiness, dict)
-            or set(readiness) != {"ready", "missing"}
-            or not isinstance(readiness.get("ready"), bool)
-            or not isinstance(readiness.get("missing"), list)
-            or not all(isinstance(item, str) for item in readiness["missing"])
-        ):
-            raise ValueError("context digest completion_readiness is invalid")
+        if not isinstance(readiness, dict) or set(readiness) != {
+            "ready",
+            "missing",
+        }:
+            _schema_failure("completion_readiness has invalid fields")
+        if not isinstance(readiness["ready"], bool):
+            _schema_failure("completion_readiness.ready must be boolean")
+        _validate_string_list(
+            readiness["missing"],
+            "completion_readiness.missing",
+            max_items=6,
+            max_length=160,
+        )
+
         budget = payload["budget"]
         if not isinstance(budget, dict) or set(budget) != {
             "tool_calls_used",
             "tool_calls_remaining",
             "tokens_remaining",
         }:
-            raise ValueError("context digest budget is invalid")
+            _schema_failure("budget has invalid fields")
         if (
-            not isinstance(budget["tool_calls_used"], int)
-            or not isinstance(budget["tool_calls_remaining"], int)
+            type(budget["tool_calls_used"]) is not int
+            or type(budget["tool_calls_remaining"]) is not int
             or (
                 budget["tokens_remaining"] is not None
-                and not isinstance(budget["tokens_remaining"], int)
+                and type(budget["tokens_remaining"]) is not int
             )
         ):
-            raise ValueError("context digest budget values are invalid")
+            _schema_failure("budget values are invalid")
         return cls(payload=dict(payload))
 
     def to_message(self) -> Dict[str, str]:
@@ -203,18 +394,12 @@ class CompactionResult:
     error: Optional[str] = None
 
 
-class ContextCompactionError(ValueError):
-    """A classified compaction response failure with provider metadata."""
-
-    def __init__(
-        self,
-        error_kind: str,
-        *,
-        finish_reason: Optional[str] = None,
-    ):
-        super().__init__(error_kind)
-        self.error_kind = error_kind
-        self.finish_reason = finish_reason
+@dataclass(frozen=True)
+class _CompactionWindow:
+    protected: List[Dict[str, Any]]
+    candidate: List[Dict[str, Any]]
+    preserved_middle: List[Dict[str, Any]]
+    recent_tail: List[Dict[str, Any]]
 
 
 class FlashContextCompactor:
@@ -227,7 +412,10 @@ class FlashContextCompactor:
         *,
         trigger_tokens: int = 12000,
         keep_recent_exchanges: int = 3,
-        output_tokens: int = 2000,
+        output_tokens: int = 4096,
+        target_tokens: int = DEFAULT_COMPACTION_TARGET_TOKENS,
+        digest_token_limit: int = DEFAULT_DIGEST_TOKEN_LIMIT,
+        retry_candidate_tokens: int = DEFAULT_RETRY_CANDIDATE_TOKENS,
         min_candidate_tokens: int = 3000,
         min_reduction_tokens: int = 2000,
     ):
@@ -235,6 +423,14 @@ class FlashContextCompactor:
             raise ValueError("trigger_tokens must be positive")
         if keep_recent_exchanges <= 0:
             raise ValueError("keep_recent_exchanges must be positive")
+        if output_tokens <= 0:
+            raise ValueError("output_tokens must be positive")
+        if target_tokens <= 0:
+            raise ValueError("target_tokens must be positive")
+        if digest_token_limit < target_tokens:
+            raise ValueError("digest_token_limit must cover target_tokens")
+        if retry_candidate_tokens <= 0:
+            raise ValueError("retry_candidate_tokens must be positive")
         if min_candidate_tokens <= 0:
             raise ValueError("min_candidate_tokens must be positive")
         if min_reduction_tokens <= 0:
@@ -244,6 +440,9 @@ class FlashContextCompactor:
         self.trigger_tokens = trigger_tokens
         self.keep_recent_exchanges = keep_recent_exchanges
         self.output_tokens = output_tokens
+        self.target_tokens = target_tokens
+        self.digest_token_limit = digest_token_limit
+        self.retry_candidate_tokens = retry_candidate_tokens
         self.min_candidate_tokens = min_candidate_tokens
         self.min_reduction_tokens = min_reduction_tokens
         self._digests: Dict[str, ContextDigest] = {}
@@ -258,37 +457,20 @@ class FlashContextCompactor:
         force: bool = False,
     ) -> CompactionResult:
         tokens_before = _message_tokens(messages)
-        keep_values = (
-            range(self.keep_recent_exchanges, 0, -1)
-            if force
-            else (self.keep_recent_exchanges,)
-        )
-        candidates = []
-        seen = set()
-        for keep_recent in keep_values:
-            protected, old_messages, tail = self._partition(
-                messages,
-                keep_recent_exchanges=keep_recent,
-            )
-            candidate_tokens = _message_tokens(old_messages)
-            if (
-                not old_messages
-                or candidate_tokens < self.min_candidate_tokens
-                or (not force and candidate_tokens < self.trigger_tokens)
-            ):
-                continue
-            digest_key = _messages_hash(old_messages)
-            if digest_key in seen:
-                continue
-            seen.add(digest_key)
-            candidates.append((protected, old_messages, tail))
-        if not candidates:
+        initial_window = self._partition(messages)
+        candidate_tokens = _message_tokens(initial_window.candidate)
+        if (
+            not initial_window.candidate
+            or candidate_tokens < self.min_candidate_tokens
+            or (not force and candidate_tokens < self.trigger_tokens)
+        ):
             return CompactionResult(False, tokens_before, tokens_before)
-        if not force:
-            candidates = [candidates[0], candidates[0]]
 
+        retry_window = self._retry_window(initial_window)
         errors: List[str] = []
-        for attempt, (protected, window, tail) in enumerate(candidates, 1):
+        window = initial_window
+        attempt = 1
+        while True:
             usage_before = _usage_total(self.llm_router)
             try:
                 digest = self._request_digest(
@@ -296,7 +478,7 @@ class FlashContextCompactor:
                         stage=stage,
                         stage_contract=stage_contract,
                         budget_snapshot=budget_snapshot,
-                        messages=window,
+                        messages=window.candidate,
                         previous_digest=(
                             self._digests[stage].payload
                             if stage in self._digests
@@ -304,12 +486,20 @@ class FlashContextCompactor:
                         ),
                     )
                 )
-                replacement = protected + [digest.to_message()] + tail
+                replacement = (
+                    window.protected
+                    + [digest.to_message()]
+                    + window.preserved_middle
+                    + window.recent_tail
+                )
                 tokens_after = _message_tokens(replacement)
                 if tokens_before - tokens_after < self.min_reduction_tokens:
-                    raise ValueError(
-                        "validated context digest did not reduce estimated tokens "
-                        f"by at least {self.min_reduction_tokens}"
+                    raise ContextCompactionError(
+                        "context_digest_nonreducing",
+                        detail=(
+                            "validated digest did not reduce estimated tokens "
+                            f"by at least {self.min_reduction_tokens}"
+                        ),
                     )
                 messages[:] = replacement
                 self._digests[stage] = digest
@@ -317,7 +507,7 @@ class FlashContextCompactor:
                     success=True,
                     attempt=attempt,
                     stage=stage,
-                    window=window,
+                    window=window.candidate,
                     tokens_before=tokens_before,
                     tokens_after=tokens_after,
                     digest=digest.payload,
@@ -331,7 +521,7 @@ class FlashContextCompactor:
                     success=False,
                     attempt=attempt,
                     stage=stage,
-                    window=window,
+                    window=window.candidate,
                     tokens_before=tokens_before,
                     tokens_after=tokens_before,
                     error=error,
@@ -339,6 +529,15 @@ class FlashContextCompactor:
                     finish_reason=getattr(exc, "finish_reason", None),
                     usage={"total_tokens": _usage_total(self.llm_router) - usage_before},
                 )
+                if (
+                    attempt == 1
+                    and retry_window is not None
+                    and self._is_retryable(exc)
+                ):
+                    window = retry_window
+                    attempt = 2
+                    continue
+                break
 
         return CompactionResult(
             False,
@@ -350,10 +549,7 @@ class FlashContextCompactor:
     def _partition(
         self,
         messages: List[Dict[str, Any]],
-        *,
-        keep_recent_exchanges: Optional[int] = None,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-        keep_recent = keep_recent_exchanges or self.keep_recent_exchanges
+    ) -> _CompactionWindow:
         protected = list(messages[:2])
         rest = [
             message
@@ -369,12 +565,70 @@ class FlashContextCompactor:
         for index in range(len(rest) - 1, -1, -1):
             if rest[index].get("role") == "assistant":
                 assistant_seen += 1
-                if assistant_seen == keep_recent:
+                if assistant_seen == self.keep_recent_exchanges:
                     tail_start = index
                     break
-        if assistant_seen < keep_recent:
-            return protected, [], rest
-        return protected, rest[:tail_start], rest[tail_start:]
+        if assistant_seen < self.keep_recent_exchanges:
+            return _CompactionWindow(protected, [], [], rest)
+        return _CompactionWindow(
+            protected=protected,
+            candidate=rest[:tail_start],
+            preserved_middle=[],
+            recent_tail=rest[tail_start:],
+        )
+
+    def _retry_window(
+        self,
+        initial: _CompactionWindow,
+    ) -> Optional[_CompactionWindow]:
+        groups = self._exchange_groups(initial.candidate)
+        if len(groups) < 2:
+            return None
+
+        prefix: List[Dict[str, Any]] = []
+        for group in groups[:-1]:
+            candidate = prefix + group
+            if _message_tokens(candidate) > self.retry_candidate_tokens:
+                break
+            prefix = candidate
+        if (
+            not prefix
+            or _message_tokens(prefix) < self.min_candidate_tokens
+            or _message_tokens(prefix) >= _message_tokens(initial.candidate)
+        ):
+            return None
+
+        return _CompactionWindow(
+            protected=initial.protected,
+            candidate=prefix,
+            preserved_middle=(
+                initial.candidate[len(prefix):] + initial.preserved_middle
+            ),
+            recent_tail=initial.recent_tail,
+        )
+
+    @staticmethod
+    def _exchange_groups(
+        messages: List[Dict[str, Any]],
+    ) -> List[List[Dict[str, Any]]]:
+        groups: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        for message in messages:
+            if message.get("role") == "assistant" and current:
+                groups.append(current)
+                current = []
+            current.append(message)
+        if current:
+            groups.append(current)
+        return groups
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        return getattr(exc, "error_kind", None) in {
+            "context_digest_truncated",
+            "context_digest_schema_invalid",
+            "context_digest_nonreducing",
+        }
 
     def _request_digest(self, request: CompactionRequest) -> ContextDigest:
         payload = {
@@ -387,7 +641,12 @@ class FlashContextCompactor:
         }
         response = self.llm_router.chat_with_tools(
             [
-                {"role": "system", "content": COMPACTION_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": COMPACTION_SYSTEM_PROMPT.format(
+                        target_tokens=self.target_tokens
+                    ),
+                },
                 {
                     "role": "user",
                     "content": json.dumps(payload, ensure_ascii=False, sort_keys=True),
@@ -420,10 +679,24 @@ class FlashContextCompactor:
                 "context_digest_truncated",
                 finish_reason=finish_reason,
             )
+        if response.get("tool_parse_errors"):
+            raise ContextCompactionError(
+                "context_digest_schema_invalid",
+                detail="tool arguments were not valid JSON",
+                finish_reason=finish_reason,
+            )
         calls = response.get("function_calls") if response.get("type") == "function_calls" else None
         if not calls or len(calls) != 1 or calls[0].get("name") != "submit_context_digest":
-            raise ValueError("Flash must return exactly one submit_context_digest call")
-        return ContextDigest.from_payload(calls[0].get("arguments"), request.stage)
+            raise ContextCompactionError(
+                "context_digest_schema_invalid",
+                detail="Flash must return exactly one submit_context_digest call",
+                finish_reason=finish_reason,
+            )
+        return ContextDigest.from_payload(
+            calls[0].get("arguments"),
+            request.stage,
+            digest_token_limit=self.digest_token_limit,
+        )
 
     def _append_audit(
         self,

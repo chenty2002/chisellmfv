@@ -574,6 +574,9 @@ class FormalWorkflow:
             FlashContextCompactor(
                 self.llm,
                 stage_dir / "context_compactions.jsonl",
+                output_tokens=spec.compaction_max_tokens,
+                target_tokens=spec.compaction_target_tokens,
+                digest_token_limit=spec.compaction_digest_limit,
             )
             if isinstance(self.llm, LLMRouter) and stage_dir is not None
             else None
