@@ -465,7 +465,7 @@ def main_coupledl2_run(args):
     """Create or resume one CoupledL2 run through the lifecycle runner."""
     from src.coupledl2.config import CoupledL2RunConfig
     from src.coupledl2.runner import CoupledL2Runner
-    from src.coupledl2.stages import STAGE_SPECS
+    from src.coupledl2.stages import DEFAULT_RUN_TOKEN_BUDGET, STAGE_SPECS
     from src.coupledl2.workspace import (
         create_coupledl2_workspace,
         load_coupledl2_workspace,
@@ -529,6 +529,8 @@ def main_coupledl2_run(args):
     max_token_budget = getattr(args, "max_tokens", None)
     if max_token_budget is None and budget_snapshot:
         max_token_budget = budget_snapshot.get("hard_token_limit")
+    if max_token_budget is None:
+        max_token_budget = DEFAULT_RUN_TOKEN_BUDGET
     llm_client = LLMRouter(
         max_token_budget=max_token_budget,
         stage_token_limits={

@@ -498,6 +498,8 @@ class LLMClient:
             self.budget_ledger.record_usage(
                 role=role,
                 stage=stage,
+                budget_scope=metadata.get("budget_scope"),
+                budget_scope_limit=metadata.get("budget_scope_limit"),
                 prompt_tokens=usage.get("prompt_tokens", 0),
                 completion_tokens=usage.get("completion_tokens", 0),
             )
@@ -506,6 +508,8 @@ class LLMClient:
         self.budget_ledger.record_usage(
             role=role,
             stage=stage,
+            budget_scope=metadata.get("budget_scope"),
+            budget_scope_limit=metadata.get("budget_scope_limit"),
             other_tokens=(
                 int(tokens.get("input_tokens", 0) or 0)
                 + int(tokens.get("output_tokens", 0) or 0)
@@ -584,6 +588,8 @@ class LLMClient:
             estimated_tokens=prompt_tokens + tool_tokens + max_tokens,
             role=metadata.get("model_role") or self.model_role or "llm",
             stage=metadata.get("stage"),
+            budget_scope=metadata.get("budget_scope"),
+            budget_scope_limit=metadata.get("budget_scope_limit"),
         )
         print(f'LLM chat_with_tools request: ~{prompt_tokens + tool_tokens} prompt/tool tokens '
               f'({prompt_tokens} message, {tool_tokens} tool) and {len(tools)} tools')

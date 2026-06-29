@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 
+DEFAULT_RUN_TOKEN_BUDGET = 400000
+
+
 @dataclass(frozen=True)
 class StageSpec:
     name: str
@@ -16,7 +19,12 @@ class StageSpec:
     discovery_budget: int
     finalization_reserve: int
     model_turn_budget: int
+    soft_token_budget: Optional[int]
     token_budget: Optional[int]
+    completion_token_reserve: int
+    request_max_tokens: int
+    completion_max_tokens: int
+    repair_round_token_budget: Optional[int]
     completion_gate: str
     artifact_contract: Tuple[str, ...]
 
@@ -35,7 +43,12 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         discovery_budget=12,
         finalization_reserve=4,
         model_turn_budget=12,
-        token_budget=48000,
+        soft_token_budget=72000,
+        token_budget=96000,
+        completion_token_reserve=20000,
+        request_max_tokens=4096,
+        completion_max_tokens=2048,
+        repair_round_token_budget=None,
         completion_gate="assertion_compilation",
         artifact_contract=("assertion_map.json", "generated_assertion_scan.json"),
     ),
@@ -48,7 +61,12 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         discovery_budget=0,
         finalization_reserve=0,
         model_turn_budget=0,
+        soft_token_budget=None,
         token_budget=None,
+        completion_token_reserve=0,
+        request_max_tokens=0,
+        completion_max_tokens=0,
+        repair_round_token_budget=None,
         completion_gate="formal_result",
         artifact_contract=("formal_result.json", "property_status.json"),
     ),
@@ -61,7 +79,12 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         discovery_budget=24,
         finalization_reserve=3,
         model_turn_budget=30,
-        token_budget=64000,
+        soft_token_budget=72000,
+        token_budget=96000,
+        completion_token_reserve=12000,
+        request_max_tokens=4096,
+        completion_max_tokens=2048,
+        repair_round_token_budget=None,
         completion_gate="diagnosis",
         artifact_contract=("diagnosis.json", "counterexample_analysis.md"),
     ),
@@ -74,7 +97,12 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         discovery_budget=10,
         finalization_reserve=4,
         model_turn_budget=12,
-        token_budget=40000,
+        soft_token_budget=None,
+        token_budget=192000,
+        completion_token_reserve=20000,
+        request_max_tokens=4096,
+        completion_max_tokens=2048,
+        repair_round_token_budget=80000,
         completion_gate="repair_regression",
         artifact_contract=("repair_result.json", "repair_history.json"),
     ),

@@ -214,16 +214,24 @@ class FlashContextCompactor:
         trigger_tokens: int = 12000,
         keep_recent_exchanges: int = 3,
         output_tokens: int = 2000,
+        min_candidate_tokens: int = 3000,
+        min_reduction_tokens: int = 2000,
     ):
         if trigger_tokens <= 0:
             raise ValueError("trigger_tokens must be positive")
         if keep_recent_exchanges <= 0:
             raise ValueError("keep_recent_exchanges must be positive")
+        if min_candidate_tokens <= 0:
+            raise ValueError("min_candidate_tokens must be positive")
+        if min_reduction_tokens <= 0:
+            raise ValueError("min_reduction_tokens must be positive")
         self.llm_router = llm_router
         self.audit_path = Path(audit_path)
         self.trigger_tokens = trigger_tokens
         self.keep_recent_exchanges = keep_recent_exchanges
         self.output_tokens = output_tokens
+        self.min_candidate_tokens = min_candidate_tokens
+        self.min_reduction_tokens = min_reduction_tokens
         self._digests: Dict[str, ContextDigest] = {}
 
     def compact(
@@ -236,25 +244,37 @@ class FlashContextCompactor:
         force: bool = False,
     ) -> CompactionResult:
         tokens_before = _message_tokens(messages)
-        protected, old_messages, tail = self._partition(messages)
-        if (
-            not old_messages
-            or (
-                not force
-                and _message_tokens(old_messages) < self.trigger_tokens
+        keep_values = (
+            range(self.keep_recent_exchanges, 0, -1)
+            if force
+            else (self.keep_recent_exchanges,)
+        )
+        candidates = []
+        seen = set()
+        for keep_recent in keep_values:
+            protected, old_messages, tail = self._partition(
+                messages,
+                keep_recent_exchanges=keep_recent,
             )
-        ):
+            candidate_tokens = _message_tokens(old_messages)
+            if (
+                not old_messages
+                or candidate_tokens < self.min_candidate_tokens
+                or (not force and candidate_tokens < self.trigger_tokens)
+            ):
+                continue
+            digest_key = _messages_hash(old_messages)
+            if digest_key in seen:
+                continue
+            seen.add(digest_key)
+            candidates.append((protected, old_messages, tail))
+        if not candidates:
             return CompactionResult(False, tokens_before, tokens_before)
+        if not force:
+            candidates = [candidates[0], candidates[0]]
 
         errors: List[str] = []
-        windows = [old_messages]
-        if len(old_messages) > 1:
-            windows.append(old_messages[len(old_messages) // 2 :])
-        else:
-            windows.append(old_messages)
-
-        for attempt, window in enumerate(windows, 1):
-            prefix = old_messages[: len(old_messages) - len(window)]
+        for attempt, (protected, window, tail) in enumerate(candidates, 1):
             usage_before = _usage_total(self.llm_router)
             try:
                 digest = self._request_digest(
@@ -270,11 +290,12 @@ class FlashContextCompactor:
                         ),
                     )
                 )
-                replacement = protected + prefix + [digest.to_message()] + tail
+                replacement = protected + [digest.to_message()] + tail
                 tokens_after = _message_tokens(replacement)
-                if tokens_after >= tokens_before:
+                if tokens_before - tokens_after < self.min_reduction_tokens:
                     raise ValueError(
-                        "validated context digest did not reduce estimated tokens"
+                        "validated context digest did not reduce estimated tokens "
+                        f"by at least {self.min_reduction_tokens}"
                     )
                 messages[:] = replacement
                 self._digests[stage] = digest
@@ -311,8 +332,12 @@ class FlashContextCompactor:
         )
 
     def _partition(
-        self, messages: List[Dict[str, Any]]
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        keep_recent_exchanges: Optional[int] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        keep_recent = keep_recent_exchanges or self.keep_recent_exchanges
         protected = list(messages[:2])
         rest = [
             message
@@ -328,10 +353,10 @@ class FlashContextCompactor:
         for index in range(len(rest) - 1, -1, -1):
             if rest[index].get("role") == "assistant":
                 assistant_seen += 1
-                if assistant_seen == self.keep_recent_exchanges:
+                if assistant_seen == keep_recent:
                     tail_start = index
                     break
-        if assistant_seen < self.keep_recent_exchanges:
+        if assistant_seen < keep_recent:
             return protected, [], rest
         return protected, rest[:tail_start], rest[tail_start:]
 
@@ -362,9 +387,15 @@ class FlashContextCompactor:
                 "type": "function",
                 "function": {"name": "submit_context_digest"},
             },
+            enable_thinking=False,
             usage_metadata={
                 "stage": request.stage,
                 "prompt_version": COMPACTION_PROMPT_VERSION,
+                **{
+                    key: request.budget_snapshot[key]
+                    for key in ("budget_scope", "budget_scope_limit")
+                    if key in request.budget_snapshot
+                },
             },
         )
         calls = response.get("function_calls") if response.get("type") == "function_calls" else None

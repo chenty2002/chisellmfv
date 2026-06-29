@@ -559,6 +559,7 @@ class FormalWorkflow:
         This replaces the previous iteration-in-prompt approach.
         """
         spec = get_stage_spec(stage)
+        token_budget_metadata = self._token_budget_metadata(stage, context)
         stage_budget = StageBudget(
             stage=stage,
             tool_call_limit=spec.tool_budget,
@@ -620,6 +621,11 @@ class FormalWorkflow:
         
         for i in range(1, spec.model_turn_budget + 1):
             forced_finalization = stage_budget.begin_model_turn()
+            if self._stage_token_finalization_required(
+                stage,
+                token_budget_metadata,
+            ):
+                stage_budget.enter_token_finalization()
             budget_snapshot = stage_budget.snapshot()
             self._record_budget_event(
                 stage,
@@ -639,11 +645,59 @@ class FormalWorkflow:
                 completion_required=budget_snapshot.completion_required,
             )
             cache_metadata = self._build_prompt_cache_metadata(stage, tool_schemas)
+            cache_metadata.update(token_budget_metadata)
             messages.append(
                 {
                     "role": "user",
                     "content": build_budget_directive(budget_snapshot),
                 }
+            )
+            soft_limit_crossed = self._stage_request_crosses_soft_limit(
+                stage,
+                messages,
+                tool_schemas,
+                max_tokens=(
+                    spec.completion_max_tokens
+                    if force_completion
+                    else spec.request_max_tokens
+                ),
+            )
+            if soft_limit_crossed:
+                stage_budget.enter_token_finalization()
+                budget_snapshot = stage_budget.snapshot()
+                force_completion = (
+                    forced_finalization
+                    or budget_snapshot.completion_required
+                    or budget_snapshot.tool_calls_remaining == 1
+                )
+                tool_schemas = get_budgeted_tool_schemas(
+                    stage,
+                    phase=budget_snapshot.phase,
+                    tool_calls_remaining=budget_snapshot.tool_calls_remaining,
+                    forced_finalization=forced_finalization,
+                    completion_required=budget_snapshot.completion_required,
+                )
+                cache_metadata = self._build_prompt_cache_metadata(
+                    stage,
+                    tool_schemas,
+                )
+                cache_metadata.update(token_budget_metadata)
+                messages[-1]["content"] = build_budget_directive(budget_snapshot)
+                self._record_budget_event(
+                    stage,
+                    "token_finalization",
+                    stage_budget,
+                )
+            hard_compaction_required = self._stage_request_needs_compaction(
+                stage,
+                messages,
+                tool_schemas,
+                token_budget_metadata=token_budget_metadata,
+                max_tokens=(
+                    spec.completion_max_tokens
+                    if force_completion
+                    else spec.request_max_tokens
+                ),
             )
             compaction_error = self._maybe_compact_stage_context(
                 stage,
@@ -651,11 +705,9 @@ class FormalWorkflow:
                 messages,
                 context_compactor,
                 stage_budget=stage_budget,
-                force=self._stage_request_needs_compaction(
-                    stage,
-                    messages,
-                    tool_schemas,
-                ),
+                token_budget_metadata=token_budget_metadata,
+                force=hard_compaction_required or soft_limit_crossed,
+                fatal_on_failure=hard_compaction_required,
             )
             if compaction_error:
                 return self._context_compaction_failure(
@@ -684,6 +736,11 @@ class FormalWorkflow:
                     if force_completion
                     else None
                 ),
+                max_tokens=(
+                    spec.completion_max_tokens
+                    if force_completion
+                    else spec.request_max_tokens
+                ),
             )
             
             try:
@@ -711,6 +768,7 @@ class FormalWorkflow:
                         messages,
                         context_compactor,
                         stage_budget=stage_budget,
+                        token_budget_metadata=token_budget_metadata,
                     )
                     if compaction_error:
                         return self._context_compaction_failure(
@@ -727,6 +785,7 @@ class FormalWorkflow:
                         messages,
                         context_compactor,
                         stage_budget=stage_budget,
+                        token_budget_metadata=token_budget_metadata,
                     )
                     if compaction_error:
                         return self._context_compaction_failure(
@@ -752,6 +811,7 @@ class FormalWorkflow:
                     messages,
                     context_compactor,
                     stage_budget=stage_budget,
+                    token_budget_metadata=token_budget_metadata,
                 )
                 if compaction_error:
                     return self._context_compaction_failure(
@@ -793,6 +853,7 @@ class FormalWorkflow:
         task_type: str,
         prompt_cache_key: Optional[str],
         usage_metadata: Dict[str, str],
+        max_tokens: int,
         tool_choice: Any = "required",
         enable_thinking: Optional[bool] = None,
     ) -> Dict[str, Any]:
@@ -808,6 +869,7 @@ class FormalWorkflow:
                 usage_metadata=metadata,
                 tool_choice=tool_choice,
                 enable_thinking=enable_thinking,
+                max_tokens=max_tokens,
             )
         if self.llm is None:
             raise ValueError("LLM client is not configured for model-backed stage execution")
@@ -819,6 +881,7 @@ class FormalWorkflow:
             usage_metadata=metadata,
             tool_choice=tool_choice,
             enable_thinking=enable_thinking,
+            max_tokens=max_tokens,
         )
     
     def _build_initial_messages(
@@ -902,6 +965,19 @@ class FormalWorkflow:
                 success=False,
                 data={"error": str(exc), "tool_names": tool_names},
             )
+            if "tools not available" in str(exc):
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"The requested tools are not available in the current "
+                        f"budget phase: {exc}. Use only the tools exposed in "
+                        "this turn."
+                    ),
+                })
+                return {
+                    "completed": False,
+                    "iteration_count": iteration_count + 1,
+                }
             return {
                 "completed": True,
                 "result": self._budget_failure(
@@ -1036,7 +1112,9 @@ class FormalWorkflow:
         compactor: Optional[FlashContextCompactor],
         *,
         stage_budget: Optional[StageBudget] = None,
+        token_budget_metadata: Optional[Dict[str, Any]] = None,
         force: bool = False,
+        fatal_on_failure: Optional[bool] = None,
     ) -> Optional[str]:
         """Use Flash to compact old turns without losing the raw audit trail."""
         if compactor is None:
@@ -1061,10 +1139,14 @@ class FormalWorkflow:
                 else max(0, spec.tool_budget - tool_calls_used)
             ),
             "tokens_remaining": (
-                ledger.tokens_remaining(stage)
+                ledger.tokens_remaining(
+                    stage,
+                    **dict(token_budget_metadata or {}),
+                )
                 if ledger is not None
                 else None
             ),
+            **dict(token_budget_metadata or {}),
         }
         result = compactor.compact(
             messages,
@@ -1084,6 +1166,14 @@ class FormalWorkflow:
                 result.tokens_before,
                 result.tokens_after,
             )
+        is_fatal = force if fatal_on_failure is None else fatal_on_failure
+        if result.error and not is_fatal:
+            self.logger.warning(
+                "Preserving %s history after nonfatal Flash compaction failure: %s",
+                stage,
+                result.error,
+            )
+            return None
         return result.error
 
     def _record_budget_event(
@@ -1138,14 +1228,89 @@ class FormalWorkflow:
         stage: str,
         messages: List[Dict[str, Any]],
         tool_schemas: List[Dict[str, Any]],
+        *,
+        token_budget_metadata: Optional[Dict[str, Any]] = None,
+        max_tokens: int,
     ) -> bool:
         ledger = getattr(self.llm, "budget_ledger", None)
         if ledger is None:
             return False
-        remaining = ledger.tokens_remaining(stage)
+        remaining = ledger.tokens_remaining(
+            stage,
+            **dict(token_budget_metadata or {}),
+        )
         if remaining is None:
             return False
-        return estimate_chat_request_tokens(messages, tool_schemas) > remaining
+        return (
+            estimate_chat_request_tokens(
+                messages,
+                tool_schemas,
+                max_tokens=max_tokens,
+            )
+            > remaining
+        )
+
+    def _stage_token_finalization_required(
+        self,
+        stage: str,
+        token_budget_metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        ledger = getattr(self.llm, "budget_ledger", None)
+        if ledger is None:
+            return False
+        spec = get_stage_spec(stage)
+        snapshot = ledger.snapshot()
+        used = int(snapshot.stage_tokens_used.get(stage, 0))
+        remaining = ledger.tokens_remaining(
+            stage,
+            **dict(token_budget_metadata or {}),
+        )
+        return (
+            spec.soft_token_budget is not None
+            and used >= spec.soft_token_budget
+        ) or (
+            remaining is not None
+            and spec.completion_token_reserve > 0
+            and remaining <= spec.completion_token_reserve
+        )
+
+    def _stage_request_crosses_soft_limit(
+        self,
+        stage: str,
+        messages: List[Dict[str, Any]],
+        tool_schemas: List[Dict[str, Any]],
+        *,
+        max_tokens: int,
+    ) -> bool:
+        ledger = getattr(self.llm, "budget_ledger", None)
+        spec = get_stage_spec(stage)
+        if ledger is None or spec.soft_token_budget is None:
+            return False
+        used = int(ledger.snapshot().stage_tokens_used.get(stage, 0))
+        projected = used + estimate_chat_request_tokens(
+            messages,
+            tool_schemas,
+            max_tokens=max_tokens,
+        )
+        return projected > spec.soft_token_budget
+
+    @staticmethod
+    def _token_budget_metadata(
+        stage: str,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        spec = get_stage_spec(stage)
+        if stage != "propose_bugfix" or spec.repair_round_token_budget is None:
+            return {}
+        repair_round = str(
+            (context.get("environment") or {}).get("repair_round") or ""
+        ).split("/", 1)[0].strip()
+        if not repair_round:
+            return {}
+        return {
+            "budget_scope": f"{stage}:round_{repair_round}",
+            "budget_scope_limit": spec.repair_round_token_budget,
+        }
 
     @staticmethod
     def _context_compaction_failure(

@@ -44,6 +44,7 @@ class StageBudgetSnapshot:
     completion_accepted: bool
     completion_required: bool
     forced_finalization: bool
+    token_finalization: bool
     required_next_action: str
 
     def to_dict(self) -> Dict[str, Any]:
@@ -83,6 +84,7 @@ class StageBudget:
         self.completion_accepted = False
         self.completion_required = False
         self.forced_finalization = False
+        self.token_finalization = False
 
     @property
     def tool_calls_remaining(self) -> int:
@@ -100,6 +102,7 @@ class StageBudget:
         remaining = self.tool_call_limit - tool_calls_used
         if (
             self.forced_finalization
+            or self.token_finalization
             or remaining <= self.finalization_reserve
         ):
             return BudgetPhase.FINALIZATION
@@ -138,6 +141,12 @@ class StageBudget:
         self.forced_finalization = self.model_turns_remaining == 1
         self.model_turns_used += 1
         return self.forced_finalization
+
+    def force_finalization(self) -> None:
+        self.forced_finalization = True
+
+    def enter_token_finalization(self) -> None:
+        self.token_finalization = True
 
     def consume_batch(
         self,
@@ -219,6 +228,7 @@ class StageBudget:
             completion_accepted=self.completion_accepted,
             completion_required=self.completion_required,
             forced_finalization=self.forced_finalization,
+            token_finalization=self.token_finalization,
             required_next_action=required,
         )
 
@@ -231,6 +241,8 @@ class BudgetSnapshot:
     calls: int
     stage_token_limits: Dict[str, int]
     stage_tokens_used: Dict[str, int]
+    scope_token_limits: Dict[str, int]
+    scope_tokens_used: Dict[str, int]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -257,6 +269,25 @@ class RunBudgetLedger:
         self.calls = 0
         self.usage_by_role: Dict[str, int] = {}
         self.usage_by_stage: Dict[str, int] = {}
+        self.scope_token_limits: Dict[str, int] = {}
+        self.usage_by_scope: Dict[str, int] = {}
+
+    def _register_scope_limit(
+        self,
+        budget_scope: Optional[str],
+        budget_scope_limit: Optional[int],
+    ) -> Optional[int]:
+        if not budget_scope:
+            return None
+        if budget_scope_limit is not None:
+            limit = int(budget_scope_limit)
+            if limit <= 0:
+                raise ValueError("budget_scope_limit must be positive")
+            existing = self.scope_token_limits.get(budget_scope)
+            if existing is not None and existing != limit:
+                raise ValueError("budget scope limit changed during a run")
+            self.scope_token_limits[budget_scope] = limit
+        return self.scope_token_limits.get(budget_scope)
 
     def check_request(
         self,
@@ -264,6 +295,8 @@ class RunBudgetLedger:
         estimated_tokens: int,
         role: Optional[str] = None,
         stage: Optional[str] = None,
+        budget_scope: Optional[str] = None,
+        budget_scope_limit: Optional[int] = None,
     ) -> None:
         """Reject before HTTP when the estimated request cannot fit."""
         if estimated_tokens < 0:
@@ -280,12 +313,21 @@ class RunBudgetLedger:
         stage_used = self.usage_by_stage.get(stage or "", 0)
         if stage_limit is not None and stage_used + estimated_tokens > stage_limit:
             raise TokenBudgetExceeded(stage_limit, stage_used + estimated_tokens)
+        scope_limit = self._register_scope_limit(
+            budget_scope,
+            budget_scope_limit,
+        )
+        scope_used = self.usage_by_scope.get(budget_scope or "", 0)
+        if scope_limit is not None and scope_used + estimated_tokens > scope_limit:
+            raise TokenBudgetExceeded(scope_limit, scope_used + estimated_tokens)
 
     def record_usage(
         self,
         *,
         role: Optional[str],
         stage: Optional[str],
+        budget_scope: Optional[str] = None,
+        budget_scope_limit: Optional[int] = None,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         other_tokens: int = 0,
@@ -301,6 +343,14 @@ class RunBudgetLedger:
             self.usage_by_role[role] = self.usage_by_role.get(role, 0) + total
         if stage:
             self.usage_by_stage[stage] = self.usage_by_stage.get(stage, 0) + total
+        scope_limit = self._register_scope_limit(
+            budget_scope,
+            budget_scope_limit,
+        )
+        if budget_scope:
+            self.usage_by_scope[budget_scope] = (
+                self.usage_by_scope.get(budget_scope, 0) + total
+            )
         if (
             self.hard_token_limit is not None
             and self.tokens_used > self.hard_token_limit
@@ -310,6 +360,9 @@ class RunBudgetLedger:
         stage_used = self.usage_by_stage.get(stage or "", 0)
         if stage_limit is not None and stage_used > stage_limit:
             raise TokenBudgetExceeded(stage_limit, stage_used)
+        scope_used = self.usage_by_scope.get(budget_scope or "", 0)
+        if scope_limit is not None and scope_used > scope_limit:
+            raise TokenBudgetExceeded(scope_limit, scope_used)
 
     def snapshot(self) -> BudgetSnapshot:
         remaining = (
@@ -324,9 +377,17 @@ class RunBudgetLedger:
             calls=self.calls,
             stage_token_limits=dict(self.stage_token_limits),
             stage_tokens_used=dict(self.usage_by_stage),
+            scope_token_limits=dict(self.scope_token_limits),
+            scope_tokens_used=dict(self.usage_by_scope),
         )
 
-    def tokens_remaining(self, stage: Optional[str] = None) -> Optional[int]:
+    def tokens_remaining(
+        self,
+        stage: Optional[str] = None,
+        *,
+        budget_scope: Optional[str] = None,
+        budget_scope_limit: Optional[int] = None,
+    ) -> Optional[int]:
         remaining = []
         if self.hard_token_limit is not None:
             remaining.append(max(0, self.hard_token_limit - self.tokens_used))
@@ -334,6 +395,14 @@ class RunBudgetLedger:
         if stage_limit is not None:
             remaining.append(
                 max(0, stage_limit - self.usage_by_stage.get(stage or "", 0))
+            )
+        scope_limit = self._register_scope_limit(
+            budget_scope,
+            budget_scope_limit,
+        )
+        if scope_limit is not None:
+            remaining.append(
+                max(0, scope_limit - self.usage_by_scope.get(budget_scope or "", 0))
             )
         return min(remaining) if remaining else None
 
@@ -358,12 +427,32 @@ class RunBudgetLedger:
             limit = self.stage_token_limits.get(stage)
             if limit is not None and used > limit:
                 raise TokenBudgetExceeded(limit, used)
+        scope_limits = {
+            str(scope): int(value)
+            for scope, value in (snapshot.get("scope_token_limits") or {}).items()
+        }
+        scope_usage = {
+            str(scope): int(value or 0)
+            for scope, value in (snapshot.get("scope_tokens_used") or {}).items()
+        }
+        if any(limit <= 0 for limit in scope_limits.values()):
+            raise ValueError("persisted scope token limits must be positive")
+        if any(value < 0 for value in scope_usage.values()):
+            raise ValueError("persisted scope token counters must not be negative")
+        for scope, used in scope_usage.items():
+            limit = scope_limits.get(scope)
+            if limit is not None and used > limit:
+                raise TokenBudgetExceeded(limit, used)
         self.tokens_used = tokens_used
         self.calls = calls
         self.usage_by_stage = stage_usage
+        self.scope_token_limits = scope_limits
+        self.usage_by_scope = scope_usage
 
     def reset(self) -> None:
         self.tokens_used = 0
         self.calls = 0
         self.usage_by_role.clear()
         self.usage_by_stage.clear()
+        self.scope_token_limits.clear()
+        self.usage_by_scope.clear()
