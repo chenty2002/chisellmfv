@@ -406,6 +406,24 @@ class RunBudgetLedger:
             )
         return min(remaining) if remaining else None
 
+    def spendable_tokens(
+        self,
+        stage: str,
+        *,
+        reserved_tokens: int,
+        budget_scope: Optional[str] = None,
+        budget_scope_limit: Optional[int] = None,
+    ) -> Optional[int]:
+        """Return tokens available after preserving a caller-owned reserve."""
+        remaining = self.tokens_remaining(
+            stage,
+            budget_scope=budget_scope,
+            budget_scope_limit=budget_scope_limit,
+        )
+        if remaining is None:
+            return None
+        return max(0, remaining - max(0, int(reserved_tokens)))
+
     def restore(self, snapshot: Mapping[str, Any]) -> None:
         """Restore persisted counters before continuing the same run."""
         tokens_used = int(snapshot.get("tokens_used", 0) or 0)

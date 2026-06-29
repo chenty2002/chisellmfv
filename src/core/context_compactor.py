@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .llm_client import count_tokens
+from .llm_client import count_tokens, estimate_chat_request_tokens
 
 
 CONTEXT_DIGEST_SCHEMA_VERSION = "context_digest.v2"
@@ -473,19 +473,19 @@ class FlashContextCompactor:
         while True:
             usage_before = _usage_total(self.llm_router)
             try:
-                digest = self._request_digest(
-                    CompactionRequest(
-                        stage=stage,
-                        stage_contract=stage_contract,
-                        budget_snapshot=budget_snapshot,
-                        messages=window.candidate,
-                        previous_digest=(
-                            self._digests[stage].payload
-                            if stage in self._digests
-                            else None
-                        ),
-                    )
+                request = CompactionRequest(
+                    stage=stage,
+                    stage_contract=stage_contract,
+                    budget_snapshot=budget_snapshot,
+                    messages=window.candidate,
+                    previous_digest=(
+                        self._digests[stage].payload
+                        if stage in self._digests
+                        else None
+                    ),
                 )
+                self._preflight_request(request)
+                digest = self._request_digest(request)
                 replacement = (
                     window.protected
                     + [digest.to_message()]
@@ -515,7 +515,15 @@ class FlashContextCompactor:
                 )
                 return CompactionResult(True, tokens_before, tokens_after)
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
+                failure = (
+                    exc
+                    if isinstance(exc, ContextCompactionError)
+                    else ContextCompactionError(
+                        "context_compaction_provider_error",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                error = f"{type(failure).__name__}: {failure}"
                 errors.append(error)
                 self._append_audit(
                     success=False,
@@ -525,14 +533,14 @@ class FlashContextCompactor:
                     tokens_before=tokens_before,
                     tokens_after=tokens_before,
                     error=error,
-                    error_kind=getattr(exc, "error_kind", None),
-                    finish_reason=getattr(exc, "finish_reason", None),
+                    error_kind=failure.error_kind,
+                    finish_reason=failure.finish_reason,
                     usage={"total_tokens": _usage_total(self.llm_router) - usage_before},
                 )
                 if (
                     attempt == 1
                     and retry_window is not None
-                    and self._is_retryable(exc)
+                    and self._is_retryable(failure)
                 ):
                     window = retry_window
                     attempt = 2
@@ -631,27 +639,9 @@ class FlashContextCompactor:
         }
 
     def _request_digest(self, request: CompactionRequest) -> ContextDigest:
-        payload = {
-            "prompt_version": COMPACTION_PROMPT_VERSION,
-            "stage": request.stage,
-            "stage_contract": request.stage_contract,
-            "budget_snapshot": request.budget_snapshot,
-            "previous_digest": request.previous_digest,
-            "messages": request.messages,
-        }
+        request_messages = self._request_messages(request)
         response = self.llm_router.chat_with_tools(
-            [
-                {
-                    "role": "system",
-                    "content": COMPACTION_SYSTEM_PROMPT.format(
-                        target_tokens=self.target_tokens
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                },
-            ],
+            request_messages,
             [SUBMIT_CONTEXT_DIGEST_TOOL],
             role="flash",
             stage=request.stage,
@@ -697,6 +687,66 @@ class FlashContextCompactor:
             request.stage,
             digest_token_limit=self.digest_token_limit,
         )
+
+    def _request_messages(
+        self,
+        request: CompactionRequest,
+    ) -> List[Dict[str, str]]:
+        payload = {
+            "prompt_version": COMPACTION_PROMPT_VERSION,
+            "stage": request.stage,
+            "stage_contract": request.stage_contract,
+            "budget_snapshot": request.budget_snapshot,
+            "previous_digest": request.previous_digest,
+            "messages": request.messages,
+        }
+        return [
+            {
+                "role": "system",
+                "content": COMPACTION_SYSTEM_PROMPT.format(
+                    target_tokens=self.target_tokens
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            },
+        ]
+
+    def _preflight_request(self, request: CompactionRequest) -> None:
+        ledger = getattr(self.llm_router, "budget_ledger", None)
+        reserved_tokens = int(
+            request.budget_snapshot.get("completion_reserved", 0) or 0
+        )
+        if (
+            ledger is None
+            or not hasattr(ledger, "spendable_tokens")
+            or reserved_tokens <= 0
+        ):
+            return
+        metadata = {
+            key: request.budget_snapshot[key]
+            for key in ("budget_scope", "budget_scope_limit")
+            if key in request.budget_snapshot
+        }
+        spendable = ledger.spendable_tokens(
+            request.stage,
+            reserved_tokens=reserved_tokens,
+            **metadata,
+        )
+        estimated = estimate_chat_request_tokens(
+            self._request_messages(request),
+            [SUBMIT_CONTEXT_DIGEST_TOOL],
+            max_tokens=self.output_tokens,
+        )
+        if spendable is not None and estimated > spendable:
+            raise ContextCompactionError(
+                "context_compaction_budget_rejected",
+                detail=(
+                    f"estimated request {estimated} exceeds "
+                    f"{spendable} non-reserved tokens"
+                ),
+            )
 
     def _append_audit(
         self,
