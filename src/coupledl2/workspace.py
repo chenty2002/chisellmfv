@@ -12,23 +12,12 @@ from typing import Any, Dict, List
 from uuid import uuid4
 
 from .config import CoupledL2RunConfig
+from .file_policy import ignored_copy_entry
 from .skills import install_context_assets, stage_rule_paths, stage_skill_paths
 from .stages import COUPLEDL2_STAGES, STAGE_SPECS, get_stage_spec
 
 
 STAGE_INPUTS_SCHEMA_VERSION = "stage_inputs.v1"
-
-
-IGNORED_COPY_ENTRIES = {
-    ".git",
-    ".bsp",
-    ".metals",
-    ".mill",
-    "out",
-    "target",
-    "generated",
-    "__pycache__",
-}
 
 
 @dataclass(frozen=True)
@@ -178,7 +167,7 @@ def _allocate_run_dir(run_root: Path, case_name: str) -> Path:
 
 
 def _ignore_copy_entries(_directory: str, names: List[str]) -> set:
-    return {name for name in names if name in IGNORED_COPY_ENTRIES}
+    return {name for name in names if ignored_copy_entry(name)}
 
 
 def _create_stage_dirs(results_dir: Path) -> None:

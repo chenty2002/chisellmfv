@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import CoupledL2RunConfig
+from .file_policy import PathIntent, evaluate_workspace_path
 from .workspace import CoupledL2Workspace
 
 
@@ -61,23 +63,12 @@ def compute_index_hashes(indexes_dir: Path) -> Dict[str, str]:
 def compute_workspace_hash(case_workspace: Path) -> str:
     """Hash source/configuration files while excluding generated build products."""
     digest = hashlib.sha256()
-    ignored_parts = {
-        "generated",
-        "out",
-        "target",
-        ".mill",
-        ".bsp",
-        ".metals",
-        "repair_loop",
-    }
     source_suffixes = {".scala", ".sc", ".sbt", ".py", ".sh"}
-    for path in sorted(case_workspace.rglob("*")):
+    for path in _discoverable_files(case_workspace):
         relative_path = path.relative_to(case_workspace)
         if (
-            not path.is_file()
-            or not relative_path.parts
+            not relative_path.parts
             or relative_path.parts[0] != "Chisel"
-            or ignored_parts.intersection(relative_path.parts)
             or (
                 path.name != "Makefile"
                 and path.suffix.lower() not in source_suffixes
@@ -104,16 +95,38 @@ def _sha256_json(value: Dict[str, Any]) -> str:
 
 def build_project_tree(case_workspace: Path) -> Dict[str, Any]:
     files: List[Dict[str, Any]] = []
-    for path in sorted(case_workspace.rglob("*")):
-        if path.is_file():
-            files.append({
-                "path": _rel(path, case_workspace),
-                "size": path.stat().st_size,
-            })
+    filtered: List[Dict[str, Any]] = []
+    for directory, dir_names, file_names in os.walk(case_workspace, followlinks=False):
+        directory_path = Path(directory)
+        allowed_dirs = []
+        for name in sorted(dir_names):
+            path = directory_path / name
+            relative = path.relative_to(case_workspace)
+            decision = evaluate_workspace_path(relative, intent=PathIntent.DISCOVER)
+            if decision.allowed and not path.is_symlink():
+                allowed_dirs.append(name)
+            else:
+                filtered.append({
+                    "path": _rel(path, case_workspace),
+                    "rule": decision.rule,
+                    "reason": decision.reason,
+                    "explicit_access": True,
+                })
+        dir_names[:] = allowed_dirs
+        for name in sorted(file_names):
+            path = directory_path / name
+            relative = path.relative_to(case_workspace)
+            decision = evaluate_workspace_path(relative, intent=PathIntent.DISCOVER)
+            if decision.allowed:
+                files.append({
+                    "path": _rel(path, case_workspace),
+                    "size": path.stat().st_size,
+                })
     return {
         "case_root": "workspace/case",
         "file_count": len(files),
         "files": files,
+        "filtered_paths": filtered,
     }
 
 
@@ -122,7 +135,11 @@ def build_build_contract(case_workspace: Path, config: CoupledL2RunConfig) -> Di
     verilog_dir = case_workspace / "Verilog"
     makefile = chisel_dir / "Makefile"
     setup_script = verilog_dir / "setup.sh"
-    verify_top_files = sorted(chisel_dir.rglob("VerifyTop*.scala"))
+    verify_top_files = sorted(
+        path
+        for path in _discoverable_files(chisel_dir, policy_root=case_workspace)
+        if path.match("VerifyTop*.scala")
+    )
 
     return {
         "case_name": config.case_name,
@@ -150,7 +167,9 @@ def build_formal_surface(case_workspace: Path) -> Dict[str, Any]:
     uses_boring_utils = False
     uses_ltl = False
 
-    for path in sorted(chisel_dir.rglob("*.scala")):
+    for path in _discoverable_files(chisel_dir, policy_root=case_workspace):
+        if path.suffix != ".scala":
+            continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         uses_chiselfv = uses_chiselfv or "chiselFv" in text or "Formal." in text
         uses_boring_utils = uses_boring_utils or "BoringUtils" in text
@@ -171,6 +190,33 @@ def build_formal_surface(case_workspace: Path) -> Dict[str, Any]:
         "uses_boring_utils": uses_boring_utils,
         "uses_ltl": uses_ltl,
     }
+
+
+def _discoverable_files(root: Path, *, policy_root: Optional[Path] = None) -> List[Path]:
+    """Walk without following links and prune paths denied for default discovery."""
+    policy_root = policy_root or root
+    files: List[Path] = []
+    for directory, dir_names, file_names in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        allowed_dirs = []
+        for name in sorted(dir_names):
+            path = directory_path / name
+            decision = evaluate_workspace_path(
+                path.relative_to(policy_root),
+                intent=PathIntent.DISCOVER,
+            )
+            if decision.allowed and not path.is_symlink():
+                allowed_dirs.append(name)
+        dir_names[:] = allowed_dirs
+        for name in sorted(file_names):
+            path = directory_path / name
+            decision = evaluate_workspace_path(
+                path.relative_to(policy_root),
+                intent=PathIntent.DISCOVER,
+            )
+            if decision.allowed:
+                files.append(path)
+    return sorted(files)
 
 
 def detect_chisel_compatibility(chisel_dir: Path, case_workspace: Path) -> Dict[str, Any]:

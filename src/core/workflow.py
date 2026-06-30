@@ -47,6 +47,7 @@ from .context_compactor import (
     FlashContextCompactor,
 )
 from .escape_policy import EscapePolicy
+from .tool_result_limiter import ToolResultLimiter, prepare_model_view
 from .records import (
     OPERATION_SCHEMA_VERSION,
     STAGE_HANDOFF_SCHEMA_VERSION,
@@ -1112,36 +1113,96 @@ class FormalWorkflow:
         self.logger.info(f"Stage {stage} Iteration {iteration_count} Actions: {[a['type'] for a in actions]}")
         print(f"  Iteration {iteration_count}: {[a['type'] for a in actions]}")
         
-        # Execute actions, replacing known no-progress repeats with compact
-        # rejection results instead of replaying the underlying operation.
-        action_results = []
-        for function_call, action in zip(function_calls, actions):
-            rejection = self.escape_policy.rejection_for(stage, function_call)
-            if rejection:
-                rejected_result = {
-                    "type": action["type"],
-                    "success": False,
-                    "error": rejection,
-                    "no_progress_rejected": True,
-                }
-                self._record_stage_operations(
-                    stage,
-                    [action],
-                    [rejected_result],
-                    {},
+        for action in actions:
+            action["_iteration"] = iteration_count
+
+        # Execute actions without exposing or recording an unbounded result.
+        edit_snapshots = self._capture_edit_snapshots(actions)
+        raw_action_results = []
+        previous_defer = getattr(self, "_defer_stage_operation_recording", False)
+        self._defer_stage_operation_recording = True
+        try:
+            for function_call, action in zip(function_calls, actions):
+                rejection = self.escape_policy.rejection_for(stage, function_call)
+                if rejection:
+                    rejected_result = {
+                        "type": action["type"],
+                        "success": False,
+                        "error": rejection,
+                        "no_progress_rejected": True,
+                    }
+                    raw_action_results.append(rejected_result)
+                else:
+                    raw_action_results.extend(
+                        self._execute_stage_actions([action], stage) or []
+                    )
+        finally:
+            self._defer_stage_operation_recording = previous_defer
+
+        stage_dir = self._coupledl2_stage_dir(stage)
+        spec = get_stage_spec(stage)
+        call_ids = [str(call.get("id") or "call") for call in function_calls]
+        if stage_dir is not None:
+            limiter = ToolResultLimiter(
+                stage_dir,
+                per_result_token_limit=spec.tool_result_token_limit,
+                batch_token_limit=spec.tool_result_batch_token_limit,
+            )
+            action_results = limiter.prepare_batch(
+                raw_action_results,
+                iteration=iteration_count,
+                call_ids=call_ids,
+            )
+        else:
+            action_results = [
+                prepare_model_view(
+                    raw_result,
+                    artifact=f"tool_results/unpersisted-{call_id}.json",
+                    token_limit=spec.tool_result_token_limit,
                 )
-                action_results.append(rejected_result)
-            else:
-                action_results.extend(self._execute_stage_actions([action], stage))
-        budget_payload = stage_budget.snapshot().to_dict()
-        for action_result in action_results:
-            action_result["_budget"] = budget_payload
+                for raw_result, call_id in zip(raw_action_results, call_ids)
+            ]
+        operation_results = []
+        for raw_result, bounded_result in zip(raw_action_results, action_results):
+            operation_result = dict(raw_result)
+            operation_result["artifacts"] = {
+                **dict(raw_result.get("artifacts", {})),
+                "tool_result": bounded_result["artifact"],
+            }
+            operation_result["metrics"] = {
+                **dict(raw_result.get("metrics", {})),
+                "original_tokens": bounded_result["original_tokens"],
+                "returned_tokens": bounded_result["returned_tokens"],
+                "truncated": bounded_result["truncated"],
+            }
+            operation_results.append(operation_result)
+        self._record_stage_operations(
+            stage,
+            actions,
+            operation_results,
+            edit_snapshots,
+        )
         
-        # Store iteration data
+        # Keep only a compact audit summary in stage state.
         iteration = {
             "iteration": iteration_count,
-            "function_calls": function_calls,
-            "action_results": action_results,
+            "function_calls": [
+                {"id": call.get("id"), "name": call.get("name")}
+                for call in function_calls
+            ],
+            "action_results": [
+                {
+                    "type": raw.get("type"),
+                    "success": bool(raw.get("success", False)),
+                    "artifact": bounded["artifact"],
+                    **(
+                        {"no_progress_rejected": True}
+                        if raw.get("no_progress_rejected")
+                        else {}
+                    ),
+                }
+                for raw, bounded in zip(raw_action_results, action_results)
+            ],
         }
         iterations.append(iteration)
         context["iterations"].append(iteration)
@@ -1163,7 +1224,12 @@ class FormalWorkflow:
             messages.append(tool_message)
 
         # Detect and discourage no-progress tool loops through the escape policy.
-        self._handle_repeated_tool_calls(stage, function_calls, action_results, messages)
+        self._handle_repeated_tool_calls(
+            stage,
+            function_calls,
+            raw_action_results,
+            messages,
+        )
         
         # CoupledL2 stages complete only through the explicit complete_stage tool.
         for fc in function_calls:
@@ -1861,7 +1927,8 @@ class FormalWorkflow:
             
     def _execute_stage_actions(self, actions: List[Dict[str, Any]], stage: str) -> List[Dict[str, Any]]:
         """Execute actions for the current stage."""
-        edit_snapshots = self._capture_edit_snapshots(actions)
+        deferred = bool(getattr(self, "_defer_stage_operation_recording", False))
+        edit_snapshots = {} if deferred else self._capture_edit_snapshots(actions)
         results = execute_stage_actions(
             actions=actions,
             work_dir=self.work_dir,
@@ -1872,18 +1939,20 @@ class FormalWorkflow:
             logger=self.logger,
             workspace_root=str(self.run_context.run_dir) if self.run_context is not None else None,
         )
-        self._record_stage_operations(stage, actions, results, edit_snapshots)
+        if not deferred:
+            self._record_stage_operations(stage, actions, results, edit_snapshots)
         return results
 
     def _capture_edit_snapshots(self, actions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         """Capture pre-edit content for lazy source snapshots."""
-        if self.run_context is None:
+        edit_actions = [
+            action for action in actions if action.get("type") == "edit_file"
+        ]
+        if not edit_actions or self.run_context is None:
             return {}
         snapshots: Dict[str, Dict[str, Any]] = {}
         workspace_root = str(self.run_context.run_dir)
-        for action in actions:
-            if action.get("type") != "edit_file":
-                continue
+        for action in edit_actions:
             raw_path = str(action.get("file_path", ""))
             try:
                 path = _resolve_workspace_path(raw_path, workspace_root, self.work_dir)

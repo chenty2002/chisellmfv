@@ -27,6 +27,8 @@ class StageSpec:
     compaction_max_tokens: int
     compaction_target_tokens: int
     compaction_digest_limit: int
+    tool_result_token_limit: int
+    tool_result_batch_token_limit: int
     repair_round_token_budget: Optional[int]
     completion_gate: str
     artifact_contract: Tuple[str, ...]
@@ -54,6 +56,8 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         compaction_max_tokens=4096,
         compaction_target_tokens=1200,
         compaction_digest_limit=1600,
+        tool_result_token_limit=6000,
+        tool_result_batch_token_limit=10000,
         repair_round_token_budget=None,
         completion_gate="assertion_compilation",
         artifact_contract=("assertion_map.json", "generated_assertion_scan.json"),
@@ -75,6 +79,8 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         compaction_max_tokens=0,
         compaction_target_tokens=0,
         compaction_digest_limit=0,
+        tool_result_token_limit=0,
+        tool_result_batch_token_limit=0,
         repair_round_token_budget=None,
         completion_gate="formal_result",
         artifact_contract=("formal_result.json", "property_status.json"),
@@ -96,6 +102,8 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         compaction_max_tokens=4096,
         compaction_target_tokens=1200,
         compaction_digest_limit=1600,
+        tool_result_token_limit=6000,
+        tool_result_batch_token_limit=10000,
         repair_round_token_budget=None,
         completion_gate="diagnosis",
         artifact_contract=("diagnosis.json", "counterexample_analysis.md"),
@@ -117,6 +125,8 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         compaction_max_tokens=4096,
         compaction_target_tokens=1200,
         compaction_digest_limit=1600,
+        tool_result_token_limit=6000,
+        tool_result_batch_token_limit=10000,
         repair_round_token_budget=80000,
         completion_gate="repair_regression",
         artifact_contract=("repair_result.json", "repair_history.json"),

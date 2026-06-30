@@ -10,6 +10,7 @@ import json
 import subprocess
 import difflib
 import hashlib
+import fnmatch
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Callable
 
@@ -18,10 +19,28 @@ try:
 except ModuleNotFoundError:
     execute_waveform_action = None
 from ..causal_analysis import CausalAnalysisActions
+from ..coupledl2.file_policy import (
+    BUILD_OUTPUT_DIRS,
+    GENERATED_DIRS,
+    SYSTEM_CACHE_DIRS,
+    PathIntent,
+    evaluate_workspace_path,
+)
 from .records import normalize_tool_result
 
 
 DEFAULT_READ_FILE_MAX_CHARS = 4000
+MAX_READ_FILE_MAX_CHARS = 24000
+DEFAULT_LIST_MAX_ENTRIES = 200
+MAX_LIST_ENTRIES = 500
+MAX_LIST_DEPTH = 6
+MAX_READ_FILES = 20
+
+
+class PathPolicyDenied(ValueError):
+    def __init__(self, message: str, rule: str):
+        super().__init__(message)
+        self.rule = rule
 
 
 def _coerce_file_paths(action: Dict[str, Any]) -> List[str]:
@@ -65,7 +84,13 @@ def _resolve_work_path(file_path: str, work_dir: str, workspace_root: Optional[s
     return os.path.normpath(os.path.join(os.path.abspath(work_dir), normalized))
 
 
-def _resolve_workspace_path(path: str, workspace_root: str, work_dir: Optional[str] = None) -> Path:
+def _resolve_workspace_path(
+    path: str,
+    workspace_root: str,
+    work_dir: Optional[str] = None,
+    *,
+    reject_symlinks: bool = False,
+) -> Path:
     """Resolve a model path inside the run workspace and reject escapes."""
     root = Path(workspace_root).resolve()
     work = Path(work_dir).resolve() if work_dir else root
@@ -73,22 +98,32 @@ def _resolve_workspace_path(path: str, workspace_root: str, work_dir: Optional[s
     if any(part == ".." for part in raw.parts):
         raise ValueError(f"path escapes workspace: {path}")
     if raw.is_absolute():
-        candidate = raw.resolve()
+        candidate = raw
     else:
         first = raw.parts[0] if raw.parts else ""
         if first == "workspace":
-            candidate = (root / raw).resolve()
+            candidate = root / raw
             if not (root / "workspace").exists():
-                candidate = (root / Path(*raw.parts[1:])).resolve()
+                candidate = root / Path(*raw.parts[1:])
         elif first in {"case", "skills", "rules", "memories"}:
             if (root / "workspace").is_dir() and not (root / first).exists():
-                candidate = (root / "workspace" / raw).resolve()
+                candidate = root / "workspace" / raw
             else:
-                candidate = (root / raw).resolve()
+                candidate = root / raw
         elif first in {"indexes", "results", "logs"}:
-            candidate = (root / raw).resolve()
+            candidate = root / raw
         else:
-            candidate = (work / raw).resolve()
+            candidate = work / raw
+    if reject_symlinks:
+        for component in (candidate, *candidate.parents):
+            if component == root.parent:
+                break
+            if component.is_symlink():
+                raise PathPolicyDenied(
+                    f"symlink paths are not writable: {path}",
+                    "symlink",
+                )
+    candidate = candidate.resolve()
     if candidate != root and root not in candidate.parents:
         raise ValueError(f"path escapes workspace: {path}")
     return candidate
@@ -208,17 +243,57 @@ def _execute_read_files(
 ) -> Dict[str, Any]:
     """Execute read_files action."""
     file_paths = _coerce_file_paths(action)
+    if len(file_paths) > MAX_READ_FILES:
+        return {
+            "type": "read_files",
+            "success": False,
+            "error_code": "too_many_files",
+            "error": f"read_files accepts at most {MAX_READ_FILES} files",
+            "files": [],
+        }
     line_start = action.get("line_start")
     line_end = action.get("line_end")
     max_chars = action.get("max_chars")
     if max_chars is None:
         max_chars = DEFAULT_READ_FILE_MAX_CHARS
+    max_chars = max(1, min(int(max_chars), MAX_READ_FILE_MAX_CHARS))
     files_result = []
     
     for fp in file_paths:
         try:
             if workspace_root:
-                fp = str(_resolve_readable_path(fp, workspace_root, work_dir))
+                resolved = _resolve_readable_path(fp, workspace_root, work_dir)
+                relative = Path(_workspace_relative(resolved, workspace_root))
+                decision = evaluate_workspace_path(relative, intent=PathIntent.READ)
+                if not decision.allowed:
+                    files_result.append({
+                        "file_path": fp,
+                        "content": None,
+                        "error_code": (
+                            "binary_file_requires_specialized_tool"
+                            if decision.rule == "binary_file"
+                            else "path_policy_denied"
+                        ),
+                        "error": decision.reason,
+                        "rule": decision.rule,
+                        "success": False,
+                    })
+                    continue
+                if not resolved.is_file():
+                    raise ValueError(f"read_files requires a concrete file: {fp}")
+                with resolved.open("rb") as handle:
+                    binary_prefix = handle.read(4096)
+                if b"\0" in binary_prefix:
+                    files_result.append({
+                        "file_path": fp,
+                        "content": None,
+                        "error_code": "binary_file_requires_specialized_tool",
+                        "error": "binary evidence requires a specialized tool",
+                        "rule": "binary_content",
+                        "success": False,
+                    })
+                    continue
+                fp = str(resolved)
             else:
                 fp = _resolve_work_path(fp, work_dir, workspace_root)
             content = read_file_func(fp)
@@ -266,13 +341,114 @@ def _execute_list_files(
     pattern = action.get("pattern") or "*"
     if not root.exists():
         return {"type": "list_files", "success": False, "error": f"path does not exist: {action.get('path', '.')}"}
-    files = root.rglob(pattern) if root.is_dir() else [root]
-    items = [
-        {"path": _workspace_relative(path, workspace_root), "bytes": path.stat().st_size}
-        for path in files
-        if path.is_file()
+    recursive = bool(action.get("recursive", False))
+    try:
+        max_depth = int(action.get("max_depth", 1))
+        max_entries = int(action.get("max_entries", DEFAULT_LIST_MAX_ENTRIES))
+    except (TypeError, ValueError):
+        return {"type": "list_files", "success": False, "error": "list limits must be integers"}
+    if not 1 <= max_depth <= MAX_LIST_DEPTH:
+        return {"type": "list_files", "success": False, "error": "max_depth must be between 1 and 6"}
+    if not 1 <= max_entries <= MAX_LIST_ENTRIES:
+        return {"type": "list_files", "success": False, "error": "max_entries must be between 1 and 500"}
+
+    root_relative = Path(_workspace_relative(root, workspace_root))
+    normal_root = evaluate_workspace_path(
+        root_relative,
+        intent=PathIntent.DISCOVER,
+        explicit_root=False,
+    )
+    explicit_root = not normal_root.allowed and normal_root.rule in {
+        "build_output",
+        "generated_output",
+    }
+    root_decision = evaluate_workspace_path(
+        root_relative,
+        intent=PathIntent.DISCOVER,
+        explicit_root=explicit_root,
+    )
+    if not root_decision.allowed:
+        return {
+            "type": "list_files",
+            "success": False,
+            "error_code": "path_policy_denied",
+            "error": root_decision.reason,
+            "rule": root_decision.rule,
+        }
+
+    candidates = []
+    if root.is_file():
+        candidates = [root]
+    else:
+        root_depth = len(root.parts)
+        for directory, dir_names, file_names in os.walk(root, followlinks=False):
+            directory_path = Path(directory)
+            depth = len(directory_path.parts) - root_depth
+            if depth >= max_depth or not recursive:
+                descend = False
+            else:
+                descend = True
+            allowed_dirs = []
+            for name in sorted(dir_names):
+                path = directory_path / name
+                relative = Path(_workspace_relative(path, workspace_root))
+                decision = evaluate_workspace_path(
+                    relative,
+                    intent=PathIntent.DISCOVER,
+                    explicit_root=explicit_root,
+                )
+                if decision.allowed and not path.is_symlink():
+                    candidates.append(path)
+                    if descend:
+                        allowed_dirs.append(name)
+            dir_names[:] = allowed_dirs if descend else []
+            for name in sorted(file_names):
+                path = directory_path / name
+                relative = Path(_workspace_relative(path, workspace_root))
+                decision = evaluate_workspace_path(
+                    relative,
+                    intent=PathIntent.DISCOVER,
+                    explicit_root=explicit_root,
+                )
+                if decision.allowed:
+                    candidates.append(path)
+            if not recursive:
+                break
+
+    entries = []
+    for path in candidates:
+        relative = _workspace_relative(path, workspace_root)
+        if not (
+            fnmatch.fnmatch(path.name, pattern)
+            or fnmatch.fnmatch(relative, pattern)
+        ):
+            continue
+        entry = {
+            "path": relative,
+            "kind": "directory" if path.is_dir() else "file",
+        }
+        if path.is_file():
+            entry["bytes"] = path.stat().st_size
+        entries.append(entry)
+    entries.sort(key=lambda item: item["path"])
+    after = action.get("after")
+    if after:
+        entries = [entry for entry in entries if entry["path"] > str(after)]
+    truncated = len(entries) > max_entries
+    entries = entries[:max_entries]
+    files = [
+        {"path": entry["path"], "bytes": entry["bytes"]}
+        for entry in entries
+        if entry["kind"] == "file"
     ]
-    return {"type": "list_files", "success": True, "files": sorted(items, key=lambda item: item["path"])}
+    return {
+        "type": "list_files",
+        "success": True,
+        "entries": entries,
+        "files": files,
+        "truncated": truncated,
+        "next_cursor": entries[-1]["path"] if truncated and entries else None,
+    }
 
 
 def _execute_rg(
@@ -286,9 +462,38 @@ def _execute_rg(
     if not pattern:
         return {"type": "rg", "success": False, "error": "pattern cannot be empty"}
     root = _resolve_workspace_path(action.get("path", "."), workspace_root, work_dir)
+    root_relative = Path(_workspace_relative(root, workspace_root))
+    normal_root = evaluate_workspace_path(
+        root_relative,
+        intent=PathIntent.DISCOVER,
+        explicit_root=False,
+    )
+    explicit_root = not normal_root.allowed and normal_root.rule in {
+        "build_output",
+        "generated_output",
+    }
+    root_decision = evaluate_workspace_path(
+        root_relative,
+        intent=PathIntent.DISCOVER,
+        explicit_root=explicit_root,
+    )
+    if not root_decision.allowed:
+        return {
+            "type": "rg",
+            "success": False,
+            "error_code": "path_policy_denied",
+            "error": root_decision.reason,
+            "rule": root_decision.rule,
+        }
     argv = ["rg", "--json", pattern, str(root)]
     if action.get("glob"):
         argv[1:1] = ["-g", str(action["glob"])]
+    excluded_dirs = set(SYSTEM_CACHE_DIRS)
+    if not explicit_root:
+        excluded_dirs.update(BUILD_OUTPUT_DIRS)
+        excluded_dirs.update(GENERATED_DIRS)
+    for directory in sorted(excluded_dirs):
+        argv[1:1] = ["-g", f"!**/{directory}/**"]
     try:
         completed = subprocess.run(
             argv,
@@ -305,7 +510,7 @@ def _execute_rg(
         return {"type": "rg", "success": True, "matches": []}
     if completed.returncode != 0:
         return {"type": "rg", "success": False, "error": completed.stdout[-4000:]}
-    max_matches = max(1, int(action.get("max_matches") or 100))
+    max_matches = max(1, min(int(action.get("max_matches") or 100), 500))
     matches = []
     for line in completed.stdout.splitlines():
         event = json.loads(line)
@@ -313,10 +518,17 @@ def _execute_rg(
             continue
         data = event["data"]
         path = Path(data["path"]["text"]).resolve()
+        decision = evaluate_workspace_path(
+            Path(_workspace_relative(path, workspace_root)),
+            intent=PathIntent.DISCOVER,
+            explicit_root=explicit_root,
+        )
+        if not decision.allowed:
+            continue
         matches.append({
             "path": _workspace_relative(path, workspace_root),
             "line": data["line_number"],
-            "text": data["lines"]["text"].rstrip("\n"),
+            "text": data["lines"]["text"].rstrip("\n")[:2000],
         })
         if len(matches) >= max_matches:
             break
@@ -332,7 +544,10 @@ def _execute_read_asset(
     if not workspace_root:
         return {"type": f"read_{subdir[:-1]}", "success": False, "error": "workspace tools are not available"}
     name = action.get("name") or ("project.md" if subdir == "memories" else "index.md")
-    rel = Path(subdir) / _with_md_suffix(str(name))
+    supplied = Path(_with_md_suffix(str(name)))
+    if supplied.parts and supplied.parts[0] == subdir:
+        supplied = Path(*supplied.parts[1:])
+    rel = Path(subdir) / supplied
     try:
         path = _resolve_workspace_path(rel.as_posix(), workspace_root, work_dir)
         content = path.read_text(encoding="utf-8")
@@ -552,7 +767,29 @@ def _execute_edit_file(
 
     raw_path = action.get("file_path", "")
     try:
-        path = _resolve_workspace_path(raw_path, workspace_root, work_dir)
+        path = _resolve_workspace_path(
+            raw_path,
+            workspace_root,
+            work_dir,
+            reject_symlinks=True,
+        )
+        relative = Path(_workspace_relative(path, workspace_root))
+        decision = evaluate_workspace_path(relative, intent=PathIntent.WRITE)
+        if not decision.allowed:
+            return {
+                "type": "edit_file",
+                "success": False,
+                "path": relative.as_posix(),
+                "operation": action.get("operation"),
+                "error_code": "path_policy_denied",
+                "error": decision.reason,
+                "rule": decision.rule,
+                "suggestion": (
+                    "modify source files under case/ and regenerate outputs"
+                    if decision.rule in {"generated_output", "build_output"}
+                    else "choose a writable source or configuration file under case/"
+                ),
+            }
         before = read_file_func(str(path))
         if isinstance(before, str) and before.startswith("Error reading file:"):
             before = ""
@@ -577,13 +814,19 @@ def _execute_edit_file(
             "error": err if not ok else None,
         }
     except Exception as exc:
-        return {
+        result = {
             "type": "edit_file",
             "success": False,
             "path": raw_path,
             "operation": action.get("operation"),
             "error": str(exc),
         }
+        if isinstance(exc, PathPolicyDenied):
+            result.update({
+                "error_code": "path_policy_denied",
+                "rule": exc.rule,
+            })
+        return result
 
 
 def _execute_complete_stage(action: Dict[str, Any]) -> Dict[str, Any]:

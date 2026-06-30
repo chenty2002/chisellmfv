@@ -54,12 +54,36 @@ class ToolRegistry:
 WORKSPACE_CONTEXT_TOOLS = [
     {
         "name": "list_files",
-        "description": "List files under the CoupledL2 run workspace. Paths are workspace-relative and cannot escape the workspace.",
+        "description": "List a bounded workspace directory view. Default discovery is shallow and excludes caches, build outputs, and generated RTL; explicitly naming a generated/build directory permits bounded inspection.",
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Workspace-relative directory or file path", "default": "."},
                 "pattern": {"type": "string", "description": "Glob pattern for files", "default": "*"},
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Recursively descend, subject to max_depth and path policy",
+                    "default": False,
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum traversal depth from path",
+                    "minimum": 1,
+                    "maximum": 6,
+                    "default": 1,
+                },
+                "max_entries": {
+                    "type": "integer",
+                    "description": "Maximum file and directory entries returned",
+                    "minimum": 1,
+                    "maximum": 500,
+                    "default": 200,
+                },
+                "after": {
+                    "type": ["string", "null"],
+                    "description": "Stable path cursor from a previous truncated response",
+                    "default": None,
+                },
             },
         },
     },
