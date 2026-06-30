@@ -21,9 +21,7 @@ class StageSpec:
     model_turn_budget: int
     soft_token_budget: Optional[int]
     token_budget: Optional[int]
-    completion_token_reserve: int
     request_max_tokens: int
-    completion_max_tokens: int
     compaction_max_tokens: int
     compaction_target_tokens: int
     compaction_digest_limit: int
@@ -50,9 +48,7 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         model_turn_budget=12,
         soft_token_budget=72000,
         token_budget=96000,
-        completion_token_reserve=20000,
         request_max_tokens=4096,
-        completion_max_tokens=2048,
         compaction_max_tokens=4096,
         compaction_target_tokens=1200,
         compaction_digest_limit=1600,
@@ -73,9 +69,7 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         model_turn_budget=0,
         soft_token_budget=None,
         token_budget=None,
-        completion_token_reserve=0,
         request_max_tokens=0,
-        completion_max_tokens=0,
         compaction_max_tokens=0,
         compaction_target_tokens=0,
         compaction_digest_limit=0,
@@ -96,9 +90,7 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         model_turn_budget=30,
         soft_token_budget=72000,
         token_budget=96000,
-        completion_token_reserve=12000,
         request_max_tokens=4096,
-        completion_max_tokens=2048,
         compaction_max_tokens=4096,
         compaction_target_tokens=1200,
         compaction_digest_limit=1600,
@@ -119,9 +111,7 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         model_turn_budget=12,
         soft_token_budget=None,
         token_budget=192000,
-        completion_token_reserve=20000,
         request_max_tokens=4096,
-        completion_max_tokens=2048,
         compaction_max_tokens=4096,
         compaction_target_tokens=1200,
         compaction_digest_limit=1600,

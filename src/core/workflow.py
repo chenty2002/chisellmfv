@@ -40,7 +40,7 @@ from .prompt_builder import (
     build_compilation_error_message,
     build_budget_directive,
 )
-from .budget import BudgetPhase, BudgetViolation, StageBudget
+from .budget import BudgetViolation, StageBudget
 from .context_compactor import (
     COMPACTION_SYSTEM_PROMPT,
     SUBMIT_CONTEXT_DIGEST_TOOL,
@@ -628,29 +628,50 @@ class FormalWorkflow:
         messages = self._build_initial_messages(context, stage, None, analysis_report)
         
         for i in range(1, spec.model_turn_budget + 1):
-            forced_finalization = stage_budget.begin_model_turn()
             if self._stage_token_finalization_required(
                 stage,
                 token_budget_metadata,
             ):
                 stage_budget.enter_token_finalization()
+                return self._finalize_stage_locally(
+                    stage,
+                    context,
+                    iterations,
+                    stage_budget,
+                    trigger="token_soft_limit",
+                )
+            budget_snapshot = stage_budget.snapshot()
+            if budget_snapshot.completion_required:
+                stage_budget.force_finalization()
+                return self._finalize_stage_locally(
+                    stage,
+                    context,
+                    iterations,
+                    stage_budget,
+                    trigger="completion_required_after_edit",
+                )
+            if budget_snapshot.tool_calls_remaining <= 1:
+                stage_budget.force_finalization()
+                return self._finalize_stage_locally(
+                    stage,
+                    context,
+                    iterations,
+                    stage_budget,
+                    trigger="tool_budget_exhausted",
+                )
+            stage_budget.begin_model_turn()
             budget_snapshot = stage_budget.snapshot()
             self._record_budget_event(
                 stage,
-                "forced_finalization" if forced_finalization else "budget_state",
+                "budget_state",
                 stage_budget,
-            )
-            force_completion = (
-                forced_finalization
-                or budget_snapshot.completion_required
-                or budget_snapshot.tool_calls_remaining == 1
             )
             tool_schemas = get_budgeted_tool_schemas(
                 stage,
                 phase=budget_snapshot.phase,
                 tool_calls_remaining=budget_snapshot.tool_calls_remaining,
-                forced_finalization=forced_finalization,
-                completion_required=budget_snapshot.completion_required,
+                forced_finalization=False,
+                completion_required=False,
             )
             cache_metadata = self._build_prompt_cache_metadata(stage, tool_schemas)
             cache_metadata.update(token_budget_metadata)
@@ -664,142 +685,68 @@ class FormalWorkflow:
                 stage,
                 messages,
                 tool_schemas,
-                max_tokens=(
-                    spec.completion_max_tokens
-                    if force_completion
-                    else spec.request_max_tokens
-                ),
+                max_tokens=spec.request_max_tokens,
             )
             if soft_limit_crossed:
                 stage_budget.enter_token_finalization()
-                budget_snapshot = stage_budget.snapshot()
-                force_completion = (
-                    forced_finalization
-                    or budget_snapshot.completion_required
-                    or budget_snapshot.tool_calls_remaining == 1
-                )
-                tool_schemas = get_budgeted_tool_schemas(
-                    stage,
-                    phase=budget_snapshot.phase,
-                    tool_calls_remaining=budget_snapshot.tool_calls_remaining,
-                    forced_finalization=forced_finalization,
-                    completion_required=budget_snapshot.completion_required,
-                )
-                cache_metadata = self._build_prompt_cache_metadata(
-                    stage,
-                    tool_schemas,
-                )
-                cache_metadata.update(token_budget_metadata)
-                messages[-1]["content"] = build_budget_directive(budget_snapshot)
                 self._record_budget_event(
                     stage,
                     "token_finalization",
                     stage_budget,
                 )
-            completion_reserve = self._estimate_completion_reserve(
-                stage,
-                messages,
-            )
-            if not self._completion_request_fits_budget(
-                stage,
-                messages,
-                token_budget_metadata,
-            ):
-                return self._token_budget_failure(
+                return self._finalize_stage_locally(
                     stage,
+                    context,
                     iterations,
                     stage_budget,
-                    error=(
-                        "complete_stage request estimate exceeds remaining "
-                        "stage token budget"
-                    ),
+                    trigger="token_soft_limit",
                 )
             hard_compaction_required = (
-                not force_completion
-                and self._stage_request_needs_compaction(
+                self._stage_request_needs_compaction(
                     stage,
                     messages,
                     tool_schemas,
                     token_budget_metadata=token_budget_metadata,
-                    completion_reserve=completion_reserve,
                     max_tokens=spec.request_max_tokens,
                 )
             )
-            compaction_error = (
-                self._maybe_compact_stage_context(
-                    stage,
-                    context,
-                    messages,
-                    context_compactor,
-                    stage_budget=stage_budget,
-                    token_budget_metadata=token_budget_metadata,
-                    force=hard_compaction_required or soft_limit_crossed,
-                    fatal_on_failure=(
-                        hard_compaction_required or soft_limit_crossed
-                    ),
-                    completion_reserve=completion_reserve,
-                )
-                if not force_completion
-                else None
+            compaction_error = self._maybe_compact_stage_context(
+                stage,
+                context,
+                messages,
+                context_compactor,
+                stage_budget=stage_budget,
+                token_budget_metadata=token_budget_metadata,
+                force=hard_compaction_required,
+                fatal_on_failure=hard_compaction_required,
             )
             if compaction_error:
-                return self._context_compaction_failure(
+                stage_budget.force_finalization()
+                return self._finalize_stage_locally(
                     stage,
+                    context,
                     iterations,
-                    compaction_error,
                     stage_budget,
+                    trigger="context_compaction_failed",
+                    error=compaction_error,
                 )
-            completion_reserve = self._estimate_completion_reserve(
-                stage,
-                messages,
-            )
             if (
-                not force_completion
-                and self._stage_request_needs_compaction(
+                self._stage_request_needs_compaction(
                     stage,
                     messages,
                     tool_schemas,
                     token_budget_metadata=token_budget_metadata,
-                    completion_reserve=completion_reserve,
                     max_tokens=spec.request_max_tokens,
                 )
             ):
                 stage_budget.force_finalization()
-                budget_snapshot = stage_budget.snapshot()
-                force_completion = True
-                tool_schemas = self._completion_tool_schemas(stage)
-                cache_metadata = self._build_prompt_cache_metadata(
+                return self._finalize_stage_locally(
                     stage,
-                    tool_schemas,
-                )
-                cache_metadata.update(token_budget_metadata)
-                messages[-1]["content"] = build_budget_directive(budget_snapshot)
-                self._record_budget_event(
-                    stage,
-                    "token_forced_completion",
-                    stage_budget,
-                    data={
-                        "completion_reserved": completion_reserve,
-                        "spendable_tokens": self._spendable_stage_tokens(
-                            stage,
-                            completion_reserve,
-                            token_budget_metadata,
-                        ),
-                    },
-                )
-            if not self._completion_request_fits_budget(
-                stage,
-                messages,
-                token_budget_metadata,
-            ):
-                return self._token_budget_failure(
-                    stage,
+                    context,
                     iterations,
                     stage_budget,
-                    error=(
-                        "complete_stage request estimate exceeds remaining "
-                        "stage token budget"
-                    ),
+                    trigger="token_budget_preflight_rejected",
+                    error="normal stage request exceeds remaining token budget",
                 )
             self._log_llm_request(stage, i, [messages[0], messages[-1]], tool_schemas)
             
@@ -812,30 +759,18 @@ class FormalWorkflow:
                     task_type="stage_loop",
                     prompt_cache_key=cache_metadata["prompt_cache_key"],
                     usage_metadata=cache_metadata,
-                    tool_choice=(
-                        {
-                            "type": "function",
-                            "function": {"name": "complete_stage"},
-                        }
-                        if force_completion
-                        else "required"
-                    ),
-                    enable_thinking=(
-                        False
-                        if force_completion
-                        else None
-                    ),
-                    max_tokens=(
-                        spec.completion_max_tokens
-                        if force_completion
-                        else spec.request_max_tokens
-                    ),
+                    tool_choice="required",
+                    enable_thinking=None,
+                    max_tokens=spec.request_max_tokens,
                 )
             except TokenBudgetExceeded as exc:
-                return self._token_budget_failure(
+                stage_budget.force_finalization()
+                return self._finalize_stage_locally(
                     stage,
+                    context,
                     iterations,
                     stage_budget,
+                    trigger="token_budget_preflight_rejected",
                     error=str(exc),
                 )
             
@@ -867,11 +802,14 @@ class FormalWorkflow:
                         token_budget_metadata=token_budget_metadata,
                     )
                     if compaction_error:
-                        return self._context_compaction_failure(
+                        stage_budget.force_finalization()
+                        return self._finalize_stage_locally(
                             stage,
+                            context,
                             iterations,
-                            compaction_error,
                             stage_budget,
+                            trigger="context_compaction_failed",
+                            error=compaction_error,
                         )
                 else:
                     # LLM returned text instead of tool calls - add error message and retry
@@ -887,18 +825,24 @@ class FormalWorkflow:
                         token_budget_metadata=token_budget_metadata,
                     )
                     if compaction_error:
-                        return self._context_compaction_failure(
+                        stage_budget.force_finalization()
+                        return self._finalize_stage_locally(
                             stage,
+                            context,
                             iterations,
-                            compaction_error,
                             stage_budget,
+                            trigger="context_compaction_failed",
+                            error=compaction_error,
                         )
                     
             except TokenBudgetExceeded as exc:
-                return self._token_budget_failure(
+                stage_budget.force_finalization()
+                return self._finalize_stage_locally(
                     stage,
+                    context,
                     iterations,
                     stage_budget,
+                    trigger="token_budget_preflight_rejected",
                     error=str(exc),
                 )
             except Exception as e:
@@ -921,20 +865,24 @@ class FormalWorkflow:
                     token_budget_metadata=token_budget_metadata,
                 )
                 if compaction_error:
-                    return self._context_compaction_failure(
+                    stage_budget.force_finalization()
+                    return self._finalize_stage_locally(
                         stage,
+                        context,
                         iterations,
-                        compaction_error,
                         stage_budget,
+                        trigger="context_compaction_failed",
+                        error=compaction_error,
                     )
         
-        snapshot = stage_budget.snapshot()
-        reason = (
-            "model_turn_budget_exhausted_after_completion_attempt"
-            if snapshot.completion_attempted
-            else "completion_not_attempted_internal_error"
+        stage_budget.force_finalization()
+        return self._finalize_stage_locally(
+            stage,
+            context,
+            iterations,
+            stage_budget,
+            trigger="model_turn_budget_exhausted",
         )
-        return self._budget_failure(reason, iterations, stage_budget)
 
     def _build_prompt_cache_metadata(
         self,
@@ -1249,7 +1197,9 @@ class FormalWorkflow:
                     result.update(
                         {
                             "completion_attempted": True,
+                            "completion_source": "model_tool",
                             "completion_accepted": True,
+                            "finalization_trigger": "model_complete_stage",
                             "termination_reason": "completed",
                             "budget": stage_budget.snapshot().to_dict(),
                         }
@@ -1267,13 +1217,20 @@ class FormalWorkflow:
                     success=False,
                 )
                 if stage_budget.tool_calls_remaining == 0 or stage_budget.forced_finalization:
+                    failure = self._budget_failure(
+                        "completion_gate_failed",
+                        iterations,
+                        stage_budget,
+                    )
+                    failure.update(
+                        {
+                            "completion_source": "model_tool",
+                            "finalization_trigger": "model_complete_stage",
+                        }
+                    )
                     return {
                         "completed": True,
-                        "result": self._budget_failure(
-                            "completion_gate_failed_after_budget_finalization",
-                            iterations,
-                            stage_budget,
-                        ),
+                        "result": failure,
                         "iteration_count": iteration_count,
                     }
         
@@ -1290,7 +1247,6 @@ class FormalWorkflow:
         token_budget_metadata: Optional[Dict[str, Any]] = None,
         force: bool = False,
         fatal_on_failure: Optional[bool] = None,
-        completion_reserve: Optional[int] = None,
     ) -> Optional[str]:
         """Use Flash to compact old turns without losing the raw audit trail."""
         if compactor is None:
@@ -1307,14 +1263,8 @@ class FormalWorkflow:
             )
         )
         ledger = getattr(self.llm, "budget_ledger", None)
-        reserved_tokens = (
-            self._estimate_completion_reserve(stage, messages)
-            if completion_reserve is None
-            else max(0, int(completion_reserve))
-        )
         spendable_tokens = self._spendable_stage_tokens(
             stage,
-            reserved_tokens,
             token_budget_metadata,
         )
         compaction_estimate = self._estimate_compaction_request(stage, messages)
@@ -1337,11 +1287,11 @@ class FormalWorkflow:
                     success=False,
                     data={
                         "estimated_tokens": compaction_estimate,
-                        "completion_reserved": reserved_tokens,
                         "spendable_tokens": spendable_tokens,
                     },
                 )
-            return None
+            is_fatal = force if fatal_on_failure is None else fatal_on_failure
+            return "context_compaction_budget_rejected" if is_fatal else None
         budget_snapshot = {
             "tool_calls_used": tool_calls_used,
             "tool_calls_remaining": (
@@ -1357,7 +1307,6 @@ class FormalWorkflow:
                 if ledger is not None
                 else None
             ),
-            "completion_reserved": reserved_tokens,
             "spendable_tokens": spendable_tokens,
             **dict(token_budget_metadata or {}),
         }
@@ -1471,7 +1420,6 @@ class FormalWorkflow:
         tool_schemas: List[Dict[str, Any]],
         *,
         token_budget_metadata: Optional[Dict[str, Any]] = None,
-        completion_reserve: int = 0,
         max_tokens: int,
     ) -> bool:
         ledger = getattr(self.llm, "budget_ledger", None)
@@ -1479,7 +1427,6 @@ class FormalWorkflow:
             return False
         spendable = self._spendable_stage_tokens(
             stage,
-            completion_reserve,
             token_budget_metadata,
         )
         if spendable is None:
@@ -1493,43 +1440,9 @@ class FormalWorkflow:
             > spendable
         )
 
-    @staticmethod
-    def _completion_tool_schemas(stage: str) -> List[Dict[str, Any]]:
-        return get_budgeted_tool_schemas(
-            stage,
-            phase=BudgetPhase.FINALIZATION,
-            tool_calls_remaining=1,
-            forced_finalization=True,
-            completion_required=True,
-        )
-
-    def _estimate_completion_request(
-        self,
-        stage: str,
-        messages: List[Dict[str, Any]],
-    ) -> int:
-        spec = get_stage_spec(stage)
-        return estimate_chat_request_tokens(
-            messages,
-            self._completion_tool_schemas(stage),
-            max_tokens=spec.completion_max_tokens,
-        )
-
-    def _estimate_completion_reserve(
-        self,
-        stage: str,
-        messages: List[Dict[str, Any]],
-    ) -> int:
-        spec = get_stage_spec(stage)
-        return max(
-            spec.completion_token_reserve,
-            self._estimate_completion_request(stage, messages),
-        )
-
     def _spendable_stage_tokens(
         self,
         stage: str,
-        completion_reserve: int,
         token_budget_metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[int]:
         ledger = getattr(self.llm, "budget_ledger", None)
@@ -1539,31 +1452,13 @@ class FormalWorkflow:
         if hasattr(ledger, "spendable_tokens"):
             return ledger.spendable_tokens(
                 stage,
-                reserved_tokens=completion_reserve,
+                reserved_tokens=0,
                 **metadata,
             )
         remaining = ledger.tokens_remaining(stage, **metadata)
         if remaining is None:
             return None
-        return max(0, remaining - max(0, completion_reserve))
-
-    def _completion_request_fits_budget(
-        self,
-        stage: str,
-        messages: List[Dict[str, Any]],
-        token_budget_metadata: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        ledger = getattr(self.llm, "budget_ledger", None)
-        if ledger is None:
-            return True
-        remaining = ledger.tokens_remaining(
-            stage,
-            **dict(token_budget_metadata or {}),
-        )
-        return (
-            remaining is None
-            or self._estimate_completion_request(stage, messages) <= remaining
-        )
+        return max(0, remaining)
 
     def _estimate_compaction_request(
         self,
@@ -1616,17 +1511,9 @@ class FormalWorkflow:
         spec = get_stage_spec(stage)
         snapshot = ledger.snapshot()
         used = int(snapshot.stage_tokens_used.get(stage, 0))
-        remaining = ledger.tokens_remaining(
-            stage,
-            **dict(token_budget_metadata or {}),
-        )
         return (
             spec.soft_token_budget is not None
             and used >= spec.soft_token_budget
-        ) or (
-            remaining is not None
-            and spec.completion_token_reserve > 0
-            and remaining <= spec.completion_token_reserve
         )
 
     def _stage_request_crosses_soft_limit(
@@ -1756,103 +1643,234 @@ class FormalWorkflow:
         iteration_count: int,
         messages: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        """
-        Handle stage completion signal from LLM.
-        
-        For stages requiring compilation, verifies the code compiles.
-        If compilation fails, adds error message to history for retry.
-        """
-        summary = args.get("summary", args.get("round_summary", ""))
-        error_type = args.get("error_type")  # Extract error_type if present
-        
-        self.logger.info(f"Stage {stage} marked complete by LLM: {summary if summary else ''}")
+        """Evaluate an explicit model completion and attach retry guidance on failure."""
+        evaluation = self._evaluate_stage_completion(
+            stage,
+            context,
+            args,
+            trigger="model_complete_stage",
+        )
+        if evaluation["accepted"]:
+            return evaluation["result"]
+
+        error = str(evaluation.get("error", "completion gate failed"))
+        if iterations:
+            iterations[-1]["completion_gate_error"] = error
+        if context.get("iterations"):
+            context["iterations"][-1]["completion_gate_error"] = error
+        if evaluation.get("error_kind") == "homologous_assertions_missing":
+            guidance = (
+                "For an `assertion_error` repair you must inspect and report homologous assertions. "
+                "Call `complete_stage` again with `homologous_assertions` listing every structurally "
+                "identical assertion repaired, or an empty list only if none exist."
+            )
+        else:
+            guidance = build_compilation_error_message(error)
+        messages.append({"role": "user", "content": guidance})
+        return None
+
+    def _evaluate_stage_completion(
+        self,
+        stage: str,
+        context: Dict[str, Any],
+        proposed_metadata: Dict[str, Any],
+        trigger: str,
+    ) -> Dict[str, Any]:
+        """Run the deterministic stage gate without making a model request."""
+        metadata = dict(proposed_metadata or {})
+        summary = str(
+            metadata.get("summary", metadata.get("round_summary", ""))
+        ).strip()
+        error_type = metadata.get("error_type")
+        iterations = context.get("iterations", [])
+
+        self.logger.info(
+            "Evaluating %s completion from %s%s",
+            stage,
+            trigger,
+            f": {summary}" if summary else "",
+        )
         if error_type:
-            self.logger.info(f"Error type identified: {error_type}")
-            print(f"  Error type: {error_type}")
             context["error_type"] = error_type
 
         if (
             stage == "propose_bugfix"
             and error_type == "assertion_error"
-            and "homologous_assertions" not in args
+            and "homologous_assertions" not in metadata
         ):
-            messages.append({
-                "role": "user",
-                "content": (
-                    "For an `assertion_error` repair you must inspect and report homologous assertions. "
-                    "Call `complete_stage` again with `homologous_assertions` listing every structurally "
-                    "identical assertion repaired, or an empty list only if none exist."
-                ),
-            })
-            return None
-        
-        # Stages that require compilation verification
-        if stage in ["write_assertions", "propose_bugfix"]:
+            return {
+                "accepted": False,
+                "error_kind": "homologous_assertions_missing",
+                "error": "assertion_error completion requires homologous_assertions",
+            }
+
+        if stage in {"write_assertions", "propose_bugfix"}:
             compile_result = self.build_ops.verify_compilation(
                 require_assertions=(
                     stage == "write_assertions"
                     and "no_assertion_presence_gate" not in self.ablation_modes
                 )
             )
-            if compile_result["success"]:
-                self.logger.info(f"Stage {stage} compilation verified successfully")
-                result = {
-                    "success": True,
-                    "iterations": iterations,
-                    "summary": summary,
-                    "verification_passed": True,
-                    "counterexample_path": None,
-                    "root_cause": None,
+            if not compile_result.get("success", False):
+                return {
+                    "accepted": False,
+                    "error_kind": "compilation_gate_failed",
+                    "error": compile_result.get(
+                        "error",
+                        f"{stage} completion compilation gate failed",
+                    ),
                 }
-                # Include error_type if present (for RL reward calculation)
-                if error_type:
-                    result["error_type"] = error_type
-                if stage == "propose_bugfix":
-                    result["target_assertion_label"] = args.get("target_assertion_label")
-                    result["homologous_assertions"] = args.get("homologous_assertions", [])
-                context["stage_results"][stage] = result
-                if stage == "propose_bugfix" and result.get("success"):
-                    context["workflow_complete"] = True
-                    context["bug_fixed"] = True
-                    if error_type:
-                        context["fix_type"] = error_type
-                return result
-            else:
-                self.logger.warning(f"Stage {stage} final build check failed, attaching to iteration {iteration_count}")
-                iterations[-1]["compilation_error"] = compile_result["error"]
-                context["iterations"][-1]["compilation_error"] = compile_result["error"]
-                print(f"  Final build check failed, asking LLM to fix...")
-                
-                # Add compilation error as user message to history
-                error_message = build_compilation_error_message(compile_result["error"])
-                messages.append({
-                    "role": "user",
-                    "content": error_message
-                })
-                
-                return None  # Continue iteration
-        else:
             result = {
                 "success": True,
                 "iterations": iterations,
-                "summary": args.get("summary", ""),
-                "verification_passed": args.get("verification_passed", True),
-                "counterexample_path": args.get("counterexample_path"),
-                "root_cause": args.get("root_cause"),
-                "files_modified": args.get("files_modified", []),
+                "summary": summary,
+                "verification_passed": True,
+                "counterexample_path": None,
+                "root_cause": None,
             }
-            # Include error_type if present (for RL reward calculation)
+            if stage == "propose_bugfix":
+                result["target_assertion_label"] = metadata.get(
+                    "target_assertion_label"
+                )
+                result["homologous_assertions"] = metadata.get(
+                    "homologous_assertions",
+                    [],
+                )
+        else:
+            if trigger != "model_complete_stage" and not summary:
+                return {
+                    "accepted": False,
+                    "error_kind": "diagnosis_artifact_missing",
+                    "error": (
+                        "waveform_explanation local completion requires a "
+                        "non-empty counterexample_analysis.md"
+                    ),
+                }
+            result = {
+                "success": True,
+                "iterations": iterations,
+                "summary": summary,
+                "verification_passed": metadata.get("verification_passed", True),
+                "counterexample_path": metadata.get("counterexample_path"),
+                "root_cause": metadata.get("root_cause"),
+                "files_modified": metadata.get("files_modified", []),
+            }
+
+        if error_type:
+            result["error_type"] = error_type
+        if stage == "waveform_explanation":
+            self._write_coupledl2_diagnosis(metadata, result)
+        context.setdefault("stage_results", {})[stage] = result
+        if stage == "propose_bugfix":
+            context["workflow_complete"] = True
+            context["bug_fixed"] = True
             if error_type:
-                result["error_type"] = error_type
-            if stage == "waveform_explanation":
-                self._write_coupledl2_diagnosis(args, result)
-            context["stage_results"][stage] = result
-            if stage == "propose_bugfix" and result.get("success"):
-                context["workflow_complete"] = True
-                context["bug_fixed"] = True
-                if error_type:
-                    context["fix_type"] = error_type
-            return result
+                context["fix_type"] = error_type
+        return {"accepted": True, "result": result}
+
+    def _build_local_completion_metadata(
+        self,
+        stage: str,
+        context: Dict[str, Any],
+        trigger: str,
+    ) -> Dict[str, Any]:
+        """Collect bounded, durable facts for workflow-owned finalization."""
+        metadata: Dict[str, Any] = {
+            "summary": f"Local completion gate triggered by {trigger}.",
+        }
+        error_type = context.get("error_type")
+        if error_type:
+            metadata["error_type"] = error_type
+
+        if stage == "waveform_explanation":
+            metadata["summary"] = ""
+            report_path = Path(self.work_dir) / "counterexample_analysis.md"
+            if report_path.is_file():
+                report = report_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ).strip()
+                metadata["summary"] = report[:4000]
+        elif stage == "propose_bugfix":
+            selected = (context.get("environment") or {}).get(
+                "selected_counterexample"
+            )
+            if isinstance(selected, dict) and selected.get("name"):
+                metadata["target_assertion_label"] = selected["name"]
+        return metadata
+
+    def _finalize_stage_locally(
+        self,
+        stage: str,
+        context: Dict[str, Any],
+        iterations: List[Dict[str, Any]],
+        stage_budget: StageBudget,
+        *,
+        trigger: str,
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Terminate under budget pressure through the existing deterministic gate."""
+        stage_budget.attempt_completion()
+        try:
+            metadata = self._build_local_completion_metadata(stage, context, trigger)
+            evaluation = self._evaluate_stage_completion(
+                stage,
+                context,
+                metadata,
+                trigger=trigger,
+            )
+        except Exception as exc:
+            self.logger.exception(
+                "Local completion gate failed unexpectedly for %s",
+                stage,
+            )
+            evaluation = {
+                "accepted": False,
+                "error_kind": "completion_gate_exception",
+                "error": str(exc),
+            }
+        accepted = bool(evaluation["accepted"])
+        stage_budget.mark_completion(accepted)
+        self._record_budget_event(
+            stage,
+            "completion_gate",
+            stage_budget,
+            success=accepted,
+            data={
+                "completion_source": "local_gate",
+                "finalization_trigger": trigger,
+            },
+        )
+
+        if accepted:
+            result = dict(evaluation["result"])
+        else:
+            result = {
+                "success": False,
+                "iterations": iterations,
+                "error_kind": evaluation.get(
+                    "error_kind",
+                    "completion_gate_failed",
+                ),
+                "error": evaluation.get("error", "completion gate failed"),
+            }
+        if error:
+            result["finalization_cause"] = error
+        result.update(
+            {
+                "termination_reason": (
+                    "completed" if accepted else "completion_gate_failed"
+                ),
+                "finalization_trigger": trigger,
+                "completion_attempted": True,
+                "completion_source": "local_gate",
+                "completion_accepted": accepted,
+                "recoverable": not accepted,
+                "budget": stage_budget.snapshot().to_dict(),
+                "token_budget": self._token_budget_snapshot(),
+            }
+        )
+        return result
     
     def _handle_text_response(
         self,

@@ -135,18 +135,21 @@ class StageBudget:
             return tool_name in {"read_files", "edit_file", "complete_stage"}
         return tool_name in {"edit_file", "complete_stage"}
 
-    def begin_model_turn(self) -> bool:
+    def begin_model_turn(self) -> None:
         if self.model_turns_remaining <= 0:
             raise BudgetViolation("model turn budget is exhausted")
-        self.forced_finalization = self.model_turns_remaining == 1
         self.model_turns_used += 1
-        return self.forced_finalization
 
     def force_finalization(self) -> None:
         self.forced_finalization = True
 
     def enter_token_finalization(self) -> None:
         self.token_finalization = True
+
+    def attempt_completion(self) -> None:
+        """Record a workflow-owned completion attempt without spending a tool slot."""
+        self.completion_attempted = True
+        self.completion_required = False
 
     def consume_batch(
         self,
