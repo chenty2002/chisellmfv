@@ -8,14 +8,27 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
 AUTO_VERIFY_GENERATED_DIR = "generated"
-FORMAL_CALL_RE = re.compile(
-    r"(?<!\bdef\s)(?:\bFormal\.(?:assert|assume)|\bfvAssert|"
+EXPLICIT_FORMAL_CALL_RE = re.compile(
+    r"(?<!\bdef\s)(?:\bchisel3\.(?:assert|assume)|"
+    r"\bFormal\.(?:assert|assume)|\bfvAssert|"
     r"\bAssertProperty|\bastLiveness|\bastRelaxedLiveness|"
-    r"\bassertLivenessTimer|\bassert|\bassume)\s*\("
+    r"\bassertLivenessTimer|\bassertAt|\bassertAfterNStepWhen|"
+    r"\bassertNextStepWhen|\bassertAlwaysAfterNStepWhen)\s*\("
 )
+UNQUALIFIED_FORMAL_CALL_RE = re.compile(r"(?<![\w.])(?:assert|assume)\s*\(")
 BORING_CALL_RE = re.compile(r"\bBoringUtils\.[A-Za-z_][A-Za-z0-9_]*\s*\(")
 VAL_RE = re.compile(r"^\s*(?:private\s+|protected\s+|lazy\s+)*val\s+([A-Za-z_][A-Za-z0-9_]*)\b")
 STRUCTURAL_BINDINGS = {"module", "io", "node", "clock", "reset"}
+FORMAL_MIXIN_RE = re.compile(r"\s+with\s+Formal\b")
+HARDWARE_SCOPE_RE = re.compile(
+    r"\b(?:extends|new)\b[^{]*(?:\bModule\b|\bRawModule\b|\bBlackBox\b|"
+    r"\bLazyModuleImp\b|\b[A-Za-z_][A-Za-z0-9_]*Module\b)"
+)
+SCALA_ASSERT_HINT_RE = re.compile(
+    r"\bPredef\.assert\b|"
+    r"\.(?:length|size|exists|forall|isDefined|isEmpty|nonEmpty|"
+    r"isInstanceOf|contains)\b"
+)
 
 
 def preprocess_coupledl2_workspace(case_workspace: Path) -> Dict[str, Any]:
@@ -32,9 +45,11 @@ def preprocess_coupledl2_workspace(case_workspace: Path) -> Dict[str, Any]:
 
 
 def verification_source_files(case_workspace: Path) -> List[Path]:
-    """Return verification harness sources subject to Scala-level cleanup."""
+    """Return all copied Chisel Scala sources subject to formal cleanup."""
     chisel_dir = case_workspace / "Chisel"
-    return sorted(path for path in chisel_dir.rglob("VerifyTop*.scala") if path.is_file())
+    if not chisel_dir.is_dir():
+        return []
+    return sorted(path for path in chisel_dir.rglob("*.scala") if path.is_file())
 
 
 def scan_formal_surface(case_workspace: Path) -> Dict[str, Any]:
@@ -43,17 +58,34 @@ def scan_formal_surface(case_workspace: Path) -> Dict[str, Any]:
     files = verification_source_files(case_workspace)
     for path in files:
         text = path.read_text(encoding="utf-8", errors="ignore")
+        lines = text.splitlines(keepends=True)
+        code_lines = _code_lines_without_comments(text)
+        hardware_ranges = _scope_ranges(lines, HARDWARE_SCOPE_RE)
+        formal_ranges = _scope_ranges(lines, FORMAL_MIXIN_RE)
+        assert_aliases = _chisel_assert_aliases(code_lines)
+        harness = _is_verification_harness(path, case_workspace)
         for line_no, (line, code) in enumerate(
-            zip(text.splitlines(), _code_lines_without_comments(text)),
+            zip(text.splitlines(), code_lines),
             1,
         ):
-            if FORMAL_CALL_RE.search(code):
+            index = line_no - 1
+            if _formal_call_trigger(
+                code,
+                index,
+                hardware_ranges,
+                formal_library=path.stem == "Formal",
+                assert_aliases=assert_aliases,
+            ):
                 assertions.append(_record(path, case_workspace, line_no, line))
-            if "BoringUtils" in code:
+            if FORMAL_MIXIN_RE.search(code):
+                assertions.append(_record(path, case_workspace, line_no, line))
+            if BORING_CALL_RE.search(code) and (
+                harness or _index_in_ranges(index, formal_ranges)
+            ):
                 boringutils.append(_record(path, case_workspace, line_no, line))
     return {
         "schema_version": "formal_surface_scan.v1",
-        "scope": "VerifyTop*.scala",
+        "scope": "Chisel/**/*.scala hardware/formal instrumentation",
         "files_checked": [_rel(path, case_workspace) for path in files],
         "assertion_count": len(assertions),
         "boringutils_count": len(boringutils),
@@ -76,16 +108,37 @@ def clean_formal_surface(case_workspace: Path) -> Dict[str, Any]:
         original = path.read_text(encoding="utf-8", errors="ignore")
         lines = original.splitlines(keepends=True)
         code_lines = _code_lines_without_comments(original)
+        hardware_ranges = _scope_ranges(lines, HARDWARE_SCOPE_RE)
+        formal_ranges = _scope_ranges(lines, FORMAL_MIXIN_RE)
+        assert_aliases = _chisel_assert_aliases(code_lines)
+        harness = _is_verification_harness(path, case_workspace)
+        formal_library = path.stem == "Formal"
         ranges: List[Tuple[int, int]] = []
         removed_identifiers: Set[str] = set()
         removed_names: Set[str] = set()
         file_failures: List[Dict[str, Any]] = []
         helper_ranges: Dict[int, Tuple[int, int, str]] = {}
         replacements: Dict[int, str] = {}
-        clean_boring = True
+        boring_indices = {
+            index
+            for index, code in enumerate(code_lines)
+            if BORING_CALL_RE.search(code)
+            and (harness or _index_in_ranges(index, formal_ranges))
+        }
+        all_boring_indices = {
+            index for index, code in enumerate(code_lines) if BORING_CALL_RE.search(code)
+        }
+        remove_boring_import = (
+            (harness or bool(formal_ranges))
+            and boring_indices == all_boring_indices
+        )
 
         for index, line in enumerate(lines):
-            if not clean_boring or not BORING_CALL_RE.search(code_lines[index]):
+            if FORMAL_MIXIN_RE.search(code_lines[index]):
+                replacements[index] = FORMAL_MIXIN_RE.sub("", line)
+
+        for index, line in enumerate(lines):
+            if index not in boring_indices:
                 continue
             helper = _enclosing_definition(lines, index)
             if helper:
@@ -94,13 +147,27 @@ def clean_formal_surface(case_workspace: Path) -> Dict[str, Any]:
                 removed_names.add(helper[2])
                 removed_text = "".join(lines[helper[0]:helper[1] + 1])
                 removed_identifiers.update(_identifiers(removed_text))
+                continue
+            declaration = _enclosing_declaration(lines, index)
+            if declaration:
+                ranges.append(declaration)
+                declaration_text = "".join(lines[declaration[0]:declaration[1] + 1])
+                match = VAL_RE.match(_code_without_line_comment(lines[declaration[0]]))
+                if match:
+                    removed_names.add(match.group(1))
+                removed_identifiers.update(_identifiers(declaration_text))
 
         for index, line in enumerate(lines):
             code = code_lines[index]
-            if clean_boring and re.match(r"^\s*import\b.*\bBoringUtils\b", code):
+            if remove_boring_import and re.match(
+                r"^\s*import\b.*\bBoringUtils\b",
+                code,
+            ):
                 ranges.append((index, index))
                 continue
             if index in helper_ranges or any(start <= index <= end for start, end, _ in helper_ranges.values()):
+                continue
+            if any(start <= index <= end for start, end in ranges):
                 continue
             helper_call = next(
                 (name for name in removed_names if re.search(rf"\b{re.escape(name)}\s*\(", code)),
@@ -118,8 +185,14 @@ def clean_formal_surface(case_workspace: Path) -> Dict[str, Any]:
                     ranges.append((index, end))
                     removed_identifiers.update(_identifiers("".join(lines[index:end + 1])))
                 continue
-            formal_trigger = FORMAL_CALL_RE.search(code)
-            boring_trigger = BORING_CALL_RE.search(code) if clean_boring else None
+            formal_trigger = _formal_call_trigger(
+                code,
+                index,
+                hardware_ranges,
+                formal_library=formal_library,
+                assert_aliases=assert_aliases,
+            )
+            boring_trigger = BORING_CALL_RE.search(code) if index in boring_indices else None
             if not (formal_trigger or boring_trigger):
                 continue
             trigger = formal_trigger or boring_trigger
@@ -312,6 +385,20 @@ def _balanced_declaration_end(lines: List[str], start: int) -> Optional[int]:
     return None
 
 
+def _enclosing_declaration(
+    lines: List[str],
+    target: int,
+    lookback: int = 12,
+) -> Optional[Tuple[int, int]]:
+    for start in range(target, max(-1, target - lookback), -1):
+        if not VAL_RE.match(_code_without_line_comment(lines[start])):
+            continue
+        end = _balanced_declaration_end(lines, start)
+        if end is not None and target <= end:
+            return start, end
+    return None
+
+
 def _enclosing_definition(lines: List[str], target: int) -> Optional[Tuple[int, int, str]]:
     for start in range(target, -1, -1):
         code = _code_without_line_comment(lines[start])
@@ -343,6 +430,77 @@ def _balanced_block_end(lines: List[str], start: int) -> Optional[int]:
         if opened and depth == 0:
             return index
     return None
+
+
+def _scope_ranges(lines: List[str], pattern: re.Pattern) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    for start, line in enumerate(lines):
+        code = _code_without_line_comment(line)
+        if not pattern.search(code):
+            continue
+        end = _balanced_block_end(lines, start)
+        if end is not None:
+            ranges.append((start, end))
+    return ranges
+
+
+def _index_in_ranges(index: int, ranges: Iterable[Tuple[int, int]]) -> bool:
+    return any(start <= index <= end for start, end in ranges)
+
+
+def _is_verification_harness(path: Path, case_workspace: Path) -> bool:
+    relative = path.relative_to(case_workspace / "Chisel")
+    stem = path.stem.lower()
+    parts = {part.lower() for part in relative.parts}
+    return (
+        stem.startswith("verifytop")
+        or stem == "testtop"
+        or "verification" in parts
+        or "coupledl2verification" in parts
+    )
+
+
+def _formal_call_trigger(
+    code: str,
+    index: int,
+    hardware_ranges: Iterable[Tuple[int, int]],
+    *,
+    formal_library: bool,
+    assert_aliases: Set[str],
+) -> Optional[re.Match]:
+    explicit = EXPLICIT_FORMAL_CALL_RE.search(code)
+    if explicit:
+        return explicit
+    for alias in assert_aliases:
+        aliased = re.search(rf"(?<![\w.]){re.escape(alias)}\s*\(", code)
+        if aliased:
+            return aliased
+    unqualified = UNQUALIFIED_FORMAL_CALL_RE.search(code)
+    if not unqualified:
+        return None
+    if re.search(r"\bdef\s*$", code[:unqualified.start()]):
+        return None
+    if SCALA_ASSERT_HINT_RE.search(code):
+        return None
+    chisel_bool_signature = (
+        re.search(r"\bdef\b", code[:unqualified.start()])
+        and re.search(r"\bBool\b", code[:unqualified.start()])
+    )
+    if formal_library or chisel_bool_signature or _index_in_ranges(index, hardware_ranges):
+        return unqualified
+    return None
+
+
+def _chisel_assert_aliases(code_lines: Iterable[str]) -> Set[str]:
+    aliases: Set[str] = set()
+    for code in code_lines:
+        aliases.update(
+            re.findall(
+                r"\b(?:assert|assume)\s*=>\s*([A-Za-z_][A-Za-z0-9_]*)",
+                code,
+            )
+        )
+    return aliases
 
 
 def _remove_dependent_verification_code(

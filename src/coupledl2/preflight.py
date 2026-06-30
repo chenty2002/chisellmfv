@@ -53,8 +53,6 @@ class CoupledL2Preflight:
             }
         _write_json(self.results_dir / "baseline_build_result.json", baseline)
 
-        rtl_cleanup = sanitize_generated_assertions(baseline.get("generated_files", []))
-        _write_json(self.results_dir / "rtl_assertion_cleanup.json", rtl_cleanup)
         generated_scan = _scan_generated_assertions(baseline.get("generated_files", []))
         _write_json(self.results_dir / "generated_assertion_scan.json", generated_scan)
         gate = {
@@ -83,7 +81,6 @@ class CoupledL2Preflight:
                 "source_manifest_before": "results/preflight/source_manifest_before.json",
                 "source_manifest_after": "results/preflight/source_manifest_after.json",
                 "baseline_build": "results/preflight/baseline_build_result.json",
-                "rtl_assertion_cleanup": "results/preflight/rtl_assertion_cleanup.json",
                 "generated_assertion_scan": "results/preflight/generated_assertion_scan.json",
             },
         }
@@ -118,7 +115,10 @@ def _source_manifest(case_workspace: Path) -> Dict[str, Any]:
 
 def _scan_generated_assertions(paths: Iterable[str]) -> Dict[str, Any]:
     records = []
-    pattern = re.compile(r"(?:\bassert\s*(?:property)?\s*\(|\$assert\b)")
+    pattern = re.compile(
+        r"(?:\bassert\s*(?:property)?\s*\(|\$assert\b|"
+        r"\$(?:error|fatal)\s*\(\s*\"Assertion failed)"
+    )
     for value in paths:
         path = Path(value)
         if not path.is_file():
@@ -131,70 +131,6 @@ def _scan_generated_assertions(paths: Iterable[str]) -> Dict[str, Any]:
         "assertion_count": len(records),
         "assertions": records,
     }
-
-
-def sanitize_generated_assertions(paths: Iterable[str]) -> Dict[str, Any]:
-    """Remove assertion statements left after the case-local set_verify.py pass."""
-    files = []
-    removed_count = 0
-    for value in paths:
-        path = Path(value)
-        if not path.is_file():
-            continue
-        original = path.read_text(encoding="utf-8", errors="ignore")
-        cleaned, removed = _strip_verilog_assertion_statements(original)
-        if removed:
-            path.write_text(cleaned, encoding="utf-8")
-            files.append({"path": str(path), "removed_statements": removed})
-            removed_count += removed
-    return {
-        "schema_version": "rtl_assertion_cleanup.v1",
-        "strategy": "AutoVerify set_verify.py output plus deterministic residual cleanup",
-        "removed_statement_count": removed_count,
-        "files": files,
-    }
-
-
-def _strip_verilog_assertion_statements(text: str) -> tuple:
-    lines = text.splitlines(keepends=True)
-    output = []
-    removed = 0
-    index = 0
-    while index < len(lines):
-        code = lines[index].split("//", 1)[0]
-        is_error = "$error" in code and "Assertion failed" in code
-        is_assert = re.search(r"\bassert\s*(?:property\s*)?\(", code) is not None
-        if not (is_error or is_assert):
-            output.append(lines[index])
-            index += 1
-            continue
-        statement = [lines[index]]
-        balance = _verilog_paren_balance(code[code.find("("):])
-        while balance > 0 and index + 1 < len(lines):
-            index += 1
-            statement.append(lines[index])
-            balance += _verilog_paren_balance(lines[index].split("//", 1)[0])
-        removed += 1
-        index += 1
-    return "".join(output), removed
-
-
-def _verilog_paren_balance(text: str) -> int:
-    depth = 0
-    in_string = False
-    escaped = False
-    for char in text:
-        if escaped:
-            escaped = False
-        elif char == "\\" and in_string:
-            escaped = True
-        elif char == '"':
-            in_string = not in_string
-        elif not in_string and char == "(":
-            depth += 1
-        elif not in_string and char == ")":
-            depth -= 1
-    return depth
 
 
 def _remove_copied_generated_rtl(case_workspace: Path) -> list:
