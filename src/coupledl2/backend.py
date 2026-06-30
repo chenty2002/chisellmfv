@@ -351,9 +351,6 @@ class CoupledL2BuildOperations:
             text = path.read_text(encoding="utf-8", errors="ignore")
             generated_assertions.extend(_scan_verilog_assertions(path, text))
 
-        formal_surface = self._load_json(self.workspace.indexes_dir / "formal_surface.json")
-        source_assertions = formal_surface.get("assertions", [])
-        source_count = int(formal_surface.get("assertion_count", len(source_assertions)))
         count = len(generated_assertions)
         success = count > 0
         result = {
@@ -367,25 +364,13 @@ class CoupledL2BuildOperations:
             result["error"] = "generated Verilog/SystemVerilog contains no assertions"
 
         assertion_map = {
-            "source_assertions": source_assertions,
-            "source_assertion_count": source_count,
+            "property_category": self.workspace.config.property_category,
             "generated_assertions": generated_assertions,
             "generated_assertion_count": count,
-            "all_source_assertions_emitted": bool(source_count and count >= source_count),
-        }
-        assertion_plan = {
-            "property_category": self.workspace.config.property_category,
-            "source_assertion_count": source_count,
-            "generated_verilog_files": [str(path) for path in files],
-            "acceptance": {
-                "requires_generated_assertions": True,
-                "requires_stable_labels": True,
-            },
         }
         stage_dir = self._stage_dir("write_assertions")
         self._write_json(stage_dir / "generated_assertion_scan.json", result)
         self._write_json(stage_dir / "assertion_map.json", assertion_map)
-        self._write_json(stage_dir / "assertion_plan.json", assertion_plan)
         return result
 
     def _stage_dir(self, stage: str) -> Path:

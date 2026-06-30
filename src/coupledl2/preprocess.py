@@ -22,12 +22,19 @@ STRUCTURAL_BINDINGS = {"module", "io", "node", "clock", "reset"}
 FORMAL_MIXIN_RE = re.compile(r"\s+with\s+Formal\b")
 HARDWARE_SCOPE_RE = re.compile(
     r"\b(?:extends|new)\b[^{]*(?:\bModule\b|\bRawModule\b|\bBlackBox\b|"
-    r"\bLazyModuleImp\b|\b[A-Za-z_][A-Za-z0-9_]*Module\b)"
+    r"\bLazyModuleImp\b|\b[A-Za-z_][A-Za-z0-9_]*Module\b|"
+    r"\bBase[A-Z][A-Za-z0-9_]*\b)|"
+    r"\bdef\b[^{]*(?:\bBool\b|\bUInt\b|\bSInt\b|\bData\b)"
 )
 SCALA_ASSERT_HINT_RE = re.compile(
     r"\bPredef\.assert\b|"
     r"\.(?:length|size|exists|forall|isDefined|isEmpty|nonEmpty|"
     r"isInstanceOf|contains)\b"
+)
+CHISEL_ASSERT_HINT_RE = re.compile(
+    r"\b(?:io|clock|reset)\b|===|=/=|:=|"
+    r"\.(?:B|U|W|fire|valid|ready|bits|andR|orR)\b|"
+    r"\b(?:Reg|RegInit|RegNext|Wire|WireDefault|Mux|PopCount|Cat|VecInit)\b"
 )
 
 
@@ -480,13 +487,19 @@ def _formal_call_trigger(
         return None
     if re.search(r"\bdef\s*$", code[:unqualified.start()]):
         return None
-    if SCALA_ASSERT_HINT_RE.search(code):
+    hardware_hint = CHISEL_ASSERT_HINT_RE.search(code)
+    if SCALA_ASSERT_HINT_RE.search(code) and not hardware_hint:
         return None
     chisel_bool_signature = (
         re.search(r"\bdef\b", code[:unqualified.start()])
         and re.search(r"\bBool\b", code[:unqualified.start()])
     )
-    if formal_library or chisel_bool_signature or _index_in_ranges(index, hardware_ranges):
+    if (
+        hardware_hint
+        or formal_library
+        or chisel_bool_signature
+        or _index_in_ranges(index, hardware_ranges)
+    ):
         return unqualified
     return None
 

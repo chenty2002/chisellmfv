@@ -500,14 +500,24 @@ def get_budgeted_tool_schemas(
     tool_calls_remaining: int,
     forced_finalization: bool = False,
     completion_required: bool = False,
+    discovery_calls_remaining: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Return the runtime tool surface allowed by the current budget phase."""
     schemas = get_coupledl2_tool_schemas(formal_stage)
     if forced_finalization or completion_required or tool_calls_remaining <= 1:
         allowed = {"complete_stage"}
+    elif (
+        formal_stage == "write_assertions"
+        and phase is BudgetPhase.DISCOVERY
+        and discovery_calls_remaining is not None
+        and discovery_calls_remaining <= 1
+    ):
+        allowed = {"edit_file"}
     elif phase is BudgetPhase.DISCOVERY:
         return schemas
-    elif formal_stage in {"write_assertions", "propose_bugfix"}:
+    elif formal_stage == "write_assertions":
+        allowed = {"edit_file"}
+    elif formal_stage == "propose_bugfix":
         allowed = (
             {"read_files", "edit_file", "complete_stage"}
             if phase is BudgetPhase.EXECUTION

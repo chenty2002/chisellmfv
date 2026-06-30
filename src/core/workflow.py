@@ -641,15 +641,6 @@ class FormalWorkflow:
                     trigger="token_soft_limit",
                 )
             budget_snapshot = stage_budget.snapshot()
-            if budget_snapshot.completion_required:
-                stage_budget.force_finalization()
-                return self._finalize_stage_locally(
-                    stage,
-                    context,
-                    iterations,
-                    stage_budget,
-                    trigger="completion_required_after_edit",
-                )
             if budget_snapshot.tool_calls_remaining <= 1:
                 stage_budget.force_finalization()
                 return self._finalize_stage_locally(
@@ -670,8 +661,12 @@ class FormalWorkflow:
                 stage,
                 phase=budget_snapshot.phase,
                 tool_calls_remaining=budget_snapshot.tool_calls_remaining,
-                forced_finalization=False,
-                completion_required=False,
+                forced_finalization=budget_snapshot.forced_finalization,
+                completion_required=budget_snapshot.completion_required,
+                discovery_calls_remaining=max(
+                    0,
+                    spec.discovery_budget - budget_snapshot.tool_calls_used,
+                ),
             )
             cache_metadata = self._build_prompt_cache_metadata(stage, tool_schemas)
             cache_metadata.update(token_budget_metadata)
@@ -1023,7 +1018,7 @@ class FormalWorkflow:
                 success=False,
                 data={"error": str(exc), "tool_names": tool_names},
             )
-            if "tools not available" in str(exc):
+            if "not available" in str(exc):
                 messages.append({
                     "role": "user",
                     "content": (
@@ -1298,8 +1293,7 @@ class FormalWorkflow:
                         "spendable_tokens": spendable_tokens,
                     },
                 )
-            is_fatal = force if fatal_on_failure is None else fatal_on_failure
-            return "context_compaction_budget_rejected" if is_fatal else None
+            return "context_compaction_budget_rejected"
         budget_snapshot = {
             "tool_calls_used": tool_calls_used,
             "tool_calls_remaining": (

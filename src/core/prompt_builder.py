@@ -419,7 +419,9 @@ def _build_coupledl2_stage_prompt(stage: str) -> list:
             "## Actions",
             "Determine the case Chisel version from `build_contract.chisel`, then read the listed assertion compatibility skill, `bounded_liveness.md`, `tilelink_protocol.md`, and the listed rules before editing.",
             "If `build_contract.chisel` is missing or unclear, inspect only build files such as `case/Chisel/build.sc`, `case/Chisel/common.sc`, or `case/Chisel/build.sbt` to choose the versioned assertion skill.",
-            "Use retrieved indexes to choose source slices, then call `complete_stage` with assertion and build evidence.",
+            "DISCOVERY is limited to the build contract, versioned skill, VerifyTop, and one necessary DUT slice.",
+            "After entering EXECUTION, call `edit_file`; do not continue reading, searching, or call `complete_stage` early.",
+            "On the model turn after a successful edit, call `complete_stage` with assertion and build evidence.",
             "",
         ],
         "invoke_verification": [

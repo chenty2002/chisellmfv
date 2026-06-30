@@ -482,16 +482,6 @@ def main_coupledl2_run(args):
         sys.exit(2)
 
     stage = args.stage or "write_assertions"
-    logger = get_logger(
-        __name__,
-        console_output=False,
-        clear_log=True,
-        base_name=(
-            "application-coupledl2-preflight.log"
-            if args.preflight_only
-            else f"application-coupledl2-{stage}.log"
-        ),
-    )
     if resume_run:
         workspace = load_coupledl2_workspace(Path(resume_run))
     else:
@@ -503,6 +493,17 @@ def main_coupledl2_run(args):
             run_root=Path(args.run_root),
         )
         workspace = create_coupledl2_workspace(config)
+
+    logger = get_logger(
+        __name__,
+        console_output=False,
+        clear_log=True,
+        base_name=(
+            f"application-coupledl2-{stage}-{workspace.run_dir.name}.log"
+        ),
+    )
+
+    if not resume_run:
         preflight_runner = CoupledL2Runner(
             workspace=workspace,
             logger=logger,
