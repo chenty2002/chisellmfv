@@ -19,7 +19,9 @@ JasperGold quality evaluator, and the Verilog-to-Chisel converter. Treat
   ledgers, stage results, handoff files, and run cost summaries.
 - Workspace-scoped model tools: source reads, bounded `rg`, focused edits,
   deterministic build/proof calls, waveform queries, causal-analysis queries,
-  and explicit `complete_stage` completion.
+  and explicit `complete_stage` completion. Token or turn pressure instead
+  invokes the same deterministic completion gate locally without another LLM
+  request.
 - Dual-model routing through `CHISELLMFV_LLM_MODEL_PRO` and
   `CHISELLMFV_LLM_MODEL_FLASH`, with `CHISELLMFV_LLM_MODEL` as a fallback.
 
@@ -180,6 +182,37 @@ must resume a run whose predecessor handoff succeeded:
 If `invoke_verification` proves all assertions, the workflow stops without
 running counterexample diagnosis or repair.
 
+### Token, Tool-Result, and Workspace Boundaries
+
+During a normal agent turn, `complete_stage` remains the model-facing protocol
+for proposing that a stage is ready to finish. The workflow then validates the
+proposal with the stage's deterministic local gate. If the stage instead
+reaches its token or model-turn boundary, or context compaction cannot proceed,
+the workflow invokes that gate directly. This forced convergence path does not
+send a final `complete_stage` LLM request and records either `completed` or
+`completion_gate_failed` with its trigger and missing evidence.
+
+Every model tool result has two views:
+
+- The complete raw JSON result is persisted first under the stage-local
+  `tool_results/` directory.
+- A valid, bounded `tool_result.v2` view containing the raw artifact reference
+  is added to model history. Agent stages limit one visible result to 6,000
+  estimated tokens and one turn's combined results to 10,000 estimated tokens.
+
+Workspace access applies separate discovery, explicit-read, and write rules.
+`list_files` is shallow and bounded by default, and recursive discovery plus
+`rg` exclude system caches, build outputs such as `out/` and `target/`, and
+generated output. Explicit bounded browsing or text reads can still inspect
+generated RTL and build evidence. `edit_file` is restricted to source and text
+configuration files under `case/`; attempts to modify caches, generated RTL,
+build output, or workflow control artifacts return a structured
+`path_policy_denied` result.
+
+FLASH context compaction and the shared PRO/FLASH run token ledger remain in
+effect for ordinary model work. Tool-result limiting occurs before compaction,
+so raw results never enter model history.
+
 ### Resume A Verified Handoff
 
 Resume uses the existing workspace and validates its hash plus the predecessor
@@ -227,6 +260,8 @@ Each stage directory may contain:
 ```text
 stage_inputs.json              # stable input contract for the stage
 operations.jsonl               # model tool operations and edit evidence
+tool_results/                  # complete raw JSON results referenced by bounded views
+context_compactions.jsonl      # FLASH compaction attempts and budget decisions
 stage_events.jsonl             # machine-readable stage events
 stage_result.json              # normalized stage result
 handoff.json                   # compact downstream-stage contract
@@ -247,7 +282,8 @@ Stage-specific artifacts include:
 Downstream stages read earlier `handoff.json` files through
 `stage_inputs.json`; successful edit stages refresh the indexes and bind the
 workspace/index hashes into their handoffs. `run_cost_summary.json` aggregates
-PRO, FLASH, context compaction, token budget, and stage tool-budget use.
+PRO, FLASH, context compaction, token budget, stage tool-budget use,
+raw/model-visible tool-result token reduction, and local-gate outcomes.
 
 ## Legacy Formal Workflow
 
