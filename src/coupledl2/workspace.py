@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .config import CoupledL2RunConfig
 from .file_policy import ignored_copy_entry
+from .prompt_context import build_prompt_bundle
 from .skills import install_context_assets, stage_rule_paths, stage_skill_paths
 from .stages import COUPLEDL2_STAGES, STAGE_SPECS, get_stage_spec
 
@@ -40,6 +41,9 @@ class StageContext:
     skills: List[Path]
     rules: List[Path]
     context_indexes: Dict[str, Dict[str, Any]]
+    prompt_bundle: List[Dict[str, Any]]
+    prompt_asset_total_chars: int
+    stage_inputs: Dict[str, Any]
 
     def to_dict(self, tool_root: Path) -> Dict[str, Any]:
         payload = {
@@ -53,6 +57,9 @@ class StageContext:
             "context_index_paths": {
                 name: f"indexes/{name}.json" for name in sorted(self.context_indexes.keys())
             },
+            "prompt_bundle": self.prompt_bundle,
+            "prompt_asset_total_chars": self.prompt_asset_total_chars,
+            "stage_inputs": self.stage_inputs,
         }
         chisel = self.context_indexes.get("build_contract", {}).get("chisel")
         if chisel:
@@ -142,13 +149,33 @@ def initialize_stage_context(workspace: CoupledL2Workspace, stage: str) -> Stage
     snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     context_indexes = _load_stage_indexes(workspace.indexes_dir, stage)
+    skills = stage_skill_paths(workspace.workspace_dir, stage, context_indexes)
+    rules = stage_rule_paths(workspace.workspace_dir, stage)
+    prompt_bundle = build_prompt_bundle(
+        workspace.workspace_dir,
+        rules=rules,
+        skills=skills,
+    )
+    stage_inputs = _build_stage_inputs(
+        workspace,
+        stage=stage,
+        stage_dir=stage_dir,
+        snapshot_dir=snapshot_dir,
+        skills=skills,
+        rules=rules,
+        context_indexes=context_indexes,
+        prompt_bundle=prompt_bundle,
+    )
     ctx = StageContext(
         stage=stage,
         stage_dir=stage_dir,
         snapshot_dir=snapshot_dir,
-        skills=stage_skill_paths(workspace.workspace_dir, stage, context_indexes),
-        rules=stage_rule_paths(workspace.workspace_dir, stage),
+        skills=skills,
+        rules=rules,
         context_indexes=context_indexes,
+        prompt_bundle=prompt_bundle,
+        prompt_asset_total_chars=sum(asset["chars"] for asset in prompt_bundle),
+        stage_inputs=stage_inputs,
     )
     _write_stage_inputs(workspace, ctx)
     _append_jsonl(workspace.logs_dir / "events.jsonl", {
@@ -214,28 +241,48 @@ def _load_stage_indexes(indexes_dir: Path, stage: str) -> Dict[str, Dict[str, An
 
 def _write_stage_inputs(workspace: CoupledL2Workspace, ctx: StageContext) -> None:
     """Persist the stable input contract for one stage."""
+    _write_json(ctx.stage_dir / "stage_inputs.json", ctx.stage_inputs)
+
+
+def _build_stage_inputs(
+    workspace: CoupledL2Workspace,
+    *,
+    stage: str,
+    stage_dir: Path,
+    snapshot_dir: Path,
+    skills: List[Path],
+    rules: List[Path],
+    context_indexes: Dict[str, Dict[str, Any]],
+    prompt_bundle: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build the complete in-memory stage input contract."""
     payload = {
         "schema_version": STAGE_INPUTS_SCHEMA_VERSION,
-        "stage": ctx.stage,
-        "stage_dir": str(ctx.stage_dir),
-        "snapshot_dir": str(ctx.snapshot_dir),
-        "skills": [_rel_to_workspace(path, workspace.workspace_dir) for path in ctx.skills],
-        "rules": [_rel_to_workspace(path, workspace.workspace_dir) for path in ctx.rules],
-        "context_indexes": sorted(ctx.context_indexes.keys()),
-        "previous_stage_handoffs": _load_previous_handoffs(workspace, ctx.stage),
+        "stage": stage,
+        "stage_dir": str(stage_dir),
+        "snapshot_dir": str(snapshot_dir),
+        "skills": [_rel_to_workspace(path, workspace.workspace_dir) for path in skills],
+        "rules": [_rel_to_workspace(path, workspace.workspace_dir) for path in rules],
+        "prompt_assets": [
+            {key: asset[key] for key in ("path", "sha256", "chars")}
+            for asset in prompt_bundle
+        ],
+        "prompt_asset_total_chars": sum(asset["chars"] for asset in prompt_bundle),
+        "context_indexes": sorted(context_indexes.keys()),
+        "previous_stage_handoffs": _load_previous_handoffs(workspace, stage),
         "case_name": workspace.config.case_name,
         "verify_mode": workspace.config.verify_mode,
         "input_mode": workspace.config.input_mode,
         "property_category": workspace.config.property_category,
-        "chisel_compatibility": ctx.context_indexes.get("build_contract", {}).get("chisel"),
+        "chisel_compatibility": context_indexes.get("build_contract", {}).get("chisel"),
     }
-    if ctx.stage == "write_assertions":
+    if stage == "write_assertions":
         payload["preflight"] = {
             "result": "results/preflight/preflight_result.json",
             "baseline_build": "results/preflight/baseline_build_result.json",
             "generated_assertion_scan": "results/preflight/generated_assertion_scan.json",
         }
-    _write_json(ctx.stage_dir / "stage_inputs.json", payload)
+    return payload
 
 
 def _load_previous_handoffs(workspace: CoupledL2Workspace, stage: str) -> List[Dict[str, Any]]:

@@ -17,10 +17,11 @@ import json
 import os
 
 from .budget import StageBudgetSnapshot
+from .llm_client import count_tokens
 from ..coupledl2.stages import get_stage_spec
 
 
-PROMPT_VERSION = "coupledl2-v3-stage-budget"
+PROMPT_VERSION = "coupledl2-v4-static-context"
 
 def build_system_prompt(
     stage: str = "write_assertions",
@@ -28,6 +29,7 @@ def build_system_prompt(
     chisel_dir: str = "",
     workspace_dir: str = "",
     work_dir_files: Optional[List[str]] = None,
+    prompt_bundle: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     Build the lightweight CoupledL2 system prompt for a specific stage.
@@ -46,12 +48,11 @@ def build_system_prompt(
         "",
         "## Stable Rules",
         "- You MUST respond ONLY with tool calls. Never respond with plain text.",
-        "- Always use the provided tools to inspect files, edit files, read skills, and complete stages.",
+        "- Always use the provided tools to inspect case evidence, edit files, and complete stages.",
         "- Each response must contain at least one tool call.",
         "- Use `complete_stage` when it is available to declare the stage ready for deterministic validation.",
-        "- Treat paths, indexes, skills, and rules in the user message as retrieved CoupledL2 run context.",
-        "- Read listed rules and relevant stage skills before making source edits or diagnosis claims.",
-        "- Before using Chisel, ChiselFV, LTL, or BoringUtils APIs, derive the case compatibility from `build_contract.chisel` and the versioned assertion skill.",
+        "- Treat the static rules and skills below as authoritative stage context already loaded.",
+        "- Before using Chisel, ChiselFV, LTL, or BoringUtils APIs, follow the injected versioned assertion skill and stable compatibility input.",
         "- Read exact source slices with line-limited tools before modifying files.",
         "- Keep edits inside the run workspace and cite concrete evidence in completion summaries.",
         "",
@@ -70,7 +71,21 @@ def build_system_prompt(
         "",
     ]
 
-    return "\n".join(base_prompt + _build_coupledl2_stage_prompt(stage))
+    asset_sections: List[str] = []
+    if prompt_bundle:
+        asset_sections.extend(["## Static Prompt Assets", ""])
+        for asset in prompt_bundle:
+            asset_sections.extend(
+                [
+                    f"### {asset['path']}",
+                    f"sha256={asset['sha256']}; chars={asset['chars']}",
+                    "",
+                    asset["content"],
+                    "",
+                ]
+            )
+
+    return "\n".join(base_prompt + asset_sections + _build_coupledl2_stage_prompt(stage))
 
 
 def build_budget_directive(snapshot: StageBudgetSnapshot) -> str:
@@ -139,7 +154,7 @@ def build_user_prompt(
         f"- Target: `{target}`",
         f"- Work Directory: `{_display_path(env.get('work_dir'), workspace_dir)}`",
         f"- Source Directory: `{_display_path(env.get('verify_src'), workspace_dir)}`",
-        "- File Tool Path Rule: use workspace-relative paths such as `case/Chisel/...`, `indexes/...`, `skills/...`, `rules/...`, or `results/...`.",
+        "- File Tool Path Rule: use workspace-relative paths such as `case/Chisel/...`, `indexes/...`, or `results/...`.",
         "- Source edits should use `edit_file`; finish the stage with `complete_stage` after evidence is available.",
         "",
     ])
@@ -153,17 +168,9 @@ def build_user_prompt(
         f"- Input Mode: `{coupledl2.get('input_mode', '')}`",
         f"- Workspace Case Path: `{_display_path(coupledl2.get('workspace_case_path'), workspace_dir)}`",
         f"- Stage Directory: `{_display_path(stage_context.get('stage_dir'), workspace_dir)}`",
-        f"- Stage Inputs: `{_display_path(stage_context.get('stage_inputs_path'), workspace_dir)}`",
         f"- Snapshot Directory: `{_display_path(stage_context.get('snapshot_dir'), workspace_dir)}`",
-        "- Stage Inputs contain previous handoff records and the stable artifact contract for this stage.",
-        "",
-        "### Stage Skills",
+        "- Static rules and skills are already loaded in the system message.",
     ])
-    for path in stage_context.get("skills", []):
-        sections.append(f"- `{path}`")
-    sections.extend(["", "### Stage Rules"])
-    for path in stage_context.get("rules", []):
-        sections.append(f"- `{path}`")
     context_index_paths = stage_context.get("context_index_paths") or {}
     if context_index_paths:
         sections.extend(["", "### Context Index Paths"])
@@ -195,6 +202,15 @@ def build_user_prompt(
             "### Retrieved Context Indexes",
             "```json",
             json.dumps(context_indexes, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            "```",
+        ])
+    stage_inputs = stage_context.get("stage_inputs")
+    if stage_inputs:
+        sections.extend([
+            "",
+            "## Stable Stage Inputs",
+            "```json",
+            json.dumps(stage_inputs, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             "```",
         ])
     sections.extend(["", "---", ""])
@@ -386,7 +402,11 @@ def build_assistant_tool_call_message(
     return message
 
 
-def build_compilation_error_message(error: str) -> str:
+def build_compilation_error_message(
+    error: str,
+    *,
+    token_limit: Optional[int] = None,
+) -> str:
     """
     Build a message for final build-check errors to append to the conversation.
     
@@ -396,17 +416,33 @@ def build_compilation_error_message(error: str) -> str:
     Returns:
         Formatted error message string
     """
-    return f"""## Final Build Check Failed
+    def render(detail: str, truncated: bool = False) -> str:
+        marker = "\n...[truncated]" if truncated else ""
+        return f"""## Final Build Check Failed
 
 Your code did not pass the final build check. The design may have failed to compile,
 or generated Verilog/SystemVerilog may be missing required assertions. Please fix the
 following errors:
 
 ```
-{error}
+{detail}{marker}
 ```
 
 **Action Required**: Use the appropriate tool to write corrected code, then call `complete_stage` again with updated evidence."""
+
+    message = render(error)
+    if token_limit is None or count_tokens(message) <= token_limit:
+        return message
+
+    low = 0
+    high = len(error)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count_tokens(render(error[:middle], truncated=True)) <= token_limit:
+            low = middle
+        else:
+            high = middle - 1
+    return render(error[:low], truncated=True)
 
 
 def _build_coupledl2_stage_prompt(stage: str) -> list:
@@ -417,9 +453,8 @@ def _build_coupledl2_stage_prompt(stage: str) -> list:
             "Add high-value CoupledL2 formal properties in the emitted design.",
             "",
             "## Actions",
-            "Determine the case Chisel version from `build_contract.chisel`, then read the listed assertion compatibility skill, `bounded_liveness.md`, `tilelink_protocol.md`, and the listed rules before editing.",
-            "If `build_contract.chisel` is missing or unclear, inspect only build files such as `case/Chisel/build.sc`, `case/Chisel/common.sc`, or `case/Chisel/build.sbt` to choose the versioned assertion skill.",
-            "DISCOVERY is limited to the build contract, versioned skill, VerifyTop, and one necessary DUT slice.",
+            "Use the already loaded compatibility, bounded-liveness, TileLink, and agent-rule context before editing.",
+            "DISCOVERY is limited to VerifyTop and directly relevant DUT evidence.",
             "After entering EXECUTION, call `edit_file`; do not continue reading, searching, or call `complete_stage` early.",
             "On the model turn after a successful edit, call `complete_stage` with assertion and build evidence.",
             "",
@@ -437,7 +472,7 @@ def _build_coupledl2_stage_prompt(stage: str) -> list:
             "Diagnose a CoupledL2 counterexample and classify the failure source.",
             "",
             "## Actions",
-            "Read `waveform_diagnosis.md` and the listed rules before making diagnosis claims.",
+            "Use the already loaded waveform diagnosis skill and agent rules before making diagnosis claims.",
             "Use waveform/source/causal tools for evidence, write the report with `write_report`, then call `complete_stage`.",
             "",
         ],
@@ -446,7 +481,7 @@ def _build_coupledl2_stage_prompt(stage: str) -> list:
             "Perform one focused CoupledL2 repair round based on diagnosis and repair history.",
             "",
             "## Actions",
-            "Read `repair_regression.md` and the listed rules before editing.",
+            "Use the already loaded repair regression skill and agent rules before editing.",
             "Use `edit_file` for one focused repair, then call `complete_stage` with repair category and evidence.",
             "",
         ],

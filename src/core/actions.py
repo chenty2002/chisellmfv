@@ -195,12 +195,6 @@ def execute_stage_actions(
             elif action_type == "rg":
                 result = _execute_rg(action, work_dir, workspace_root)
 
-            elif action_type == "read_skill":
-                result = _execute_read_asset(action, work_dir, workspace_root, "skills")
-
-            elif action_type == "read_rule":
-                result = _execute_read_asset(action, work_dir, workspace_root, "rules")
-
             elif action_type == "read_memory":
                 result = _execute_read_asset(action, work_dir, workspace_root, "memories")
 

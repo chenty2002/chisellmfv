@@ -174,16 +174,24 @@ class StageBudget:
             raise BudgetViolation("complete_stage may appear at most once per batch")
         if "complete_stage" in names and names[-1] != "complete_stage":
             raise BudgetViolation("complete_stage must be the last call in a batch")
-        if self.completion_required and names[0] != "complete_stage":
-            raise BudgetViolation(
-                "complete_stage is required on the model turn after edit_file"
-            )
         if available_tools is not None:
             unavailable = [name for name in names if name not in available_tools]
             if unavailable:
                 raise BudgetViolation(
                     f"tools not available in {self.phase.value}: {unavailable}"
                 )
+        if self.completion_required and names[0] != "complete_stage":
+            raise BudgetViolation(
+                "complete_stage is required on the model turn after edit_file"
+            )
+        discovery_calls_remaining = max(0, self.discovery_limit - self.tool_calls_used)
+        if (
+            self.phase is BudgetPhase.DISCOVERY
+            and len(names) > discovery_calls_remaining
+        ):
+            raise BudgetViolation(
+                "tools not available: batch crosses the DISCOVERY boundary"
+            )
         for offset, name in enumerate(names):
             projected_used = self.tool_calls_used + offset
             projected_remaining = self.tool_call_limit - projected_used
@@ -219,7 +227,7 @@ class StageBudget:
             and phase is BudgetPhase.DISCOVERY
             and self.discovery_limit - self.tool_calls_used <= 1
         ):
-            required = "edit"
+            required = "final_evidence_or_edit"
         elif phase is BudgetPhase.DISCOVERY:
             required = "discover"
         elif phase is BudgetPhase.EXECUTION:

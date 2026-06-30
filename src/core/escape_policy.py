@@ -65,14 +65,6 @@ class EscapePolicy:
                     "rejected because the repeated empty rg search made no progress"
                 )
 
-            if (
-                function_call.get("name") in {"read_skill", "read_rule"}
-                and result.get("success")
-            ):
-                self._blocked_calls[self._call_key(stage, function_call)] = (
-                    f"{function_call.get('name')} content is already loaded"
-                )
-
         if messages is not None and len(messages) >= self.config.compact_after_messages:
             actions.append(
                 EscapeAction(

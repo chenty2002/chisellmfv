@@ -626,9 +626,18 @@ class FormalWorkflow:
 
         # Build initial message history
         messages = self._build_initial_messages(context, stage, None, analysis_report)
+        runtime_state = {
+            "protocol_violations": 0,
+            "completion_gate_failures": 0,
+            "repair_edit_pending": False,
+        }
         
         for i in range(1, spec.model_turn_budget + 1):
-            if self._stage_token_finalization_required(
+            priority_turn = bool(
+                stage_budget.completion_required
+                or runtime_state["repair_edit_pending"]
+            )
+            if not priority_turn and self._stage_token_finalization_required(
                 stage,
                 token_budget_metadata,
             ):
@@ -663,6 +672,7 @@ class FormalWorkflow:
                 tool_calls_remaining=budget_snapshot.tool_calls_remaining,
                 forced_finalization=budget_snapshot.forced_finalization,
                 completion_required=budget_snapshot.completion_required,
+                repair_edit_required=runtime_state["repair_edit_pending"],
                 discovery_calls_remaining=max(
                     0,
                     spec.discovery_budget - budget_snapshot.tool_calls_used,
@@ -670,17 +680,23 @@ class FormalWorkflow:
             )
             cache_metadata = self._build_prompt_cache_metadata(stage, tool_schemas)
             cache_metadata.update(token_budget_metadata)
+            request_max_tokens = (
+                spec.completion_request_max_tokens
+                if budget_snapshot.completion_required
+                and spec.completion_request_max_tokens is not None
+                else spec.request_max_tokens
+            )
             messages.append(
                 {
                     "role": "user",
                     "content": build_budget_directive(budget_snapshot),
                 }
             )
-            soft_limit_crossed = self._stage_request_crosses_soft_limit(
+            soft_limit_crossed = not priority_turn and self._stage_request_crosses_soft_limit(
                 stage,
                 messages,
                 tool_schemas,
-                max_tokens=spec.request_max_tokens,
+                max_tokens=request_max_tokens,
             )
             if soft_limit_crossed:
                 stage_budget.enter_token_finalization()
@@ -702,7 +718,7 @@ class FormalWorkflow:
                     messages,
                     tool_schemas,
                     token_budget_metadata=token_budget_metadata,
-                    max_tokens=spec.request_max_tokens,
+                    max_tokens=request_max_tokens,
                 )
             )
             compaction_error = self._maybe_compact_stage_context(
@@ -731,9 +747,15 @@ class FormalWorkflow:
                     messages,
                     tool_schemas,
                     token_budget_metadata=token_budget_metadata,
-                    max_tokens=spec.request_max_tokens,
+                    max_tokens=request_max_tokens,
                 )
             ):
+                if priority_turn and runtime_state["completion_gate_failures"]:
+                    return self._completion_repair_budget_failure(
+                        iterations,
+                        stage_budget,
+                        "priority completion-repair request exceeds remaining token budget",
+                    )
                 stage_budget.force_finalization()
                 return self._finalize_stage_locally(
                     stage,
@@ -756,9 +778,15 @@ class FormalWorkflow:
                     usage_metadata=cache_metadata,
                     tool_choice="required",
                     enable_thinking=None,
-                    max_tokens=spec.request_max_tokens,
+                    max_tokens=request_max_tokens,
                 )
             except TokenBudgetExceeded as exc:
+                if priority_turn and runtime_state["completion_gate_failures"]:
+                    return self._completion_repair_budget_failure(
+                        iterations,
+                        stage_budget,
+                        str(exc),
+                    )
                 stage_budget.force_finalization()
                 return self._finalize_stage_locally(
                     stage,
@@ -782,6 +810,7 @@ class FormalWorkflow:
                         messages,
                         stage_budget,
                         {schema["name"] for schema in tool_schemas},
+                        runtime_state=runtime_state,
                     )
                     iteration_count = result["iteration_count"]
                     
@@ -952,6 +981,11 @@ class FormalWorkflow:
             chisel_dir=self.chisel_dir,
             workspace_dir=self.workspace_dir,
             work_dir_files=None,
+            prompt_bundle=(
+                self.stage_context.prompt_bundle
+                if self.stage_context is not None
+                else None
+            ),
         )
         
         # User prompt - task description and context
@@ -991,6 +1025,7 @@ class FormalWorkflow:
         messages: List[Dict[str, Any]],
         stage_budget: StageBudget,
         available_tools: set,
+        runtime_state: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Handle function call responses from LLM.
@@ -1003,6 +1038,12 @@ class FormalWorkflow:
         raw_message = response.get("raw_message", {})
         if not hasattr(self, "escape_policy"):
             self.escape_policy = EscapePolicy()
+        if runtime_state is None:
+            runtime_state = {
+                "protocol_violations": 0,
+                "completion_gate_failures": 0,
+                "repair_edit_pending": False,
+            }
 
         tool_names = [call["name"] for call in function_calls]
         try:
@@ -1019,12 +1060,26 @@ class FormalWorkflow:
                 data={"error": str(exc), "tool_names": tool_names},
             )
             if "not available" in str(exc):
+                runtime_state["protocol_violations"] += 1
+                if runtime_state["protocol_violations"] >= 2:
+                    return {
+                        "completed": True,
+                        "result": self._budget_failure(
+                            "tool_protocol_violation",
+                            iterations,
+                            stage_budget,
+                            error=str(exc),
+                        ),
+                        "iteration_count": iteration_count,
+                    }
+                snapshot = stage_budget.snapshot()
                 messages.append({
                     "role": "user",
                     "content": (
-                        f"The requested tools are not available in the current "
-                        f"budget phase: {exc}. Use only the tools exposed in "
-                        "this turn."
+                        f"Tool protocol correction: {exc}. "
+                        f"allowed_tools={sorted(available_tools)}; "
+                        f"required_next_action={snapshot.required_next_action}. "
+                        "Only one protocol correction is allowed."
                     ),
                 })
                 return {
@@ -1125,6 +1180,11 @@ class FormalWorkflow:
             operation_results,
             edit_snapshots,
         )
+        if runtime_state["repair_edit_pending"] and any(
+            action.get("type") == "edit_file" and result.get("success")
+            for action, result in zip(actions, raw_action_results)
+        ):
+            runtime_state["repair_edit_pending"] = False
         
         # Keep only a compact audit summary in stage state.
         iteration = {
@@ -1178,6 +1238,7 @@ class FormalWorkflow:
         for fc in function_calls:
             args = fc.get("arguments", {})
             if fc.get("name") == "complete_stage":
+                self._last_completion_gate_failure = None
                 result = self._handle_stage_completion(
                     args, stage, context, iterations, iteration_count, messages
                 )
@@ -1211,6 +1272,47 @@ class FormalWorkflow:
                     stage_budget,
                     success=False,
                 )
+                gate_failure = self._last_completion_gate_failure or {}
+                spec = get_stage_spec(stage)
+                if (
+                    gate_failure.get("error_kind") == "compilation_gate_failed"
+                    and spec.completion_gate_repair_limit > 0
+                ):
+                    failures = int(runtime_state["completion_gate_failures"]) + 1
+                    runtime_state["completion_gate_failures"] = failures
+                    if failures <= spec.completion_gate_repair_limit:
+                        if stage_budget.tool_calls_remaining < 2:
+                            return {
+                                "completed": True,
+                                "result": self._completion_repair_budget_failure(
+                                    iterations,
+                                    stage_budget,
+                                    gate_failure.get("error", "completion gate failed"),
+                                ),
+                                "iteration_count": iteration_count,
+                            }
+                        runtime_state["repair_edit_pending"] = True
+                        return {
+                            "completed": False,
+                            "iteration_count": iteration_count,
+                        }
+                    failure = self._budget_failure(
+                        "completion_gate_failed",
+                        iterations,
+                        stage_budget,
+                        error=gate_failure.get("error", "completion gate failed"),
+                    )
+                    failure.update(
+                        {
+                            "completion_source": "model_tool",
+                            "finalization_trigger": "model_complete_stage",
+                        }
+                    )
+                    return {
+                        "completed": True,
+                        "result": failure,
+                        "iteration_count": iteration_count,
+                    }
                 if stage_budget.tool_calls_remaining == 0 or stage_budget.forced_finalization:
                     failure = self._budget_failure(
                         "completion_gate_failed",
@@ -1386,6 +1488,20 @@ class FormalWorkflow:
         if error:
             result["error"] = error
         return result
+
+    @staticmethod
+    def _completion_repair_budget_failure(
+        iterations: List[Dict[str, Any]],
+        stage_budget: StageBudget,
+        error: str,
+    ) -> Dict[str, Any]:
+        """Return the terminal result when the single repair window cannot fit."""
+        return FormalWorkflow._budget_failure(
+            "completion_repair_budget_exhausted",
+            iterations,
+            stage_budget,
+            error=error,
+        )
 
     def _token_budget_failure(
         self,
@@ -1655,6 +1771,7 @@ class FormalWorkflow:
         if evaluation["accepted"]:
             return evaluation["result"]
 
+        self._last_completion_gate_failure = evaluation
         error = str(evaluation.get("error", "completion gate failed"))
         if iterations:
             iterations[-1]["completion_gate_error"] = error
@@ -1667,7 +1784,10 @@ class FormalWorkflow:
                 "identical assertion repaired, or an empty list only if none exist."
             )
         else:
-            guidance = build_compilation_error_message(error)
+            guidance = build_compilation_error_message(
+                error,
+                token_limit=get_stage_spec(stage).completion_error_token_limit,
+            )
         messages.append({"role": "user", "content": guidance})
         return None
 

@@ -102,28 +102,6 @@ WORKSPACE_CONTEXT_TOOLS = [
         },
     },
     {
-        "name": "read_skill",
-        "description": "Read one installed CoupledL2 workspace skill by name or relative path.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Skill file name, with or without .md suffix"},
-            },
-            "required": ["name"],
-        },
-    },
-    {
-        "name": "read_rule",
-        "description": "Read one installed CoupledL2 workspace rule by name or relative path.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Rule file name, with or without .md suffix"},
-            },
-            "required": ["name"],
-        },
-    },
-    {
         "name": "read_memory",
         "description": "Read a workspace-scoped memory note from the CoupledL2 run workspace.",
         "parameters": {
@@ -500,19 +478,24 @@ def get_budgeted_tool_schemas(
     tool_calls_remaining: int,
     forced_finalization: bool = False,
     completion_required: bool = False,
+    repair_edit_required: bool = False,
     discovery_calls_remaining: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Return the runtime tool surface allowed by the current budget phase."""
     schemas = get_coupledl2_tool_schemas(formal_stage)
     if forced_finalization or completion_required or tool_calls_remaining <= 1:
         allowed = {"complete_stage"}
+    elif repair_edit_required:
+        allowed = {"edit_file"}
     elif (
         formal_stage == "write_assertions"
         and phase is BudgetPhase.DISCOVERY
         and discovery_calls_remaining is not None
         and discovery_calls_remaining <= 1
     ):
-        allowed = {"edit_file"}
+        allowed = {"read_files", "edit_file"}
+    elif formal_stage == "write_assertions" and phase is BudgetPhase.DISCOVERY:
+        allowed = {"list_files", "rg", "read_files", "edit_file"}
     elif phase is BudgetPhase.DISCOVERY:
         return schemas
     elif formal_stage == "write_assertions":

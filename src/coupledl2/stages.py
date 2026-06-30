@@ -30,6 +30,9 @@ class StageSpec:
     repair_round_token_budget: Optional[int]
     completion_gate: str
     artifact_contract: Tuple[str, ...]
+    completion_request_max_tokens: Optional[int] = None
+    completion_gate_repair_limit: int = 0
+    completion_error_token_limit: int = 4000
 
     @property
     def directory_name(self) -> str:
@@ -43,7 +46,7 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         execution_kind="agent",
         required_predecessor="preflight",
         tool_budget=24,
-        discovery_budget=8,
+        discovery_budget=4,
         finalization_reserve=4,
         model_turn_budget=12,
         soft_token_budget=72000,
@@ -57,6 +60,9 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         repair_round_token_budget=None,
         completion_gate="assertion_compilation",
         artifact_contract=("assertion_map.json", "generated_assertion_scan.json"),
+        completion_request_max_tokens=1024,
+        completion_gate_repair_limit=1,
+        completion_error_token_limit=4000,
     ),
     StageSpec(
         name="invoke_verification",
