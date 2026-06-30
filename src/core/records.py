@@ -88,10 +88,23 @@ def normalize_tool_result(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def normalize_stage_result(stage: str, result: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a stage result envelope with a stable schema version."""
-    if result.get("schema_version") == STAGE_RESULT_SCHEMA_VERSION:
-        return result
+    """Return a compact stage result envelope with durable artifact references."""
     normalized = dict(result)
+    iterations = normalized.pop("iterations", None)
+    if "iteration_count" not in normalized:
+        normalized["iteration_count"] = (
+            len(iterations) if isinstance(iterations, list) else 0
+        )
+    if (
+        normalized.get("success") is False
+        and not normalized.get("error_kind")
+        and normalized.get("termination_reason")
+    ):
+        normalized["error_kind"] = normalized["termination_reason"]
+    artifacts = dict(normalized.get("artifacts") or {})
+    artifacts.setdefault("operations", "operations.jsonl")
+    artifacts.setdefault("tool_results", "tool_results/")
+    normalized["artifacts"] = artifacts
     normalized["schema_version"] = STAGE_RESULT_SCHEMA_VERSION
     normalized["stage"] = stage
     return normalized
@@ -123,6 +136,7 @@ def build_run_cost_summary(
     *,
     stage_results: Optional[Iterable[Dict[str, Any]]] = None,
     compactions: Optional[Iterable[Dict[str, Any]]] = None,
+    tool_results: Optional[Iterable[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Convert raw client token usage into a compact run cost artifact."""
     usage = dict(token_usage or {})
@@ -159,6 +173,7 @@ def build_run_cost_summary(
 
     stage_results = list(stage_results or [])
     compactions = list(compactions or [])
+    tool_results = list(tool_results or [])
     stage_budgets = {
         str(result.get("stage")): dict(result["budget"])
         for result in stage_results
@@ -174,6 +189,28 @@ def build_run_cost_summary(
     compaction_after = sum(
         int(item.get("tokens_after", 0) or 0)
         for item in successful_compactions
+    )
+    tool_metrics = [
+        item.get("metrics") or item
+        for item in tool_results
+        if isinstance(item, dict)
+    ]
+    raw_tool_tokens = sum(
+        int(item.get("original_tokens", 0) or 0)
+        for item in tool_metrics
+    )
+    visible_tool_tokens = sum(
+        int(item.get("returned_tokens", 0) or 0)
+        for item in tool_metrics
+    )
+    local_finalizations = [
+        result
+        for result in stage_results
+        if result.get("completion_source") == "local_gate"
+    ]
+    accepted_finalizations = sum(
+        result.get("completion_accepted") is True
+        for result in local_finalizations
     )
     return {
         "schema_version": RUN_COST_SUMMARY_SCHEMA_VERSION,
@@ -212,6 +249,20 @@ def build_run_cost_summary(
             ),
             "stages": stage_budgets,
         },
+        "tool_results": {
+            "raw_tokens": raw_tool_tokens,
+            "model_visible_tokens": visible_tool_tokens,
+            "tokens_removed": max(0, raw_tool_tokens - visible_tool_tokens),
+            "truncations": sum(
+                bool(item.get("truncated"))
+                for item in tool_metrics
+            ),
+        },
+        "finalization": {
+            "local_gates": len(local_finalizations),
+            "accepted": accepted_finalizations,
+            "failed": len(local_finalizations) - accepted_finalizations,
+        },
         "termination_reasons": {
             str(result["stage"]): str(result["termination_reason"])
             for result in stage_results
@@ -247,6 +298,13 @@ def merge_run_cost_summaries(
             "tokens_after",
             "tokens_removed",
         ),
+        "tool_results": (
+            "raw_tokens",
+            "model_visible_tokens",
+            "tokens_removed",
+            "truncations",
+        ),
+        "finalization": ("local_gates", "accepted", "failed"),
     }
     for section, metrics in additive_sections.items():
         combined = dict(current.get(section) or {})

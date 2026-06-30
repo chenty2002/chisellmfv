@@ -11,7 +11,11 @@ from .indexer import compute_index_hashes, compute_workspace_hash, refresh_index
 from .preflight import CoupledL2Preflight
 from .stages import COUPLEDL2_STAGES, get_stage_spec
 from .workspace import CoupledL2Workspace
-from ..core.records import build_run_cost_summary, merge_run_cost_summaries
+from ..core.records import (
+    build_run_cost_summary,
+    merge_run_cost_summaries,
+    normalize_stage_result,
+)
 
 
 class CoupledL2Runner:
@@ -52,6 +56,12 @@ class CoupledL2Runner:
             path: len(path.read_text(encoding="utf-8").splitlines())
             for path in (workspace.results_dir / "by_stage").glob(
                 "*/context_compactions.jsonl"
+            )
+        }
+        self.operation_offsets = {
+            path: len(path.read_text(encoding="utf-8").splitlines())
+            for path in (workspace.results_dir / "by_stage").glob(
+                "*/operations.jsonl"
             )
         }
 
@@ -220,6 +230,7 @@ class CoupledL2Runner:
             else {}
         )
         compactions = []
+        tool_results = []
         compaction_paths = (self.workspace.results_dir / "by_stage").glob(
             "*/context_compactions.jsonl"
         )
@@ -228,10 +239,21 @@ class CoupledL2Runner:
             for line in lines[self.compaction_offsets.get(path, 0):]:
                 if line.strip():
                     compactions.append(json.loads(line))
+        operation_paths = (self.workspace.results_dir / "by_stage").glob(
+            "*/operations.jsonl"
+        )
+        for path in sorted(operation_paths):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for line in lines[self.operation_offsets.get(path, 0):]:
+                if line.strip():
+                    item = json.loads(line)
+                    if item.get("kind") == "tool_result":
+                        tool_results.append(item)
         current = build_run_cost_summary(
             usage,
             stage_results=stage_results,
             compactions=compactions,
+            tool_results=tool_results,
         )
         _write_json(
             self.workspace.results_dir / "run_cost_summary.json",
@@ -252,7 +274,8 @@ class CoupledL2Runner:
                 persisted[stage] = result
         for result in stage_results:
             if result.get("stage"):
-                persisted[str(result["stage"])] = result
+                stage = str(result["stage"])
+                persisted[stage] = normalize_stage_result(stage, result)
         payload["stage_results"] = [
             persisted[stage]
             for stage in COUPLEDL2_STAGES

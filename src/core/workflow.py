@@ -1190,7 +1190,7 @@ class FormalWorkflow:
                     stage_budget.mark_completion(True)
                     self._record_budget_event(
                         stage,
-                        "completion_gate",
+                        "completion_gate_passed",
                         stage_budget,
                         success=True,
                     )
@@ -1212,7 +1212,7 @@ class FormalWorkflow:
                 stage_budget.mark_completion(False)
                 self._record_budget_event(
                     stage,
-                    "completion_gate",
+                    "completion_gate_failed",
                     stage_budget,
                     success=False,
                 )
@@ -1279,6 +1279,14 @@ class FormalWorkflow:
                 compaction_estimate,
                 spendable_tokens,
             )
+            record_rejection = getattr(compactor, "record_budget_rejection", None)
+            if callable(record_rejection):
+                record_rejection(
+                    stage=stage,
+                    messages=messages,
+                    estimated_tokens=compaction_estimate,
+                    remaining_tokens=spendable_tokens,
+                )
             if stage_budget is not None:
                 self._record_budget_event(
                     stage,
@@ -1811,6 +1819,38 @@ class FormalWorkflow:
     ) -> Dict[str, Any]:
         """Terminate under budget pressure through the existing deterministic gate."""
         stage_budget.attempt_completion()
+        if trigger == "context_compaction_failed":
+            self._record_budget_event(
+                stage,
+                "context_compaction_failed",
+                stage_budget,
+                success=False,
+                data={
+                    "error": error,
+                    "error_kind": (
+                        "context_compaction_budget_rejected"
+                        if error and "context_compaction_budget_rejected" in error
+                        else "context_compaction_failed"
+                    ),
+                },
+            )
+        elif trigger == "token_budget_preflight_rejected":
+            self._record_budget_event(
+                stage,
+                "token_budget_preflight_rejected",
+                stage_budget,
+                success=False,
+                data={"error": error},
+            )
+        self._record_budget_event(
+            stage,
+            "local_finalization_started",
+            stage_budget,
+            data={
+                "completion_source": "local_gate",
+                "finalization_trigger": trigger,
+            },
+        )
         try:
             metadata = self._build_local_completion_metadata(stage, context, trigger)
             evaluation = self._evaluate_stage_completion(
@@ -1833,12 +1873,27 @@ class FormalWorkflow:
         stage_budget.mark_completion(accepted)
         self._record_budget_event(
             stage,
+            "completion_gate_passed" if accepted else "completion_gate_failed",
+            stage_budget,
+            success=accepted,
+            data={
+                "completion_source": "local_gate",
+                "finalization_trigger": trigger,
+            },
+        )
+        self._record_budget_event(
+            stage,
             "completion_gate",
             stage_budget,
             success=accepted,
             data={
                 "completion_source": "local_gate",
                 "finalization_trigger": trigger,
+                "gate_event": (
+                    "completion_gate_passed"
+                    if accepted
+                    else "completion_gate_failed"
+                ),
             },
         )
 
@@ -2264,9 +2319,35 @@ class FormalWorkflow:
         except Exception as exc:
             self.logger.warning(f"Failed to collect run cost summary: {exc}")
             return
+        stage_results = []
+        compactions = []
+        tool_results = []
+        for path in sorted(
+            (self.run_context.results_dir / "by_stage").glob("*/stage_result.json")
+        ):
+            stage_results.append(json.loads(path.read_text(encoding="utf-8")))
+        for path in sorted(
+            (self.run_context.results_dir / "by_stage").glob(
+                "*/context_compactions.jsonl"
+            )
+        ):
+            compactions.extend(self._read_jsonl(path))
+        for path in sorted(
+            (self.run_context.results_dir / "by_stage").glob("*/operations.jsonl")
+        ):
+            tool_results.extend(
+                item
+                for item in self._read_jsonl(path)
+                if item.get("kind") == "tool_result"
+            )
         self._write_json(
             self.run_context.results_dir / "run_cost_summary.json",
-            build_run_cost_summary(usage),
+            build_run_cost_summary(
+                usage,
+                stage_results=stage_results,
+                compactions=compactions,
+                tool_results=tool_results,
+            ),
         )
 
     def _write_coupledl2_diagnosis(self, args: Dict[str, Any], result: Dict[str, Any]) -> None:
@@ -2324,6 +2405,16 @@ class FormalWorkflow:
             json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+        if not path.is_file():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
 
     @staticmethod
     def _append_jsonl(path: Path, value: Dict[str, Any]) -> None:

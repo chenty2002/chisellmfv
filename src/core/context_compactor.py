@@ -447,6 +447,31 @@ class FlashContextCompactor:
         self.min_reduction_tokens = min_reduction_tokens
         self._digests: Dict[str, ContextDigest] = {}
 
+    def record_budget_rejection(
+        self,
+        *,
+        stage: str,
+        messages: List[Dict[str, Any]],
+        estimated_tokens: int,
+        remaining_tokens: Optional[int],
+    ) -> None:
+        """Audit a budget rejection that occurs before any Flash HTTP request."""
+        tokens_before = _message_tokens(messages)
+        self._append_audit(
+            success=False,
+            attempt=1,
+            stage=stage,
+            window=messages,
+            tokens_before=tokens_before,
+            tokens_after=tokens_before,
+            error="Flash compaction request rejected by token budget preflight",
+            error_kind="context_compaction_budget_rejected",
+            request_sent=False,
+            estimated_tokens=estimated_tokens,
+            remaining_tokens=remaining_tokens,
+            usage={"total_tokens": 0},
+        )
+
     def compact(
         self,
         messages: List[Dict[str, Any]],
@@ -472,6 +497,8 @@ class FlashContextCompactor:
         attempt = 1
         while True:
             usage_before = _usage_total(self.llm_router)
+            request: Optional[CompactionRequest] = None
+            request_sent = False
             try:
                 request = CompactionRequest(
                     stage=stage,
@@ -485,6 +512,7 @@ class FlashContextCompactor:
                     ),
                 )
                 self._preflight_request(request)
+                request_sent = True
                 digest = self._request_digest(request)
                 replacement = (
                     window.protected
@@ -525,6 +553,15 @@ class FlashContextCompactor:
                 )
                 error = f"{type(failure).__name__}: {failure}"
                 errors.append(error)
+                estimated_tokens = None
+                remaining_tokens = None
+                if (
+                    request is not None
+                    and failure.error_kind == "context_compaction_budget_rejected"
+                ):
+                    estimated_tokens, remaining_tokens = self._request_budget(
+                        request
+                    )
                 self._append_audit(
                     success=False,
                     attempt=attempt,
@@ -536,6 +573,9 @@ class FlashContextCompactor:
                     error_kind=failure.error_kind,
                     finish_reason=failure.finish_reason,
                     usage={"total_tokens": _usage_total(self.llm_router) - usage_before},
+                    request_sent=request_sent,
+                    estimated_tokens=estimated_tokens,
+                    remaining_tokens=remaining_tokens,
                 )
                 if (
                     attempt == 1
@@ -714,6 +754,25 @@ class FlashContextCompactor:
         ]
 
     def _preflight_request(self, request: CompactionRequest) -> None:
+        estimated, spendable = self._request_budget(request)
+        if spendable is not None and estimated > spendable:
+            raise ContextCompactionError(
+                "context_compaction_budget_rejected",
+                detail=(
+                    f"estimated request {estimated} exceeds "
+                    f"{spendable} non-reserved tokens"
+                ),
+            )
+
+    def _request_budget(
+        self,
+        request: CompactionRequest,
+    ) -> tuple[int, Optional[int]]:
+        estimated = estimate_chat_request_tokens(
+            self._request_messages(request),
+            [SUBMIT_CONTEXT_DIGEST_TOOL],
+            max_tokens=self.output_tokens,
+        )
         ledger = getattr(self.llm_router, "budget_ledger", None)
         reserved_tokens = int(
             request.budget_snapshot.get("completion_reserved", 0) or 0
@@ -723,7 +782,7 @@ class FlashContextCompactor:
             or not hasattr(ledger, "spendable_tokens")
             or reserved_tokens <= 0
         ):
-            return
+            return estimated, request.budget_snapshot.get("spendable_tokens")
         metadata = {
             key: request.budget_snapshot[key]
             for key in ("budget_scope", "budget_scope_limit")
@@ -734,19 +793,7 @@ class FlashContextCompactor:
             reserved_tokens=reserved_tokens,
             **metadata,
         )
-        estimated = estimate_chat_request_tokens(
-            self._request_messages(request),
-            [SUBMIT_CONTEXT_DIGEST_TOOL],
-            max_tokens=self.output_tokens,
-        )
-        if spendable is not None and estimated > spendable:
-            raise ContextCompactionError(
-                "context_compaction_budget_rejected",
-                detail=(
-                    f"estimated request {estimated} exceeds "
-                    f"{spendable} non-reserved tokens"
-                ),
-            )
+        return estimated, spendable
 
     def _append_audit(
         self,
@@ -762,6 +809,9 @@ class FlashContextCompactor:
         error_kind: Optional[str] = None,
         finish_reason: Optional[str] = None,
         usage: Optional[Dict[str, int]] = None,
+        request_sent: bool = True,
+        estimated_tokens: Optional[int] = None,
+        remaining_tokens: Optional[int] = None,
     ) -> None:
         client = getattr(self.llm_router, "flash_client", None)
         record = {
@@ -785,6 +835,9 @@ class FlashContextCompactor:
             "error": error,
             "error_kind": error_kind,
             "finish_reason": finish_reason,
+            "request_sent": request_sent,
+            "estimated_tokens": estimated_tokens,
+            "remaining_tokens": remaining_tokens,
         }
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         with self.audit_path.open("a", encoding="utf-8") as handle:
