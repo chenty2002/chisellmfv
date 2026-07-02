@@ -332,6 +332,47 @@ def _build_stage_inputs(
             "generated_assertion_scan": "results/preflight/generated_assertion_scan.json",
         }
         payload["property_catalog"] = public_catalog(catalog)
+    elif stage == "waveform_explanation":
+        stage2_dir = (
+            workspace.results_dir
+            / "by_stage"
+            / get_stage_spec("bind_properties").directory_name
+        )
+        stage3_dir = (
+            workspace.results_dir
+            / "by_stage"
+            / get_stage_spec("invoke_verification").directory_name
+        )
+        result_map_path = stage3_dir / "property_result_map.json"
+        manifest_path = stage2_dir / "binding_manifest.json"
+        if result_map_path.is_file() and manifest_path.is_file():
+            result_map = json.loads(result_map_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            instance = manifest["instances"][0]
+            failed = []
+            for prop in result_map.get("properties", []):
+                for result in prop.get("jaspergold_properties", []):
+                    if result.get("status") == "cex":
+                        failed.append(
+                            {
+                                "instance_id": prop.get("instance_id"),
+                                "property_schema_id": prop.get(
+                                    "property_schema_id"
+                                ),
+                                "template_id": prop.get("template_id"),
+                                "base_label": prop.get("base_label"),
+                                "bindings": instance.get("bindings"),
+                                "parameters": instance.get("parameters"),
+                                "rtl_label": result.get("rtl_label"),
+                                "jaspergold_property_id": result.get(
+                                    "jaspergold_property_id"
+                                ),
+                                "counterexample_path": result.get(
+                                    "counterexample_path"
+                                ),
+                            }
+                        )
+            payload["failed_property_traces"] = failed
     return payload
 
 

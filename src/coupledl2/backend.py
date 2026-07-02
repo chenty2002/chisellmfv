@@ -14,6 +14,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .property_catalog import load_property_profile
+from .rtl_property_labeler import label_rtl_properties
 from .workspace import CoupledL2Workspace
 
 
@@ -52,7 +54,7 @@ class CoupledL2BuildOperations:
         """Run the configured CoupledL2 build target and collect generated Verilog."""
         result = self.run_compilation()
         if require_assertions and result.get("success"):
-            scan = self.scan_generated_assertions()
+            scan = self.scan_generated_properties()
             if not scan["success"]:
                 result = dict(result)
                 result["success"] = False
@@ -72,6 +74,47 @@ class CoupledL2BuildOperations:
                 "build_result": build,
             }
 
+        stage2_dir = self._stage_dir("bind_properties")
+        manifest_path = stage2_dir / "binding_manifest.json"
+        traceability_path = stage2_dir / "assertion_traceability.json"
+        if not manifest_path.is_file() or not traceability_path.is_file():
+            return {
+                "success": False,
+                "summary": "Stage 2 traceability artifacts are missing",
+                "verification_passed": False,
+                "build_result": build,
+            }
+        manifest = self._load_json(manifest_path)
+        traceability = self._load_json(traceability_path)
+        catalog = load_property_profile(self.workspace.config.property_profile)
+        try:
+            relabelled = label_rtl_properties(
+                [Path(path) for path in build.get("generated_files", [])],
+                manifest,
+                catalog,
+            )
+        except ValueError as exc:
+            return {
+                "success": False,
+                "summary": f"deterministic RTL relabelling failed: {exc}",
+                "verification_passed": False,
+                "build_result": build,
+            }
+        expected_labels = {
+            item["rtl_label"]
+            for prop in traceability.get("properties", [])
+            for item in prop.get("rtl_properties", [])
+        }
+        actual_labels = {item.rtl_label for item in relabelled}
+        if actual_labels != expected_labels:
+            return {
+                "success": False,
+                "summary": "rebuilt RTL property labels do not match Stage 2 traceability",
+                "verification_passed": False,
+                "build_result": build,
+                "expected_labels": sorted(expected_labels),
+                "actual_labels": sorted(actual_labels),
+            }
         prepared = self.prepare_verification_inputs(top_module=build.get("top_module"))
         if not prepared.get("success"):
             return {
@@ -83,6 +126,24 @@ class CoupledL2BuildOperations:
             }
 
         formal = self.run_jaspergold()
+        try:
+            property_map = join_property_results(
+                traceability,
+                formal.get("jaspergold_result") or {},
+            )
+        except ValueError as exc:
+            return {
+                "success": False,
+                "summary": f"JasperGold traceability join failed: {exc}",
+                "verification_passed": False,
+                "build_result": build,
+                "prepare_result": prepared,
+                "formal_result": formal,
+            }
+        self._write_json(
+            self._stage_dir("invoke_verification") / "property_result_map.json",
+            property_map,
+        )
         return {
             "success": formal.get("success", False),
             "summary": formal.get("summary", ""),
@@ -96,6 +157,7 @@ class CoupledL2BuildOperations:
             "proven_count": formal.get("proven_count", 0),
             "fst_files": formal.get("fst_files", []),
             "counterexample_path": formal.get("counterexample_path"),
+            "property_result_map": property_map,
         }
 
     def run_baseline_build(
@@ -344,7 +406,7 @@ class CoupledL2BuildOperations:
                 return name
         return modules[0] if modules else None
 
-    def scan_generated_assertions(self) -> Dict[str, Any]:
+    def scan_generated_properties(self) -> Dict[str, Any]:
         files = self.discover_generated_verilog_files()
         generated_assertions = []
         for path in files:
@@ -363,14 +425,6 @@ class CoupledL2BuildOperations:
         if not success:
             result["error"] = "generated Verilog/SystemVerilog contains no assertions"
 
-        assertion_map = {
-            "property_profile": self.workspace.config.property_profile,
-            "generated_assertions": generated_assertions,
-            "generated_assertion_count": count,
-        }
-        stage_dir = self._stage_dir("bind_properties")
-        self._write_json(stage_dir / "generated_assertion_scan.json", result)
-        self._write_json(stage_dir / "assertion_map.json", assertion_map)
         return result
 
     def _stage_dir(self, stage: str) -> Path:
@@ -501,6 +555,78 @@ def parse_jaspergold_report(log_text: str, trace_dir: Optional[Path] = None) -> 
         "inconclusive_count": len(inconclusive),
         "timed_out": timed_out,
         "trace_artifacts": trace_artifacts,
+    }
+
+
+def join_property_results(
+    traceability: Dict[str, Any],
+    jaspergold_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Join exact JasperGold property IDs to concrete Stage 2 RTL labels."""
+    statuses = jaspergold_report.get("property_statuses")
+    if not isinstance(statuses, dict):
+        raise ValueError("JasperGold report has no property_statuses object")
+    trace_entries: Dict[str, Dict[str, Any]] = {}
+    for prop in traceability.get("properties", []):
+        for rtl in prop.get("rtl_properties", []):
+            label = rtl.get("rtl_label")
+            if not isinstance(label, str) or label in trace_entries:
+                raise ValueError("traceability contains a missing or duplicate RTL label")
+            trace_entries[label] = prop
+    if not trace_entries:
+        raise ValueError("traceability contains no concrete RTL labels")
+
+    matches: Dict[str, list[tuple[str, Dict[str, Any]]]] = {
+        label: [] for label in trace_entries
+    }
+    unmapped_cl2 = []
+    for property_id, status in statuses.items():
+        matched = [
+            label
+            for label in trace_entries
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(label)}(?![A-Za-z0-9_])", property_id)
+        ]
+        if property_id.find("CL2_") >= 0 and not matched:
+            unmapped_cl2.append(property_id)
+        if len(matched) > 1:
+            raise ValueError(f"JasperGold property matches multiple RTL labels: {property_id}")
+        if matched:
+            matches[matched[0]].append((property_id, status))
+    if unmapped_cl2:
+        raise ValueError(f"unmapped JasperGold CL2 properties: {sorted(unmapped_cl2)}")
+    for label, items in matches.items():
+        if len(items) != 1:
+            raise ValueError(f"RTL label must match exactly one JasperGold property: {label}")
+
+    properties = []
+    for prop in traceability.get("properties", []):
+        joined = []
+        for rtl in prop.get("rtl_properties", []):
+            label = rtl["rtl_label"]
+            property_id, status = matches[label][0]
+            item = {
+                "rtl_label": label,
+                "jaspergold_property_id": property_id,
+                "status": status.get("status"),
+            }
+            trace = status.get("fst_file") or status.get("counterexample_path")
+            if trace:
+                item["counterexample_path"] = trace
+            joined.append(item)
+        record = {
+            key: prop[key]
+            for key in (
+                "instance_id",
+                "property_schema_id",
+                "template_id",
+                "base_label",
+            )
+        }
+        record["jaspergold_properties"] = joined
+        properties.append(record)
+    return {
+        "schema_version": "property_result_map.v1",
+        "properties": properties,
     }
 
 

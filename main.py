@@ -5,7 +5,7 @@ ChiselLMFV - 统一入口
 基于 LLM 的 Chisel 形式化验证工具，提供两种工作流：
 
 1. 形式化验证 (Formal Verification)：四阶段自动化工作流
-   - preflight → write_assertions → invoke_verification
+   - preflight → bind_properties → invoke_verification
    - → waveform_explanation (结合 VerilogCausalAnalysis 因果分析)
    - → propose_bugfix
 2. Verilog→Chisel 转换 (Verilog2Chisel)：自动将 Verilog 代码转换为 Chisel
@@ -13,7 +13,7 @@ ChiselLMFV - 统一入口
 使用方式：
     # 形式化验证
     python main.py formal --full --chisel-dir chisel/ --target gigamax
-    python main.py formal --stage write_assertions --target gigamax
+    python main.py formal --stage bind_properties --target gigamax
 
     # Verilog 转 Chisel
     python main.py v2c --target <benchmark_name> --max-iterations 5
@@ -602,11 +602,8 @@ def get_default_query(stage: Optional[str] = None, target: str = "gigamax") -> s
         Default query string
     """
     benchmark_queries = {
-        "write_assertions": (
-            "Add formal verification assertions to the design using ChiselFV or Chisel LTL. "
-            "Place assertions directly inside the original DUT module/class emitted by VerilogGenerator, "
-            "not in a separate *Formal wrapper or sibling module. "
-            "Focus on key properties like safety and liveness."
+        "bind_properties": (
+            "Bind one repository-owned property template using the selected profile."
         ),
         "invoke_verification": (
             "Compile the design with 'make verilog' and fix any compilation errors."
@@ -644,7 +641,7 @@ def parse_args():
     formal_parser = subparsers.add_parser('formal', help='四阶段形式化验证工作流')
     formal_parser.add_argument('--full', action='store_true', help='运行完整工作流')
     formal_parser.add_argument('--stage', type=str,
-                               choices=['write_assertions',
+                               choices=['bind_properties',
                                         'invoke_verification', 'waveform_explanation',
                                         'propose_bugfix'],
                                help='运行单个阶段')

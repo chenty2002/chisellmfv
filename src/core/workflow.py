@@ -2,7 +2,7 @@
 Workflow for Chisel formal verification - Single Stage Mode Only.
 
 Supports running one stage at a time:
-2. write_assertions - Add deadlock detection assertions
+2. bind_properties - Deterministic repository-owned property binding
 3. invoke_verification - Compile and run formal verification
 4. waveform_explanation - Analyze counterexample waveforms
 5. propose_bugfix - Fix identified bugs
@@ -103,7 +103,7 @@ class FormalWorkflow:
         workspace_dir: str,
         logger: logging.Logger,
         waveform_path: Optional[str] = None,
-        stage: str = "write_assertions",
+        stage: str = "waveform_explanation",
         target: str = "gigamax",
         ablation_modes: Optional[List[str]] = None,
         max_repair_rounds: int = DEFAULT_MAX_REPAIR_ROUNDS,
@@ -235,7 +235,7 @@ class FormalWorkflow:
             "indexes_dir": str(self.run_context.indexes_dir),
             "verify_mode": self.run_context.config.verify_mode,
             "input_mode": self.run_context.config.input_mode,
-            "property_category": self.run_context.config.property_category,
+            "property_profile": self.run_context.config.property_profile,
             "stage_context": (
                 stage_context.to_dict(self.run_context.run_dir)
                 if stage_context is not None
@@ -630,12 +630,16 @@ class FormalWorkflow:
             "protocol_violations": 0,
             "completion_gate_failures": 0,
             "repair_edit_pending": False,
+            "parse_recovery_pending": False,
+            "tool_parse_failures": 0,
+            "primary_error": None,
         }
         
         for i in range(1, spec.model_turn_budget + 1):
             priority_turn = bool(
                 stage_budget.completion_required
                 or runtime_state["repair_edit_pending"]
+                or runtime_state["parse_recovery_pending"]
             )
             if not priority_turn and self._stage_token_finalization_required(
                 stage,
@@ -666,26 +670,36 @@ class FormalWorkflow:
                 "budget_state",
                 stage_budget,
             )
+            discovery_calls_remaining = max(
+                0,
+                spec.discovery_budget - budget_snapshot.tool_calls_used,
+            )
             tool_schemas = get_budgeted_tool_schemas(
                 stage,
                 phase=budget_snapshot.phase,
                 tool_calls_remaining=budget_snapshot.tool_calls_remaining,
                 forced_finalization=budget_snapshot.forced_finalization,
                 completion_required=budget_snapshot.completion_required,
-                repair_edit_required=runtime_state["repair_edit_pending"],
-                discovery_calls_remaining=max(
-                    0,
-                    spec.discovery_budget - budget_snapshot.tool_calls_used,
+                repair_edit_required=(
+                    runtime_state["repair_edit_pending"]
+                    or runtime_state["parse_recovery_pending"]
                 ),
+                discovery_calls_remaining=discovery_calls_remaining,
             )
             cache_metadata = self._build_prompt_cache_metadata(stage, tool_schemas)
             cache_metadata.update(token_budget_metadata)
-            request_max_tokens = (
-                spec.completion_request_max_tokens
-                if budget_snapshot.completion_required
-                and spec.completion_request_max_tokens is not None
-                else spec.request_max_tokens
+            request_policy = self._stage_request_policy(
+                stage,
+                tool_schemas,
+                discovery_calls_remaining=discovery_calls_remaining,
+                default_max_tokens=(
+                    spec.completion_request_max_tokens
+                    if budget_snapshot.completion_required
+                    and spec.completion_request_max_tokens is not None
+                    else spec.request_max_tokens
+                ),
             )
+            request_max_tokens = request_policy["max_tokens"]
             messages.append(
                 {
                     "role": "user",
@@ -776,8 +790,10 @@ class FormalWorkflow:
                     task_type="stage_loop",
                     prompt_cache_key=cache_metadata["prompt_cache_key"],
                     usage_metadata=cache_metadata,
-                    tool_choice="required",
-                    enable_thinking=None,
+                    tool_choice=request_policy["tool_choice"],
+                    enable_thinking=request_policy["enable_thinking"],
+                    parallel_tool_calls=request_policy["parallel_tool_calls"],
+                    temperature=request_policy["temperature"],
                     max_tokens=request_max_tokens,
                 )
             except TokenBudgetExceeded as exc:
@@ -799,7 +815,7 @@ class FormalWorkflow:
             
             try:
                 self._log_llm_response(stage, i, response)
-                
+
                 if response["type"] == "function_calls":
                     result = self._handle_function_calls(
                         response,
@@ -908,6 +924,28 @@ class FormalWorkflow:
             trigger="model_turn_budget_exhausted",
         )
 
+    @staticmethod
+    def _named_tool_choice(name: str) -> Dict[str, Any]:
+        return {"type": "function", "function": {"name": name}}
+
+    def _stage_request_policy(
+        self,
+        stage: str,
+        tool_schemas: List[Dict[str, Any]],
+        *,
+        discovery_calls_remaining: Optional[int],
+        default_max_tokens: int,
+    ) -> Dict[str, Any]:
+        """Derive request controls from the current bounded tool surface."""
+        policy = {
+            "max_tokens": default_max_tokens,
+            "temperature": 0.5,
+            "tool_choice": "required",
+            "enable_thinking": None,
+            "parallel_tool_calls": None,
+        }
+        return policy
+
     def _build_prompt_cache_metadata(
         self,
         stage: str,
@@ -938,6 +976,8 @@ class FormalWorkflow:
         max_tokens: int,
         tool_choice: Any = "required",
         enable_thinking: Optional[bool] = None,
+        parallel_tool_calls: Optional[bool] = None,
+        temperature: float = 0.5,
     ) -> Dict[str, Any]:
         """Call either LLMRouter or a single LLMClient."""
         metadata = dict(usage_metadata)
@@ -951,6 +991,8 @@ class FormalWorkflow:
                 usage_metadata=metadata,
                 tool_choice=tool_choice,
                 enable_thinking=enable_thinking,
+                parallel_tool_calls=parallel_tool_calls,
+                temperature=temperature,
                 max_tokens=max_tokens,
             )
         if self.llm is None:
@@ -963,6 +1005,8 @@ class FormalWorkflow:
             usage_metadata=metadata,
             tool_choice=tool_choice,
             enable_thinking=enable_thinking,
+            parallel_tool_calls=parallel_tool_calls,
+            temperature=temperature,
             max_tokens=max_tokens,
         )
     
@@ -1043,6 +1087,9 @@ class FormalWorkflow:
                 "protocol_violations": 0,
                 "completion_gate_failures": 0,
                 "repair_edit_pending": False,
+                "parse_recovery_pending": False,
+                "tool_parse_failures": 0,
+                "primary_error": None,
             }
 
         tool_names = [call["name"] for call in function_calls]
@@ -1185,6 +1232,11 @@ class FormalWorkflow:
             for action, result in zip(actions, raw_action_results)
         ):
             runtime_state["repair_edit_pending"] = False
+        if runtime_state.get("parse_recovery_pending") and any(
+            action.get("type") == "edit_file" and result.get("success")
+            for action, result in zip(actions, raw_action_results)
+        ):
+            runtime_state["parse_recovery_pending"] = False
         
         # Keep only a compact audit summary in stage state.
         iteration = {
@@ -1332,6 +1384,97 @@ class FormalWorkflow:
                     }
         
         return {"completed": False, "iteration_count": iteration_count}
+
+    def _handle_tool_parse_errors(
+        self,
+        response: Dict[str, Any],
+        stage: str,
+        context: Dict[str, Any],
+        iterations: List[Dict[str, Any]],
+        iteration_count: int,
+        messages: List[Dict[str, Any]],
+        stage_budget: StageBudget,
+        runtime_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Allow one bounded Stage 2 retry for malformed tool arguments."""
+        finish_reason = response.get("finish_reason")
+        error_kind = (
+            "tool_argument_truncated"
+            if finish_reason == "length"
+            else "tool_arguments_invalid"
+        )
+        parse_errors = response.get("tool_parse_errors") or []
+        tool_name = next(
+            (
+                item.get("name")
+                for item in parse_errors
+                if isinstance(item, dict) and item.get("name")
+            ),
+            None,
+        )
+        primary_error = {
+            "kind": error_kind,
+            "finish_reason": finish_reason,
+            "tool_name": tool_name,
+        }
+        runtime_state["tool_parse_failures"] = (
+            int(runtime_state.get("tool_parse_failures", 0)) + 1
+        )
+        if runtime_state.get("primary_error") is None:
+            runtime_state["primary_error"] = primary_error
+            context["_stage_primary_error"] = primary_error
+
+        iteration_count += 1
+        iteration = {
+            "iteration": iteration_count,
+            "error_kind": error_kind,
+            "finish_reason": finish_reason,
+            "tool_name": tool_name,
+        }
+        iterations.append(iteration)
+        context["iterations"].append(iteration)
+        self._record_budget_event(
+            stage,
+            "tool_parse_error",
+            stage_budget,
+            success=False,
+            data={
+                **primary_error,
+                "recovery_attempt": runtime_state["tool_parse_failures"],
+            },
+        )
+
+        if runtime_state["tool_parse_failures"] >= 2:
+            failure = self._budget_failure(
+                "tool_protocol_violation",
+                iterations,
+                stage_budget,
+                error="tool arguments remained invalid after one bounded recovery",
+            )
+            failure["primary_error"] = runtime_state["primary_error"]
+            return {
+                "completed": True,
+                "result": failure,
+                "iteration_count": iteration_count,
+            }
+
+        runtime_state["parse_recovery_pending"] = True
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Tool argument recovery: the `{tool_name or 'edit_file'}` call "
+                    f"was classified as `{error_kind}` with "
+                    f"finish_reason={finish_reason!r}. Retry once using only "
+                    "`edit_file` with complete valid JSON arguments. Thinking is "
+                    "disabled for this retry."
+                ),
+            }
+        )
+        return {
+            "completed": False,
+            "iteration_count": iteration_count,
+        }
 
     def _maybe_compact_stage_context(
         self,
@@ -1826,12 +1969,9 @@ class FormalWorkflow:
                 "error": "assertion_error completion requires homologous_assertions",
             }
 
-        if stage in {"write_assertions", "propose_bugfix"}:
+        if stage == "propose_bugfix":
             compile_result = self.build_ops.verify_compilation(
-                require_assertions=(
-                    stage == "write_assertions"
-                    and "no_assertion_presence_gate" not in self.ablation_modes
-                )
+                require_assertions=False
             )
             if not compile_result.get("success", False):
                 return {
@@ -2388,24 +2528,19 @@ class FormalWorkflow:
                 "operations": "operations.jsonl",
             },
         }
-        if stage in {"write_assertions", "propose_bugfix"}:
+        if stage == "propose_bugfix":
             handoff["source_snapshot"] = {
                 "before_manifest": "snapshot_manifest_before.json",
                 "after_manifest": "snapshot_manifest_after.json",
             }
-        if stage == "write_assertions":
-            handoff["assertions"] = {
-                "assertion_map": "assertion_map.json",
-                "generated_assertion_scan": "generated_assertion_scan.json",
-                "verification_passed": stage_result.get("verification_passed"),
-            }
-        elif stage == "invoke_verification":
+        if stage == "invoke_verification":
             handoff["verification"] = {
                 "verification_passed": stage_result.get("verification_passed"),
                 "counterexample_path": stage_result.get("counterexample_path"),
                 "cex_count": stage_result.get("cex_count"),
                 "formal_result": "formal_result.json",
                 "property_status": "property_status.json",
+                "property_result_map": "property_result_map.json",
             }
         elif stage == "waveform_explanation":
             handoff["diagnosis"] = {
@@ -2470,27 +2605,60 @@ class FormalWorkflow:
         if stage_dir is None:
             return
 
-        property_name = (
-            args.get("property")
-            or args.get("target_assertion_label")
-            or self._first_failing_property()
-            or "unknown"
-        )
         classification = args.get("error_type") or "inconclusive"
+        allowed = {
+            "design_bug",
+            "property_schema_error",
+            "template_error",
+            "binding_error",
+            "environment_error",
+            "assumption_error",
+            "inconclusive",
+        }
+        if classification not in allowed:
+            classification = "inconclusive"
         evidence = []
         for key in ("summary", "root_cause", "counterexample_path"):
             value = args.get(key) or result.get(key)
             if value:
                 evidence.append({"kind": key, "value": value})
-        diagnosis = {
-            "diagnoses": [
+        failed_traces = []
+        if self.stage_context is not None:
+            failed_traces = self.stage_context.stage_inputs.get(
+                "failed_property_traces",
+                [],
+            )
+        if not failed_traces:
+            failed_traces = [
                 {
-                    "property": property_name,
+                    "rtl_label": (
+                        args.get("property")
+                        or args.get("target_assertion_label")
+                        or self._first_failing_property()
+                        or "unknown"
+                    ),
+                    "jaspergold_property_id": self._first_failing_property(),
+                }
+            ]
+        diagnoses = []
+        for trace in failed_traces:
+            diagnoses.append(
+                {
+                    "property": trace.get("rtl_label") or "unknown",
+                    "jaspergold_property_id": trace.get(
+                        "jaspergold_property_id"
+                    ),
+                    "instance_id": trace.get("instance_id"),
+                    "property_schema_id": trace.get("property_schema_id"),
+                    "template_id": trace.get("template_id"),
                     "classification": classification,
                     "evidence": evidence,
                     "uncertainty": args.get("uncertainty") or "not_reported",
                 }
-            ],
+            )
+        diagnosis = {
+            "schema_version": "property_diagnosis.v1",
+            "diagnoses": diagnoses,
             "summary": args.get("summary", result.get("summary", "")),
         }
         self._write_json(stage_dir / "diagnosis.json", diagnosis)

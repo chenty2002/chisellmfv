@@ -279,11 +279,6 @@ def detect_chisel_compatibility(chisel_dir: Path, case_workspace: Path) -> Dict[
     elif family == "unknown" and major_version and major_version >= 6:
         family = "chisel6"
 
-    assertion_skill = (
-        "skills/chiselfv_chisel3_assertions.md"
-        if family == "chisel3"
-        else "skills/chiselfv_assertions.md"
-    )
     forbidden_apis = []
     if family == "chisel3":
         forbidden_apis = [
@@ -301,9 +296,7 @@ def detect_chisel_compatibility(chisel_dir: Path, case_workspace: Path) -> Dict[
         "scala_version": scala_version,
         "detected_from": detected_from,
         "dependencies": deps,
-        "assertion_skill": assertion_skill,
         "forbidden_apis": forbidden_apis,
-        "version_check": "read build.sc/common.sc/build.sbt to choose the versioned assertion skill before choosing assertion APIs",
     }
 
 

@@ -117,10 +117,6 @@ class StageBudget:
         phase = self._phase_at(tool_calls_used)
         if phase is BudgetPhase.DISCOVERY:
             return True
-        if self.stage == "write_assertions":
-            return tool_name == (
-                "complete_stage" if self.completion_required else "edit_file"
-            )
         if self.stage == "waveform_explanation":
             execution_tools = {
                 "read_files",
@@ -222,12 +218,6 @@ class StageBudget:
         phase = self.phase
         if remaining == 1 or self.forced_finalization or self.completion_required:
             required = "complete"
-        elif (
-            self.stage == "write_assertions"
-            and phase is BudgetPhase.DISCOVERY
-            and self.discovery_limit - self.tool_calls_used <= 1
-        ):
-            required = "final_evidence_or_edit"
         elif phase is BudgetPhase.DISCOVERY:
             required = "discover"
         elif phase is BudgetPhase.EXECUTION:

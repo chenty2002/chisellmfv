@@ -129,7 +129,7 @@ WORKSPACE_CONTEXT_TOOLS = [
 
 READ_FILES_TOOL = {
     "name": "read_files",
-    "description": "Read source or artifact files inside the CoupledL2 run workspace. Prefer workspace-relative paths with line_start/line_end when possible.",
+    "description": "Read source or artifact files inside the CoupledL2 run workspace. Use either file_paths with shared bounds or up to four independent slices, never both.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -137,6 +137,38 @@ READ_FILES_TOOL = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Workspace-relative files to read, such as case/Chisel/src/test/scala/coupledl2/VerifyTop.scala or results/by_stage/03_invoke_verification/formal_result.json.",
+            },
+            "slices": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative concrete file path",
+                        },
+                        "line_start": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional 1-based first line",
+                        },
+                        "line_end": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional 1-based last line",
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 12000,
+                            "description": "Maximum returned characters for this slice",
+                        },
+                    },
+                    "required": ["path"],
+                },
+                "description": "Independent bounded source slices; mutually exclusive with file_paths",
             },
             "line_start": {
                 "type": "integer",
@@ -155,7 +187,11 @@ READ_FILES_TOOL = {
                 "description": "Reason for reading these files",
             },
         },
-        "required": ["file_paths", "reason"],
+        "required": ["reason"],
+        "oneOf": [
+            {"required": ["file_paths"]},
+            {"required": ["slices"]},
+        ],
     },
 }
 
@@ -247,7 +283,11 @@ COMPLETE_STAGE_TOOL = {
             },
             "error_type": {
                 "type": "string",
-                "enum": ["dut_bug", "assertion_error", "setup_error", "inconclusive"],
+                "enum": [
+                    "design_bug", "property_schema_error", "template_error",
+                    "binding_error", "environment_error", "assumption_error",
+                    "inconclusive",
+                ],
                 "description": "Failure or repair category when relevant.",
             },
             "target_assertion_label": {
@@ -400,7 +440,11 @@ WRITE_REPORT_TOOL = {
             },
             "error_type": {
                 "type": "string",
-                "enum": ["dut_bug", "assertion_error", "setup_error", "inconclusive"],
+                "enum": [
+                    "design_bug", "property_schema_error", "template_error",
+                    "binding_error", "environment_error", "assumption_error",
+                    "inconclusive",
+                ],
                 "description": "Type of error found in counterexample.",
             },
         },
@@ -438,15 +482,14 @@ def _register_many(
 def get_default_tool_registry() -> ToolRegistry:
     """Build the stage-aware registry for CoupledL2 workflow tools."""
     registry = ToolRegistry()
-    all_stages = set(FORMAL_STAGES)
-    source_write_stages = {"write_assertions", "propose_bugfix"}
+    agent_stages = {"waveform_explanation", "propose_bugfix"}
 
-    _register_many(registry, WORKSPACE_CONTEXT_TOOLS, all_stages)
-    _register_many(registry, [READ_FILES_TOOL], all_stages)
+    _register_many(registry, WORKSPACE_CONTEXT_TOOLS, agent_stages)
+    _register_many(registry, [READ_FILES_TOOL], agent_stages)
     _register_many(
         registry,
         [EDIT_FILE_TOOL],
-        source_write_stages,
+        {"propose_bugfix"},
         write_policy="workspace_source",
         audit_level="diff",
     )
@@ -459,15 +502,17 @@ def get_default_tool_registry() -> ToolRegistry:
     _register_many(
         registry,
         [COMPLETE_STAGE_TOOL],
-        {"write_assertions", "waveform_explanation", "propose_bugfix"},
+        agent_stages,
         audit_level="completion",
     )
     return registry
 
 
-def get_coupledl2_tool_schemas(formal_stage: str = "write_assertions") -> List[Dict[str, Any]]:
+def get_coupledl2_tool_schemas(formal_stage: str = "waveform_explanation") -> List[Dict[str, Any]]:
     """Return CoupledL2-only tools."""
-    stage = formal_stage if formal_stage in FORMAL_STAGES else "write_assertions"
+    if formal_stage in {"bind_properties", "invoke_verification"}:
+        return []
+    stage = formal_stage if formal_stage in FORMAL_STAGES else "waveform_explanation"
     return get_default_tool_registry().get_tool_schemas(stage)
 
 
@@ -487,19 +532,8 @@ def get_budgeted_tool_schemas(
         allowed = {"complete_stage"}
     elif repair_edit_required:
         allowed = {"edit_file"}
-    elif (
-        formal_stage == "write_assertions"
-        and phase is BudgetPhase.DISCOVERY
-        and discovery_calls_remaining is not None
-        and discovery_calls_remaining <= 1
-    ):
-        allowed = {"read_files", "edit_file"}
-    elif formal_stage == "write_assertions" and phase is BudgetPhase.DISCOVERY:
-        allowed = {"list_files", "rg", "read_files", "edit_file"}
     elif phase is BudgetPhase.DISCOVERY:
         return schemas
-    elif formal_stage == "write_assertions":
-        allowed = {"edit_file"}
     elif formal_stage == "propose_bugfix":
         allowed = (
             {"read_files", "edit_file", "complete_stage"}
@@ -522,7 +556,7 @@ def get_budgeted_tool_schemas(
 
 
 def get_tool_schemas(
-    formal_stage: str = "write_assertions",
+    formal_stage: str = "waveform_explanation",
     target: Optional[str] = None,
     coupledl2: bool = False,
 ) -> List[Dict[str, Any]]:

@@ -137,6 +137,11 @@ class CoupledL2Runner:
                 self.last_verification_result = detail
                 if detail.get("verification_passed"):
                     break
+            if current_stage == "waveform_explanation":
+                diagnoses = self._read_diagnoses()
+                if not diagnoses_allow_bugfix(diagnoses):
+                    self._write_revision_request(diagnoses)
+                    break
 
         summary = {
             "schema_version": "coupledl2_run_result.v1",
@@ -188,6 +193,12 @@ class CoupledL2Runner:
                 raise ValueError("waveform_explanation cannot run after all properties were proven")
             if not verification.get("counterexample_path"):
                 raise ValueError("waveform_explanation requires a counterexample path")
+        if stage == "propose_bugfix":
+            diagnoses = self._read_diagnoses()
+            if not diagnoses_allow_bugfix(diagnoses):
+                raise ValueError(
+                    "propose_bugfix requires every diagnosis to be design_bug"
+                )
 
     def _counterexample_path(self) -> Optional[str]:
         handoff = self._read_handoff("invoke_verification") or {}
@@ -196,6 +207,61 @@ class CoupledL2Runner:
             return None
         path = Path(value)
         return str(path if path.is_absolute() else self.workspace.run_dir / path)
+
+    def _read_diagnoses(self) -> list[Dict[str, Any]]:
+        path = (
+            self.workspace.results_dir
+            / "by_stage"
+            / get_stage_spec("waveform_explanation").directory_name
+            / "diagnosis.json"
+        )
+        if not path.is_file():
+            return []
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        diagnoses = payload.get("diagnoses")
+        return diagnoses if isinstance(diagnoses, list) else []
+
+    def _write_revision_request(self, diagnoses: list[Dict[str, Any]]) -> None:
+        layer_by_classification = {
+            "property_schema_error": "property_schema",
+            "template_error": "assertion_template",
+            "binding_error": "binding_manifest",
+            "environment_error": "environment",
+            "assumption_error": "assumptions",
+            "inconclusive": "analysis",
+        }
+        requests = []
+        for item in diagnoses:
+            classification = item.get("classification")
+            if classification == "design_bug":
+                continue
+            requests.append(
+                {
+                    "property": item.get("property"),
+                    "jaspergold_property_id": item.get(
+                        "jaspergold_property_id"
+                    ),
+                    "classification": classification,
+                    "asset_layer": layer_by_classification.get(
+                        classification,
+                        "analysis",
+                    ),
+                    "evidence": item.get("evidence", []),
+                }
+            )
+        path = (
+            self.workspace.results_dir
+            / "by_stage"
+            / get_stage_spec("waveform_explanation").directory_name
+            / "revision_request.json"
+        )
+        _write_json(
+            path,
+            {
+                "schema_version": "revision_request.v1",
+                "requests": requests,
+            },
+        )
 
     def _read_handoff(self, stage: str) -> Optional[Dict[str, Any]]:
         path = self._handoff_path(stage)
@@ -301,4 +367,11 @@ def _write_json(path: Path, value: Dict[str, Any]) -> None:
     path.write_text(
         json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
+    )
+
+
+def diagnoses_allow_bugfix(diagnoses: list[Dict[str, Any]]) -> bool:
+    """Stage 5 is reachable only for a non-empty all-design-bug diagnosis set."""
+    return bool(diagnoses) and all(
+        item.get("classification") == "design_bug" for item in diagnoses
     )

@@ -84,7 +84,11 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         tool_result_batch_token_limit=0,
         repair_round_token_budget=None,
         completion_gate="formal_result",
-        artifact_contract=("formal_result.json", "property_status.json"),
+        artifact_contract=(
+            "formal_result.json",
+            "property_status.json",
+            "property_result_map.json",
+        ),
     ),
     StageSpec(
         name="waveform_explanation",

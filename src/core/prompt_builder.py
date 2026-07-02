@@ -1,7 +1,7 @@
 """
 Prompt builder for Chisel formal verification workflow.
 Builds prompts for active CoupledL2 stages:
-  2. write_assertions
+  2. bind_properties
   3. invoke_verification
   4. waveform_explanation
   5. propose_bugfix
@@ -24,7 +24,7 @@ from ..coupledl2.stages import get_stage_spec
 PROMPT_VERSION = "coupledl2-v4-static-context"
 
 def build_system_prompt(
-    stage: str = "write_assertions",
+    stage: str = "waveform_explanation",
     target: str = "",
     chisel_dir: str = "",
     workspace_dir: str = "",
@@ -117,7 +117,7 @@ def _display_path(path: Optional[str], workspace_dir: Optional[str]) -> str:
 
 def build_user_prompt(
     context: Dict[str, Any],
-    stage: str = "write_assertions",
+    stage: str = "waveform_explanation",
     scala_sources: Optional[Dict[str, str]] = None,
     analysis_report: Optional[str] = None
 ) -> str:
@@ -163,7 +163,7 @@ def build_user_prompt(
     sections.extend([
         "## CoupledL2 Stage Context",
         f"- Case: `{coupledl2.get('case_name', '')}`",
-        f"- Property Category: `{coupledl2.get('property_category', '')}`",
+        f"- Property Profile: `{coupledl2.get('property_profile', '')}`",
         f"- Verify Mode: `{coupledl2.get('verify_mode', '')}`",
         f"- Input Mode: `{coupledl2.get('input_mode', '')}`",
         f"- Workspace Case Path: `{_display_path(coupledl2.get('workspace_case_path'), workspace_dir)}`",
@@ -428,7 +428,10 @@ following errors:
 {detail}{marker}
 ```
 
-**Action Required**: Use the appropriate tool to write corrected code, then call `complete_stage` again with updated evidence."""
+**Action Required**: Repair only the compiler-reported issue with the smallest
+focused edit. Preserve the existing match/foreach/class structure and never
+replace a range spanning surrounding closing braces. Then call `complete_stage`
+again with updated evidence."""
 
     message = render(error)
     if token_limit is None or count_tokens(message) <= token_limit:
@@ -448,17 +451,6 @@ following errors:
 def _build_coupledl2_stage_prompt(stage: str) -> list:
     """Generate lightweight CoupledL2 stage instructions."""
     stage_prompts = {
-        "write_assertions": [
-            "## Objective",
-            "Add high-value CoupledL2 formal properties in the emitted design.",
-            "",
-            "## Actions",
-            "Use the already loaded compatibility, bounded-liveness, TileLink, and agent-rule context before editing.",
-            "DISCOVERY is limited to VerifyTop and directly relevant DUT evidence.",
-            "After entering EXECUTION, call `edit_file`; do not continue reading, searching, or call `complete_stage` early.",
-            "On the model turn after a successful edit, call `complete_stage` with assertion and build evidence.",
-            "",
-        ],
         "invoke_verification": [
             "## Objective",
             "Run the configured CoupledL2 build and formal verification flow.",

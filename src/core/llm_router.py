@@ -78,7 +78,7 @@ class LLMRouter:
 
         # Any stage loop that can write files or complete a stage stays on PRO.
         if stage in {
-            "write_assertions",
+            "bind_properties",
             "invoke_verification",
             "waveform_explanation",
             "propose_bugfix",
