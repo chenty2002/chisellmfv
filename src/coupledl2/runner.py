@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Type
 
 from .backend import CoupledL2BuildOperations
+from .binding_stage import BindingStage
 from .indexer import compute_index_hashes, compute_workspace_hash, refresh_indexes
 from .preflight import CoupledL2Preflight
 from .stages import COUPLEDL2_STAGES, get_stage_spec
@@ -86,8 +87,8 @@ class CoupledL2Runner:
         if self.resumed:
             self._validate_workspace_integrity()
             self.last_verification_result = self._read_stage_result("invoke_verification")
-        if not self.resumed and stage and stage != "write_assertions":
-            raise ValueError("fresh run must start at write_assertions")
+        if not self.resumed and stage and stage != "bind_properties":
+            raise ValueError("fresh run must start at bind_properties")
 
         stages = self._stages_to_run(stage=stage, full=full)
         completed_stage: Optional[str] = None
@@ -96,22 +97,30 @@ class CoupledL2Runner:
 
         for current_stage in stages:
             self._validate_predecessor(current_stage)
-            waveform_path = self._counterexample_path() if current_stage == "waveform_explanation" else None
-            workflow = self.workflow_cls(
-                llm_client=self.llm_client,
-                chisel_dir=".",
-                workspace_dir=str(self.workspace.run_dir),
-                logger=self.logger,
-                waveform_path=waveform_path,
-                stage=current_stage,
-                target=self.workspace.config.case_name,
-                max_repair_rounds=self.max_repair_rounds,
-                initial_verification_result=self.last_verification_result,
-                run_context=self.workspace,
-            )
-            result = workflow.process_task(
-                self.query_for_stage(current_stage, self.workspace.config.case_name)
-            )
+            if current_stage == "bind_properties":
+                result = BindingStage(
+                    self.workspace,
+                    CoupledL2BuildOperations(self.workspace, self.logger),
+                    self.llm_client,
+                    self.logger,
+                ).run()
+            else:
+                waveform_path = self._counterexample_path() if current_stage == "waveform_explanation" else None
+                workflow = self.workflow_cls(
+                    llm_client=self.llm_client,
+                    chisel_dir=".",
+                    workspace_dir=str(self.workspace.run_dir),
+                    logger=self.logger,
+                    waveform_path=waveform_path,
+                    stage=current_stage,
+                    target=self.workspace.config.case_name,
+                    max_repair_rounds=self.max_repair_rounds,
+                    initial_verification_result=self.last_verification_result,
+                    run_context=self.workspace,
+                )
+                result = workflow.process_task(
+                    self.query_for_stage(current_stage, self.workspace.config.case_name)
+                )
             completed_stage = current_stage
             detail = dict(result.get("stage_result") or {})
             detail.setdefault("stage", current_stage)
@@ -120,7 +129,7 @@ class CoupledL2Runner:
             if not success:
                 break
 
-            if current_stage in {"write_assertions", "propose_bugfix"}:
+            if current_stage in {"bind_properties", "propose_bugfix"}:
                 state = refresh_indexes(self.workspace)
                 self._bind_state_to_handoff(current_stage, state)
 

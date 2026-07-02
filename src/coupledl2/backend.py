@@ -118,7 +118,7 @@ class CoupledL2BuildOperations:
     ) -> Dict[str, Any]:
         """Compile edits made by an agent stage."""
         return self._run_build(
-            self._stage_dir("write_assertions"),
+            self._stage_dir("bind_properties"),
             target=target,
             timeout_s=timeout_s,
         )
@@ -364,11 +364,11 @@ class CoupledL2BuildOperations:
             result["error"] = "generated Verilog/SystemVerilog contains no assertions"
 
         assertion_map = {
-            "property_category": self.workspace.config.property_category,
+            "property_profile": self.workspace.config.property_profile,
             "generated_assertions": generated_assertions,
             "generated_assertion_count": count,
         }
-        stage_dir = self._stage_dir("write_assertions")
+        stage_dir = self._stage_dir("bind_properties")
         self._write_json(stage_dir / "generated_assertion_scan.json", result)
         self._write_json(stage_dir / "assertion_map.json", assertion_map)
         return result
