@@ -192,6 +192,8 @@ def scan_formal_surface(case_workspace: Path) -> Dict[str, Any]:
     boringutils: List[Dict[str, Any]] = []
     files = verification_source_files(case_workspace)
     for path in files:
+        if _is_formal_library(path, case_workspace):
+            continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         lines = text.splitlines(keepends=True)
         code_lines = _code_lines_without_comments(text)
@@ -240,6 +242,8 @@ def clean_formal_surface(case_workspace: Path) -> Dict[str, Any]:
     failures: List[Dict[str, Any]] = []
 
     for path in verification_source_files(case_workspace):
+        if _is_formal_library(path, case_workspace):
+            continue
         original = path.read_text(encoding="utf-8", errors="ignore")
         lines = original.splitlines(keepends=True)
         code_lines = _code_lines_without_comments(original)
@@ -424,6 +428,16 @@ def patch_autoverify_outputs(case_workspace: Path) -> List[str]:
         path.write_text(updated, encoding="utf-8")
         patched.append(_rel(path, case_workspace))
     return patched
+
+
+def _is_formal_library(path: Path, case_workspace: Path) -> bool:
+    relative = path.relative_to(case_workspace)
+    return (
+        path.name == "Formal.scala"
+        and "src" in relative.parts
+        and "main" in relative.parts
+        and "chiselFv" in relative.parts
+    )
 
 
 def _patch_autoverify_text(text: str) -> str:

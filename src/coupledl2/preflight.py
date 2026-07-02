@@ -167,6 +167,7 @@ def _remove_copied_generated_rtl(case_workspace: Path) -> list:
     removed = []
     roots = [
         case_workspace / "Chisel" / "generated",
+        case_workspace / "Chisel" / "Verilog",
         case_workspace / "Verilog",
     ]
     for root in roots:

@@ -35,6 +35,8 @@ DEFAULT_LIST_MAX_ENTRIES = 200
 MAX_LIST_ENTRIES = 500
 MAX_LIST_DEPTH = 6
 MAX_READ_FILES = 20
+MAX_READ_SLICES = 4
+MAX_READ_SLICE_CHARS = 12000
 
 
 class PathPolicyDenied(ValueError):
@@ -237,6 +239,51 @@ def _execute_read_files(
 ) -> Dict[str, Any]:
     """Execute read_files action."""
     file_paths = _coerce_file_paths(action)
+    slices = action.get("slices")
+    if slices is not None and file_paths:
+        return {
+            "type": "read_files",
+            "success": False,
+            "error_code": "conflicting_read_inputs",
+            "error": "read_files accepts either file_paths or slices, not both",
+            "files": [],
+        }
+    if slices is not None:
+        if not isinstance(slices, list) or not slices:
+            return {
+                "type": "read_files",
+                "success": False,
+                "error_code": "invalid_slices",
+                "error": "read_files.slices must be a non-empty list",
+                "files": [],
+            }
+        if len(slices) > MAX_READ_SLICES:
+            return {
+                "type": "read_files",
+                "success": False,
+                "error_code": "too_many_slices",
+                "error": f"read_files accepts at most {MAX_READ_SLICES} slices",
+                "files": [],
+            }
+        read_specs = [
+            {
+                "path": item.get("path") if isinstance(item, dict) else None,
+                "line_start": item.get("line_start") if isinstance(item, dict) else None,
+                "line_end": item.get("line_end") if isinstance(item, dict) else None,
+                "max_chars": item.get("max_chars") if isinstance(item, dict) else None,
+            }
+            for item in slices
+        ]
+    else:
+        read_specs = [
+            {
+                "path": path,
+                "line_start": action.get("line_start"),
+                "line_end": action.get("line_end"),
+                "max_chars": action.get("max_chars"),
+            }
+            for path in file_paths
+        ]
     if len(file_paths) > MAX_READ_FILES:
         return {
             "type": "read_files",
@@ -245,16 +292,25 @@ def _execute_read_files(
             "error": f"read_files accepts at most {MAX_READ_FILES} files",
             "files": [],
         }
-    line_start = action.get("line_start")
-    line_end = action.get("line_end")
-    max_chars = action.get("max_chars")
-    if max_chars is None:
-        max_chars = DEFAULT_READ_FILE_MAX_CHARS
-    max_chars = max(1, min(int(max_chars), MAX_READ_FILE_MAX_CHARS))
     files_result = []
     
-    for fp in file_paths:
+    for spec in read_specs:
+        fp = spec["path"]
+        line_start = spec["line_start"]
+        line_end = spec["line_end"]
+        max_chars = spec["max_chars"]
+        if max_chars is None:
+            max_chars = DEFAULT_READ_FILE_MAX_CHARS
+        max_chars = max(
+            1,
+            min(
+                int(max_chars),
+                MAX_READ_SLICE_CHARS if slices is not None else MAX_READ_FILE_MAX_CHARS,
+            ),
+        )
         try:
+            if not isinstance(fp, str) or not fp:
+                raise ValueError("read_files slice requires a concrete path")
             if workspace_root:
                 resolved = _resolve_readable_path(fp, workspace_root, work_dir)
                 relative = Path(_workspace_relative(resolved, workspace_root))

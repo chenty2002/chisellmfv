@@ -76,7 +76,10 @@ def binding_manifest_tool(catalog: PropertyCatalog) -> Dict[str, Any]:
                             "evidence",
                         ],
                         "properties": {
-                            "instance_id": {"type": "string"},
+                            "instance_id": {
+                                "type": "string",
+                                "pattern": r"^[a-z0-9_]{1,96}$",
+                            },
                             "property_schema_id": {
                                 "type": "string",
                                 "enum": schema_ids,
@@ -112,6 +115,10 @@ def binding_manifest_tool(catalog: PropertyCatalog) -> Dict[str, Any]:
                             "evidence": {
                                 "type": "array",
                                 "maxItems": 4,
+                                "description": (
+                                    "Provide at most four representative candidate "
+                                    "references; do not repeat every binding."
+                                ),
                                 "items": {
                                     "type": "object",
                                     "additionalProperties": False,

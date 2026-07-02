@@ -263,8 +263,8 @@ class CoupledL2BuildOperations:
         """Write the run-local Verilog file list and verify.tcl for JasperGold."""
         stage_dir = self._stage_dir("invoke_verification")
         stage_dir.mkdir(parents=True, exist_ok=True)
-        verilog_files = self.discover_generated_verilog_files()
-        if not verilog_files:
+        source_files = self.discover_generated_verilog_files()
+        if not source_files:
             result = {
                 "success": False,
                 "error": "no Verilog/SystemVerilog files available for JasperGold",
@@ -273,6 +273,13 @@ class CoupledL2BuildOperations:
             }
             self._write_json(stage_dir / "verilog_files.json", result)
             return result
+
+        prepared_dir = stage_dir / "rtl_inputs"
+        verilog_files = []
+        for index, source in enumerate(source_files):
+            destination = prepared_dir / f"{index:02d}_{source.name}"
+            materialize_jaspergold_input(source, destination)
+            verilog_files.append(destination)
 
         top_module = top_module or self.infer_top_module(verilog_files)
         if not top_module:
@@ -285,7 +292,14 @@ class CoupledL2BuildOperations:
             self._write_json(stage_dir / "verilog_files.json", result)
             return result
 
-        file_records = [{"path": str(path), "relative_to_verilog": self._rel_to_verilog(path)} for path in verilog_files]
+        file_records = [
+            {
+                "source_path": str(source),
+                "path": str(path),
+                "relative_to_verilog": self._rel_to_verilog(path),
+            }
+            for source, path in zip(source_files, verilog_files)
+        ]
         verify_tcl = self.build_verify_tcl(verilog_files, top_module)
         (stage_dir / "verify.tcl").write_text(verify_tcl, encoding="utf-8")
         (self.case_dir / "Verilog").mkdir(parents=True, exist_ok=True)
@@ -673,3 +687,16 @@ def _unique_sorted(paths: List[Path]) -> List[Path]:
 def _tcl_quote(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
     return "{" + escaped + "}"
+
+
+def materialize_jaspergold_input(source: Path, destination: Path) -> None:
+    """Copy CIRCT output while removing its non-Verilog resource file list."""
+    text = Path(source).read_text(encoding="utf-8", errors="ignore")
+    marker = re.search(
+        r'(?m)^// ----- 8< ----- FILE "firrtl_black_box_resource_files\.f" ----- 8< -----\s*$',
+        text,
+    )
+    if marker is not None:
+        text = text[:marker.start()].rstrip() + "\n"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(text, encoding="utf-8")

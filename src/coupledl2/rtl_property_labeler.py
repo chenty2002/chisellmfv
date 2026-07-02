@@ -16,6 +16,9 @@ ASSERT_RE = re.compile(
     r"(?P<body>assert\s*(?:property\s*)?\()",
     re.IGNORECASE,
 )
+STANDALONE_LABEL_RE = re.compile(
+    r"^(?P<indent>\s*)(?P<label>[A-Za-z_][A-Za-z0-9_$]*)\s*:\s*$"
+)
 
 
 class RTLPropertyLabelError(ValueError):
@@ -43,7 +46,7 @@ def label_rtl_properties(
     base_label = instance["base_label"]
     files = sorted({Path(path).resolve() for path in generated_files})
     existing: list[str] = []
-    occurrences: list[tuple[Path, int]] = []
+    occurrences: list[tuple[Path, int, int, str | None]] = []
     texts: Dict[Path, list[str]] = {}
 
     for path in files:
@@ -53,15 +56,38 @@ def label_rtl_properties(
         existing.extend(CONCRETE_LABEL_RE.findall(text))
         lines = text.splitlines(keepends=True)
         texts[path] = lines
-        last_source_line = -100
         for index, line in enumerate(lines):
-            if suffix in line:
-                last_source_line = index
             assertion = ASSERT_RE.match(line)
-            if assertion and index - last_source_line <= 8:
-                if assertion.group("label"):
-                    raise RTLPropertyLabelError("matching RTL property already has a label")
-                occurrences.append((path, index))
+            if assertion is None:
+                continue
+            end = index
+            while end < len(lines) and ";" not in lines[end]:
+                end += 1
+            if end >= len(lines):
+                raise RTLPropertyLabelError("generated RTL property is unterminated")
+            statement = "".join(lines[index:end + 1])
+            if suffix not in statement:
+                continue
+            label_line = index
+            existing_label = assertion.group("label")
+            if existing_label is None and index > 0:
+                standalone = STANDALONE_LABEL_RE.match(
+                    lines[index - 1].rstrip("\r\n")
+                )
+                if standalone is not None:
+                    label_line = index - 1
+                    existing_label = standalone.group("label")
+            if existing_label:
+                generated_label = re.fullmatch(r"_GEN_\d+", existing_label)
+                base_expansion = re.fullmatch(
+                    rf"{re.escape(base_label)}(?:_\d+)?",
+                    existing_label,
+                )
+                if not generated_label and not base_expansion:
+                    raise RTLPropertyLabelError(
+                        "matching RTL property has a non-generated label"
+                    )
+            occurrences.append((path, index, label_line, existing_label))
 
     if existing:
         raise RTLPropertyLabelError("generated RTL contains baseline or duplicate CL2 labels")
@@ -72,12 +98,14 @@ def label_rtl_properties(
         raise RTLPropertyLabelError("template forbids multiple RTL property matches")
 
     results: list[RTLProperty] = []
-    per_file: Dict[Path, list[tuple[int, str]]] = {}
-    for elaboration_index, (path, line_index) in enumerate(
+    per_file: Dict[Path, list[tuple[int, int, str | None, str]]] = {}
+    for elaboration_index, (path, line_index, label_line, existing_label) in enumerate(
         sorted(occurrences, key=lambda item: (item[0].as_posix(), item[1]))
     ):
         label = f"{base_label}__E{elaboration_index}"
-        per_file.setdefault(path, []).append((line_index, label))
+        per_file.setdefault(path, []).append(
+            (line_index, label_line, existing_label, label)
+        )
         results.append(
             RTLProperty(
                 rtl_label=label,
@@ -88,7 +116,12 @@ def label_rtl_properties(
         )
     for path, edits in per_file.items():
         lines = texts[path]
-        for line_index, label in edits:
+        for line_index, label_line, existing_label, label in edits:
+            if label_line != line_index:
+                newline = "\n" if lines[label_line].endswith("\n") else ""
+                indent = re.match(r"\s*", lines[label_line]).group(0)
+                lines[label_line] = f"{indent}{label}:{newline}"
+                continue
             match = ASSERT_RE.match(lines[line_index])
             if match is None:
                 raise RTLPropertyLabelError("RTL property changed during labelling")
@@ -96,7 +129,7 @@ def label_rtl_properties(
                 match.group("indent")
                 + label
                 + ": "
-                + lines[line_index][len(match.group("indent")):]
+                + lines[line_index][match.start("body"):]
             )
         path.write_text("".join(lines), encoding="utf-8")
 

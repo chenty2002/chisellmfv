@@ -154,9 +154,7 @@ def build_build_contract(case_workspace: Path, config: CoupledL2RunConfig) -> Di
         },
         "chisel": detect_chisel_compatibility(chisel_dir, case_workspace),
         "generated_verilog_globs": [
-            "workspace/case/Chisel/generated/**/*.sv",
-            "workspace/case/Chisel/generated/**/*.v",
-            "workspace/case/Verilog/VerifyTop*.sv",
+            "workspace/case/Chisel/Verilog/**/VerifyTop*.sv",
         ],
     }
 

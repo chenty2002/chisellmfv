@@ -82,6 +82,17 @@ def render_property_source(
     block_lines = [GENERATED_BEGIN, *rendered.splitlines(), GENERATED_END]
     block = "\n".join(indent + line if line else "" for line in block_lines)
     updated = original.replace(marker, marker + "\n" + block, 1)
+    if "fvAssert(" in rendered:
+        formal_anchor = "new LazyModuleImp(this) with Formal {"
+        plain_anchor = "new LazyModuleImp(this) {"
+        if updated.count(formal_anchor) == 0:
+            if updated.count(plain_anchor) != 1:
+                raise AssertionRenderError(
+                    "Formal mixin anchor must occur exactly once"
+                )
+            updated = updated.replace(plain_anchor, formal_anchor, 1)
+        elif updated.count(formal_anchor) != 1:
+            raise AssertionRenderError("Formal mixin must be unique")
     before_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
     after_hash = hashlib.sha256(updated.encode("utf-8")).hexdigest()
     diff = "".join(

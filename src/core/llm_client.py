@@ -530,6 +530,7 @@ class LLMClient:
                         temperature: float = 0.5,
                         tool_choice: Optional[Union[str, Dict[str, Any]]] = "required",
                         enable_thinking: Optional[bool] = None,
+                        parallel_tool_calls: Optional[bool] = None,
                         prompt_cache_key: Optional[str] = None,
                         prompt_cache_retention: Optional[str] = None,
                         usage_metadata: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -548,6 +549,8 @@ class LLMClient:
                          "required" so the API enforces the workflow's
                          tool-only prompt contract. Provider adapters may
                          downgrade unsupported policies before sending.
+            parallel_tool_calls: Optional OpenAI-compatible switch controlling
+                                 whether one response may contain multiple calls.
             
         Returns:
             Dictionary containing:
@@ -565,6 +568,8 @@ class LLMClient:
         }
         if tools and tool_choice is not None:
             payload["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            payload["parallel_tool_calls"] = parallel_tool_calls
         if prompt_cache_key and self.enable_prompt_cache_key:
             payload["prompt_cache_key"] = prompt_cache_key
         if prompt_cache_retention and self.enable_prompt_cache_key:

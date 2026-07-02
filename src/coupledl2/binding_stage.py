@@ -194,6 +194,8 @@ class BindingStage:
                 "content": (
                     "Select exactly one repository property binding. "
                     "Use only candidate IDs and bounded parameters. "
+                    "Evidence contains at most four representative candidate IDs "
+                    "and does not need to repeat every binding. "
                     "Do not emit source code, file paths, patches, or template text."
                 ),
             },
