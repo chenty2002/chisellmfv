@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from .config import CoupledL2RunConfig
 from .file_policy import PathIntent, evaluate_workspace_path
+from .property_catalog import load_property_profile
 from .workspace import CoupledL2Workspace
 
 
@@ -307,11 +308,8 @@ def detect_chisel_compatibility(chisel_dir: Path, case_workspace: Path) -> Dict[
 
 
 def _select_make_target(config: CoupledL2RunConfig) -> str:
-    name = config.case_name.lower()
-    category = config.property_category
-    if category in {"deadlock", "peer_l2"} or "deadlock" in name or "peer-l2" in name:
-        return "auto-l2l3l2"
-    return "auto"
+    profile = load_property_profile(config.property_profile).profile
+    return str(profile["build"]["recommended_make_target"])
 
 
 def _looks_like_assertion(line: str) -> bool:

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 
-DEFAULT_RUN_TOKEN_BUDGET = 400000
+DEFAULT_RUN_TOKEN_BUDGET = 640000
 
 
 @dataclass(frozen=True)
@@ -41,34 +41,35 @@ class StageSpec:
 
 STAGE_SPECS: Tuple[StageSpec, ...] = (
     StageSpec(
-        name="write_assertions",
+        name="bind_properties",
         ordinal=2,
-        execution_kind="agent",
+        execution_kind="binding",
         required_predecessor="preflight",
-        tool_budget=24,
-        discovery_budget=4,
-        finalization_reserve=4,
-        model_turn_budget=12,
-        soft_token_budget=72000,
-        token_budget=96000,
-        request_max_tokens=4096,
-        compaction_max_tokens=4096,
-        compaction_target_tokens=1200,
-        compaction_digest_limit=1600,
-        tool_result_token_limit=6000,
-        tool_result_batch_token_limit=10000,
+        tool_budget=0,
+        discovery_budget=0,
+        finalization_reserve=0,
+        model_turn_budget=2,
+        soft_token_budget=None,
+        token_budget=4096,
+        request_max_tokens=2048,
+        compaction_max_tokens=0,
+        compaction_target_tokens=0,
+        compaction_digest_limit=0,
+        tool_result_token_limit=0,
+        tool_result_batch_token_limit=0,
         repair_round_token_budget=None,
-        completion_gate="assertion_compilation",
-        artifact_contract=("assertion_map.json", "generated_assertion_scan.json"),
-        completion_request_max_tokens=1024,
-        completion_gate_repair_limit=1,
-        completion_error_token_limit=4000,
+        completion_gate="property_binding",
+        artifact_contract=(
+            "binding_manifest.json",
+            "assertion_traceability.json",
+            "rtl_label_result.json",
+        ),
     ),
     StageSpec(
         name="invoke_verification",
         ordinal=3,
         execution_kind="deterministic",
-        required_predecessor="write_assertions",
+        required_predecessor="bind_properties",
         tool_budget=0,
         discovery_budget=0,
         finalization_reserve=0,

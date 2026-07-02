@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+from .property_catalog import PropertyCatalog
 
 
 AUTO_VERIFY_GENERATED_DIR = "generated"
@@ -36,6 +40,130 @@ CHISEL_ASSERT_HINT_RE = re.compile(
     r"\.(?:B|U|W|fire|valid|ready|bits|andR|orR)\b|"
     r"\b(?:Reg|RegInit|RegNext|Wire|WireDefault|Mux|PopCount|Cat|VecInit)\b"
 )
+
+
+class PropertySurfaceError(ValueError):
+    """Raised when a profile cannot be installed unambiguously."""
+
+
+@dataclass(frozen=True)
+class PreparedPropertySurface:
+    target_path: Path
+    marker_text: str
+    sha256_before: str
+    sha256_after: str
+
+
+def prepare_profile_surface(
+    case_workspace: Path,
+    catalog: PropertyCatalog,
+) -> PreparedPropertySurface:
+    """Clean inherited verification code and install one profile marker."""
+    case_workspace = Path(case_workspace)
+    target = catalog.profile["target"]
+    target_path = case_workspace / target["relative_path"]
+    if not target_path.is_file():
+        raise PropertySurfaceError(f"profile target not found: {target['relative_path']}")
+    original = target_path.read_text(encoding="utf-8")
+    marker = target["marker_text"]
+    marker_after = target["marker_after"]
+    if original.count(marker):
+        raise PropertySurfaceError("profile marker already exists")
+    if original.count(marker_after) != 1:
+        raise PropertySurfaceError("marker selector must match exactly once")
+    cleanup = target["cleanup_region"]
+    if cleanup is not None:
+        if original.count(cleanup["start_text"]) != 1:
+            raise PropertySurfaceError("cleanup start selector must match exactly once")
+        start = original.index(cleanup["start_text"])
+        if original.find(cleanup["block_start_text"], start) < 0:
+            raise PropertySurfaceError("cleanup block selector not found")
+        if original.count(cleanup["block_start_text"], start) != 1:
+            raise PropertySurfaceError("cleanup block selector must match exactly once")
+    _validate_candidate_provenance(case_workspace, catalog)
+
+    cleanup_result = clean_formal_surface(case_workspace)
+    if not cleanup_result["success"]:
+        raise PropertySurfaceError("generic formal-surface cleanup failed")
+    updated = target_path.read_text(encoding="utf-8")
+    if cleanup is not None:
+        updated = _remove_profile_cleanup_region(updated, cleanup)
+    if updated.count(marker_after) != 1:
+        raise PropertySurfaceError("marker selector changed during cleanup")
+    lines = updated.splitlines(keepends=True)
+    selector_line = next(
+        index for index, line in enumerate(lines) if marker_after in line
+    )
+    indent = re.match(r"\s*", lines[selector_line]).group(0)
+    marker_line = f"{indent}{marker}\n"
+    lines.insert(selector_line + 1, marker_line)
+    updated = "".join(lines)
+    if updated.count(marker) != 1:
+        raise PropertySurfaceError("profile marker installation is not unique")
+    target_path.write_text(updated, encoding="utf-8")
+    return PreparedPropertySurface(
+        target_path=target_path,
+        marker_text=marker,
+        sha256_before=hashlib.sha256(original.encode("utf-8")).hexdigest(),
+        sha256_after=hashlib.sha256(updated.encode("utf-8")).hexdigest(),
+    )
+
+
+def _validate_candidate_provenance(
+    case_workspace: Path,
+    catalog: PropertyCatalog,
+) -> None:
+    for candidate in catalog.candidates.values():
+        provenance = candidate["provenance"]
+        if provenance["kind"] == "source_scope":
+            path = case_workspace / provenance["path"]
+            if not path.is_file():
+                raise PropertySurfaceError("candidate provenance source not found")
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if text.count(provenance["scope_anchor"]) != 1:
+                raise PropertySurfaceError("candidate scope anchor must match exactly once")
+            continue
+        template = catalog.templates[provenance["template_id"]]
+        if candidate["expression"] not in template["fragments"]["support_block"]:
+            raise PropertySurfaceError("template candidate expression is not reconstructible")
+
+
+def _remove_profile_cleanup_region(text: str, cleanup: Dict[str, Any]) -> str:
+    search_start = text.index(cleanup["start_text"])
+    block_start = text.index(cleanup["block_start_text"], search_start)
+    brace_start = text.find("{", block_start)
+    if brace_start < 0:
+        raise PropertySurfaceError("cleanup block has no opening brace")
+    depth = 0
+    in_string = False
+    escaped = False
+    end = None
+    for index in range(brace_start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+    if end is None:
+        raise PropertySurfaceError("cleanup block is unbalanced")
+    while end < len(text) and text[end] in " \t":
+        end += 1
+    if end < len(text) and text[end] == "\n":
+        end += 1
+    return text[:block_start] + text[end:]
 
 
 def preprocess_coupledl2_workspace(case_workspace: Path) -> Dict[str, Any]:

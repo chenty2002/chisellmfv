@@ -481,15 +481,18 @@ def main_coupledl2_run(args):
         print("错误: --resume-run 必须与一个显式 --stage 一起使用")
         sys.exit(2)
 
-    stage = args.stage or "write_assertions"
+    stage = args.stage or "bind_properties"
     if resume_run:
         workspace = load_coupledl2_workspace(Path(resume_run))
     else:
+        if not args.property_profile:
+            print("错误: 新建 run 必须提供 --property-profile")
+            sys.exit(2)
         config = CoupledL2RunConfig(
             case_path=Path(args.case),
+            property_profile=args.property_profile,
             verify_mode=args.mode,
             input_mode=args.input_mode,
-            property_category=args.property_category,
             run_root=Path(args.run_root),
         )
         workspace = create_coupledl2_workspace(config)
@@ -735,15 +738,15 @@ def parse_args():
     run_parser.add_argument('--input-mode', type=str, default='coupledl2asl1',
                             choices=['coupledl2asl1'],
                             help='VERIFY_INPUT_MODE（默认: coupledl2asl1）')
-    run_parser.add_argument('--property', dest='property_category', type=str, default='deadlock',
-                            choices=['deadlock', 'write_read', 'copy_equality', 'peer_l2', 'custom'],
-                            help='属性类别（默认: deadlock）')
+    run_parser.add_argument('--property-profile', type=str, default=None,
+                            choices=['write_read_poc', 'mshr_wait_bound_poc'],
+                            help='新建 run 使用的 repository-owned property profile')
     run_parser.add_argument('--run-root', type=str, default='runs',
                             help='run workspace 根目录（默认: runs）')
     run_parser.add_argument('--full', action='store_true',
                             help='运行 Stage 2-5 完整流程')
     run_parser.add_argument('--stage', type=str, default=None,
-                            choices=['write_assertions',
+                            choices=['bind_properties',
                                      'invoke_verification', 'waveform_explanation',
                                      'propose_bugfix'],
                             help='运行单个阶段')

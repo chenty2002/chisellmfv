@@ -9,8 +9,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable
 
 from .indexer import generate_indexes
-from .preprocess import preprocess_coupledl2_workspace, scan_formal_surface
-from .workspace import CoupledL2Workspace, initialize_stage_context
+from .preprocess import (
+    patch_autoverify_outputs,
+    prepare_profile_surface,
+    scan_formal_surface,
+)
+from .property_catalog import load_property_profile
+from .workspace import CoupledL2Workspace
 
 
 class CoupledL2Preflight:
@@ -26,7 +31,25 @@ class CoupledL2Preflight:
         _write_json(self.results_dir / "source_manifest_before.json", before_manifest)
         _write_json(self.results_dir / "formal_surface_before.json", before_surface)
 
-        preprocess = preprocess_coupledl2_workspace(self.workspace.case_workspace)
+        catalog = load_property_profile(self.workspace.config.property_profile)
+        patched_autoverify = patch_autoverify_outputs(self.workspace.case_workspace)
+        prepared = prepare_profile_surface(self.workspace.case_workspace, catalog)
+        preprocess = {
+            "schema_version": "coupledl2_preprocess.v3",
+            "success": True,
+            "patched_autoverify": patched_autoverify,
+            "property_profile": self.workspace.config.property_profile,
+            "prepared_surface": {
+                "target_path": "workspace/case/"
+                + prepared.target_path.relative_to(
+                    self.workspace.case_workspace
+                ).as_posix(),
+                "marker_text": prepared.marker_text,
+                "sha256_before": prepared.sha256_before,
+                "sha256_after": prepared.sha256_after,
+            },
+            "generated_output_dir": "workspace/case/Chisel/generated",
+        }
         preprocess["removed_generated_rtl"] = _remove_copied_generated_rtl(
             self.workspace.case_workspace
         )
@@ -61,6 +84,7 @@ class CoupledL2Preflight:
             "source_boringutils_count": after_surface["boringutils_count"],
             "baseline_build_success": bool(baseline.get("success")),
             "generated_assertion_count": generated_scan["assertion_count"],
+            "baseline_cl2_label_count": generated_scan["cl2_label_count"],
         }
         success = (
             gate["cleanup_completed"]
@@ -68,6 +92,7 @@ class CoupledL2Preflight:
             and gate["source_boringutils_count"] == 0
             and gate["baseline_build_success"]
             and gate["generated_assertion_count"] == 0
+            and gate["baseline_cl2_label_count"] == 0
         )
         result = {
             "schema_version": "coupledl2_preflight.v1",
@@ -86,8 +111,6 @@ class CoupledL2Preflight:
         }
         _write_json(self.results_dir / "preflight_result.json", result)
         _update_manifest(self.workspace, result)
-        if success:
-            initialize_stage_context(self.workspace, "write_assertions")
         return result
 
 
@@ -96,7 +119,7 @@ def _termination_reason(gate: Dict[str, Any]) -> str:
         return "preflight_cleanup_failed"
     if not gate["baseline_build_success"]:
         return "preflight_build_failed"
-    if gate["generated_assertion_count"]:
+    if gate["generated_assertion_count"] or gate["baseline_cl2_label_count"]:
         return "preflight_generated_assertions_found"
     return "preflight_completed"
 
@@ -115,6 +138,7 @@ def _source_manifest(case_workspace: Path) -> Dict[str, Any]:
 
 def _scan_generated_assertions(paths: Iterable[str]) -> Dict[str, Any]:
     records = []
+    cl2_labels = []
     pattern = re.compile(
         r"(?:\bassert\s*(?:property)?\s*\(|\$assert\b|"
         r"\$(?:error|fatal)\s*\(\s*\"Assertion failed)"
@@ -126,10 +150,16 @@ def _scan_generated_assertions(paths: Iterable[str]) -> Dict[str, Any]:
         for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
             if pattern.search(line.split("//", 1)[0]):
                 records.append({"path": str(path), "line": line_no, "text": line.strip()})
+            for label in re.findall(r"\bCL2_[A-Z0-9_]+\b", line):
+                cl2_labels.append(
+                    {"path": str(path), "line": line_no, "label": label}
+                )
     return {
         "schema_version": "generated_assertion_scan.v1",
         "assertion_count": len(records),
         "assertions": records,
+        "cl2_label_count": len(cl2_labels),
+        "cl2_labels": cl2_labels,
     }
 
 

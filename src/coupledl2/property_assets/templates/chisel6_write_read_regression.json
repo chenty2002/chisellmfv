@@ -1,0 +1,24 @@
+{
+  "schema_version": "assertion_template.v1",
+  "template_id": "chisel6_write_read_regression",
+  "chisel_family": "chisel6",
+  "property_schema_ids": ["CL2_WRITE_READ_REGRESSION"],
+  "slots": {
+    "trigger": {"type": "Bool"},
+    "selector": {"type": "Bool"},
+    "observed_data": {"type": "UInt"},
+    "expected_data_true": {"type": "UInt"},
+    "expected_data_false": {"type": "UInt"},
+    "tracking_valid": {"type": "Bool"}
+  },
+  "parameters": {},
+  "fragments": {
+    "support_block": "val data_p1 = RegInit(0.U(256.W))\nval data_p2 = RegInit(0.U(256.W))\nval tracking_valid = RegInit(false.B)\ncoupledL2.foreach { l2 =>\n  l2.module.slices.head match {\n    case tlSlice: L2Slice =>\n      val c_opcode = chisel3.util.experimental.BoringUtils.bore(tlSlice.io.in.c.bits.opcode)\n      val c_param = chisel3.util.experimental.BoringUtils.bore(tlSlice.io.in.c.bits.param)\n      val c_addr = chisel3.util.experimental.BoringUtils.bore(tlSlice.io.in.c.bits.address)\n      val c_data = chisel3.util.experimental.BoringUtils.bore(tlSlice.io.in.c.bits.data)\n      val c_valid = chisel3.util.experimental.BoringUtils.bore(tlSlice.io.in.c.valid)\n      val c_flag = RegInit(false.B)\n      when((c_opcode === ReleaseData || c_opcode === ProbeAckData) && isParamFromT(c_param) && c_addr === 0.U && c_valid) {\n        tracking_valid := true.B\n        when(c_flag) { c_flag := false.B; data_p2 := c_data }\n          .otherwise { c_flag := true.B; data_p1 := c_data }\n      }\n      val d_opcode = chisel3.util.experimental.BoringUtils.bore(tlSlice.io.in.d.bits.opcode)\n      val d_addr = tlSlice.io.in.d.bits.echo.lift(L2AddrKey)\n        .map(addr => chisel3.util.experimental.BoringUtils.bore(addr))\n        .getOrElse(0.U(io(0).inputAddr.getWidth.W))\n      val d_data = chisel3.util.experimental.BoringUtils.bore(tlSlice.io.in.d.bits.data)\n      val d_valid = chisel3.util.experimental.BoringUtils.bore(tlSlice.io.in.d.valid)\n      val d_flag = RegInit(false.B)\n      val d_GrantData_valid = d_opcode === GrantData && d_addr === 0.U && d_valid\n      {{ASSERTION_BLOCK}}\n      when(d_GrantData_valid) {\n        when(d_flag) { d_flag := false.B }.otherwise { d_flag := true.B }\n      }\n  }\n}",
+    "assertion_block": "fvAssert(\n  !{{trigger}} ||\n  ({{selector}} && ({{observed_data}} === {{expected_data_true}} || !{{tracking_valid}})) ||\n  (!{{selector}} && ({{observed_data}} === {{expected_data_false}} || !{{tracking_valid}})),\n  \"{{base_label}}\"\n)"
+  },
+  "rtl_match": {
+    "source_annotation_suffix": "src/test/scala/coupledL2Verification/VerifyTop.scala",
+    "minimum_occurrences": 1,
+    "allow_multiple_occurrences": true
+  }
+}

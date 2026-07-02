@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .property_catalog import load_property_profile
 
 VALID_VERIFY_MODES = {"small"}
 VALID_INPUT_MODES = {"coupledl2asl1"}
-VALID_PROPERTY_CATEGORIES = {"deadlock", "write_read", "copy_equality", "peer_l2", "custom"}
+VALID_PROPERTY_PROFILES = {"write_read_poc", "mshr_wait_bound_poc"}
 
 
 @dataclass(frozen=True)
@@ -16,9 +17,9 @@ class CoupledL2RunConfig:
     """Configuration needed before preflight and the four active stages."""
 
     case_path: Path
+    property_profile: str
     verify_mode: str = "small"
     input_mode: str = "coupledl2asl1"
-    property_category: str = "deadlock"
     run_root: Path = Path("runs")
     copy_strategy: str = "copy"
 
@@ -32,9 +33,14 @@ class CoupledL2RunConfig:
             raise ValueError(f"verify_mode must be one of {sorted(VALID_VERIFY_MODES)}")
         if self.input_mode not in VALID_INPUT_MODES:
             raise ValueError(f"input_mode must be one of {sorted(VALID_INPUT_MODES)}")
-        if self.property_category not in VALID_PROPERTY_CATEGORIES:
+        if self.property_profile not in VALID_PROPERTY_PROFILES:
             raise ValueError(
-                f"property_category must be one of {sorted(VALID_PROPERTY_CATEGORIES)}"
+                f"property_profile must be one of {sorted(VALID_PROPERTY_PROFILES)}"
+            )
+        profile = load_property_profile(self.property_profile).profile
+        if profile["case_name"] != case_path.name:
+            raise ValueError(
+                f"profile {self.property_profile} requires case {profile['case_name']}"
             )
         if self.copy_strategy != "copy":
             raise ValueError("only copy workspace strategy is supported in commit 1")

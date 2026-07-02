@@ -13,12 +13,14 @@ from uuid import uuid4
 
 from .config import CoupledL2RunConfig
 from .file_policy import ignored_copy_entry
+from .property_catalog import load_property_profile, public_catalog
 from .prompt_context import build_prompt_bundle
 from .skills import install_context_assets, stage_rule_paths, stage_skill_paths
 from .stages import COUPLEDL2_STAGES, STAGE_SPECS, get_stage_spec
 
 
 STAGE_INPUTS_SCHEMA_VERSION = "stage_inputs.v1"
+MANIFEST_SCHEMA_VERSION = "coupledl2_run_manifest.v2"
 
 
 @dataclass(frozen=True)
@@ -115,11 +117,23 @@ def load_coupledl2_workspace(run_dir: Path) -> CoupledL2Workspace:
     if not manifest_path.is_file():
         raise FileNotFoundError(f"CoupledL2 manifest not found: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        raise ValueError("unsupported CoupledL2 manifest schema version")
+    required = {
+        "schema_version", "case_name", "original_case_path",
+        "workspace_case_path", "run_dir", "workspace_dir", "copy_strategy",
+        "verify_mode", "input_mode", "property_profile", "stages",
+        "entry_stage", "skipped_stages", "preflight_result",
+        "preflight_status",
+    }
+    missing = required - set(manifest)
+    if missing:
+        raise ValueError(f"CoupledL2 manifest missing fields: {sorted(missing)}")
     config = CoupledL2RunConfig(
         case_path=Path(manifest["original_case_path"]),
+        property_profile=manifest["property_profile"],
         verify_mode=manifest["verify_mode"],
         input_mode=manifest["input_mode"],
-        property_category=manifest["property_category"],
         run_root=run_dir.parent,
         copy_strategy=manifest["copy_strategy"],
     )
@@ -149,13 +163,18 @@ def initialize_stage_context(workspace: CoupledL2Workspace, stage: str) -> Stage
     snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     context_indexes = _load_stage_indexes(workspace.indexes_dir, stage)
-    skills = stage_skill_paths(workspace.workspace_dir, stage, context_indexes)
-    rules = stage_rule_paths(workspace.workspace_dir, stage)
-    prompt_bundle = build_prompt_bundle(
-        workspace.workspace_dir,
-        rules=rules,
-        skills=skills,
-    )
+    if stage == "bind_properties":
+        skills = []
+        rules = []
+        prompt_bundle = []
+    else:
+        skills = stage_skill_paths(workspace.workspace_dir, stage, context_indexes)
+        rules = stage_rule_paths(workspace.workspace_dir, stage)
+        prompt_bundle = build_prompt_bundle(
+            workspace.workspace_dir,
+            rules=rules,
+            skills=skills,
+        )
     stage_inputs = _build_stage_inputs(
         workspace,
         stage=stage,
@@ -209,6 +228,7 @@ def _build_manifest(
     case_workspace: Path,
 ) -> Dict[str, Any]:
     return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "case_name": config.case_name,
         "original_case_path": str(config.case_path),
         "workspace_case_path": str(case_workspace),
@@ -217,9 +237,9 @@ def _build_manifest(
         "copy_strategy": config.copy_strategy,
         "verify_mode": config.verify_mode,
         "input_mode": config.input_mode,
-        "property_category": config.property_category,
+        "property_profile": config.property_profile,
         "stages": COUPLEDL2_STAGES,
-        "entry_stage": "write_assertions",
+        "entry_stage": "bind_properties",
         "skipped_stages": ["build_top_module"],
         "preflight_result": "results/preflight/preflight_result.json",
         "preflight_status": "pending",
@@ -228,7 +248,7 @@ def _build_manifest(
 
 def _load_stage_indexes(indexes_dir: Path, stage: str) -> Dict[str, Dict[str, Any]]:
     required = {
-        "write_assertions": ["build_contract", "formal_surface"],
+        "bind_properties": ["build_contract", "formal_surface"],
         "invoke_verification": ["build_contract", "formal_surface"],
         "waveform_explanation": ["build_contract", "formal_surface"],
         "propose_bugfix": ["build_contract", "formal_surface"],
@@ -273,15 +293,45 @@ def _build_stage_inputs(
         "case_name": workspace.config.case_name,
         "verify_mode": workspace.config.verify_mode,
         "input_mode": workspace.config.input_mode,
-        "property_category": workspace.config.property_category,
+        "property_profile": workspace.config.property_profile,
         "chisel_compatibility": context_indexes.get("build_contract", {}).get("chisel"),
     }
-    if stage == "write_assertions":
+    if stage == "bind_properties":
+        catalog = load_property_profile(workspace.config.property_profile)
+        build_contract = context_indexes.get("build_contract", {})
+        formal_surface = context_indexes.get("formal_surface", {})
+        preflight_result = json.loads(
+            (workspace.results_dir / "preflight" / "preflight_result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        payload["build_contract_summary"] = {
+            "recommended_make_target": build_contract.get("recommended_make_target"),
+            "verify_top_files": [
+                _tool_visible_path(path)
+                for path in build_contract.get("verify_top_files", [])
+            ],
+            "generated_verilog_globs": [
+                _tool_visible_path(path)
+                for path in build_contract.get("generated_verilog_globs", [])
+            ],
+        }
+        payload["formal_surface_summary"] = _formal_surface_summary(formal_surface)
+        payload["preflight_gate"] = {
+            key: preflight_result.get("gate", {}).get(key)
+            for key in (
+                "source_assertion_count",
+                "source_boringutils_count",
+                "baseline_build_success",
+                "generated_assertion_count",
+            )
+        }
         payload["preflight"] = {
             "result": "results/preflight/preflight_result.json",
             "baseline_build": "results/preflight/baseline_build_result.json",
             "generated_assertion_scan": "results/preflight/generated_assertion_scan.json",
         }
+        payload["property_catalog"] = public_catalog(catalog)
     return payload
 
 
@@ -321,6 +371,12 @@ def _formal_surface_summary(formal_surface: Dict[str, Any]) -> Dict[str, Any]:
         "uses_boring_utils": formal_surface.get("uses_boring_utils"),
         "uses_ltl": formal_surface.get("uses_ltl"),
     }
+
+
+def _tool_visible_path(path: str) -> str:
+    """Remove the persisted workspace/ prefix used by deterministic indexes."""
+    prefix = "workspace/"
+    return path[len(prefix):] if path.startswith(prefix) else path
 
 
 def _write_json(path: Path, value: Dict[str, Any]) -> None:
