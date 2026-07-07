@@ -383,6 +383,8 @@ def main_verilog2chisel(args):
         benchmark=args.target,
         logger=logger,
         max_iterations=args.max_iterations,
+        preflight_only=args.preflight_only,
+        publish=args.publish,
     )
 
     try:
@@ -673,6 +675,10 @@ def parse_args():
                             help='最大编译重试次数（默认: 5）')
     v2c_parser.add_argument('--max-tokens', type=int, default=None,
                             help='Token 总量限制（所有 API 调用累计，超出后停止）')
+    v2c_parser.add_argument('--preflight-only', action='store_true',
+                            help='只扫描 Verilog 输入并写入 v2c run artifacts')
+    v2c_parser.add_argument('--publish', action='store_true',
+                            help='成功后发布 Scala 到 chisel/extra_bench/<target>')
 
     # JasperGold quality evaluation
     quality_parser = subparsers.add_parser('quality', help='JasperGold 质量评估')

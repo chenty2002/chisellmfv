@@ -1,588 +1,560 @@
-"""
-Verilog to Chisel conversion workflow.
+"""Auditable Verilog to Chisel conversion workflow."""
 
-Workflow:
-1. Read all .v/.sv files from verilog2chisel/verilog/<benchmark>/
-2. Send to LLM to generate Chisel code in verilog2chisel/chisel/<benchmark>/
-3. Compile with make, retry with error messages if compilation fails
-"""
-
-import os
-import sys
-import glob
 import json
 import logging
+import os
+import re
 import shutil
 import subprocess
-from typing import Dict, List, Any, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..core.llm_client import LLMClient
 from ..core.prompt_builder import build_assistant_tool_call_message
-from ..utils.llm_properties import *
-from ..utils.file_utils import read_file as utils_read_file, write_file as utils_write_file
+from ..utils.file_utils import write_file as utils_write_file
 from ..utils.llm_logging import LLMLogger
-from .tool_schemas import get_verilog2chisel_tool_schemas, convert_tool_call_to_action
 from .actions import execute_action
+from .gates import check_generated_verilog, check_prompt_leak, lint_scala_sources
+from .preflight import V2CPreflight
+from .prompt_builder import (
+    build_v2c_conversion_prompt,
+    build_v2c_repair_prompt,
+    load_vis_rules,
+)
+from .tool_schemas import convert_tool_call_to_action, get_verilog2chisel_tool_schemas
 
 
 class Verilog2ChiselWorkflow:
-    """
-    Workflow for converting Verilog/SystemVerilog to Chisel.
-    
-    Steps:
-    1. Read all Verilog files from verilog2chisel/verilog/<benchmark>/
-    2. Generate Chisel code using LLM (write_files tool)
-    3. Compile with make, retry with errors if needed
-    """
-    
+    """Stage-based v2c workflow with deterministic artifacts and local gates."""
+
     def __init__(
         self,
         llm_client: LLMClient,
         workspace_dir: str,
         benchmark: str,
-        logger: logging.Logger,
-        max_iterations: int = 5
+        logger: Optional[logging.Logger],
+        max_iterations: int = 5,
+        preflight_only: bool = False,
+        publish: bool = False,
     ):
-        """
-        Initialize the Verilog to Chisel conversion workflow.
-        
-        Args:
-            llm_client: LLM client for API interactions
-            workspace_dir: Root directory of the project
-            benchmark: Benchmark name (e.g., 'gigamax', 'philo')
-            logger: Logger instance
-            max_iterations: Maximum compilation retry iterations
-        """
         self.llm = llm_client
-        self.workspace_dir = workspace_dir
+        self.workspace_dir = Path(workspace_dir).resolve()
         self.benchmark = benchmark
-        self.logger = logger
+        self.logger = logger or logging.getLogger(__name__)
         self.max_iterations = max_iterations
-        
-        # Derived paths with benchmark subdirectory
-        self.verilog2chisel_dir = os.path.join(workspace_dir, "verilog2chisel")
-        self.verilog_dir = os.path.join(self.verilog2chisel_dir, "verilog", benchmark)
-        self.chisel_dir = os.path.join(self.verilog2chisel_dir, "chisel", benchmark)
-        self.generated_dir = os.path.join(self.verilog2chisel_dir, "generated")
-        
-        # Track previous iteration's generated code for error feedback
-        self.previous_chisel_files = {}
-        
-        # System prompt for conversion
-        self.system_prompt = "You are an expert in Verilog and Chisel hardware description languages. Convert Verilog code to equivalent Chisel code."
-        
-        # Create directories if they don't exist
-        os.makedirs(self.chisel_dir, exist_ok=True)
-        os.makedirs(self.generated_dir, exist_ok=True)
-    
-    def read_verilog_files(self) -> Tuple[Dict[str, str], Dict[str, str]]:
-        """
-        Read all Verilog/SystemVerilog files and their instruction txt files from verilog directory.
-        
-        Returns:
-            Tuple of (verilog_files, instruction_files)
-            - verilog_files: Dictionary mapping filename to content
-            - instruction_files: Dictionary mapping verilog filename to its instruction content
-        """
-        verilog_files = {}
-        instruction_files = {}
-        
-        # Find all .v and .sv files
-        v_files = glob.glob(os.path.join(self.verilog_dir, "*.v"))
-        sv_files = glob.glob(os.path.join(self.verilog_dir, "*.sv"))
-        all_files = v_files + sv_files
-        
-        self.logger.info(f"Found {len(all_files)} Verilog files: {[os.path.basename(f) for f in all_files]}")
-        
-        for file_path in all_files:
-            filename = os.path.basename(file_path)
-            try:
-                content = utils_read_file(file_path)
-                verilog_files[filename] = content
-                self.logger.info(f"Read {filename}: {len(content)} chars")
-                
-                # Look for corresponding instruction txt file
-                # Pattern: Prob156_review2015_fancytimer_ref.sv -> Prob156_review2015_fancytimer_prompt.txt
-                base_name = os.path.splitext(filename)[0]
-                # Remove _ref suffix if present
-                if base_name.endswith('_ref'):
-                    base_name = base_name[:-4]
-                instruction_file = os.path.join(self.verilog_dir, f"{base_name}_prompt.txt")
-                
-                if os.path.exists(instruction_file):
-                    try:
-                        instruction_content = utils_read_file(instruction_file)
-                        instruction_files[filename] = instruction_content
-                        self.logger.info(f"Read instruction for {filename}: {len(instruction_content)} chars")
-                    except Exception as e:
-                        self.logger.warning(f"Failed to read instruction file {instruction_file}: {e}")
-            except Exception as e:
-                self.logger.error(f"Failed to read {filename}: {e}")
-        
-        return verilog_files, instruction_files
-    
-    def build_conversion_prompt(
-        self, 
-        verilog_files: Dict[str, str],
-        instruction_files: Dict[str, str],
-    ) -> str:
-        """
-        Build the initial user prompt for LLM to convert Verilog to Chisel.
-        
-        Args:
-            verilog_files: Dictionary of Verilog filename -> content
-            instruction_files: Dictionary of Verilog filename -> instruction content
-            
-        Returns:
-            Formatted prompt string
-        """
-        prompt_parts = []
-        
-        # Header
-        prompt_parts.extend([
-            "# Task: Convert Verilog/SystemVerilog to Chisel",
-            "",
-            "Convert the following Verilog/SystemVerilog files to Chisel code.",
-            ""
-        ])
-        
-        # Instructions
-        prompt_parts.extend([
-            "## Requirements",
-            "1. Generate syntactically correct Chisel code",
-            "2. Preserve the original module names and functionality",
-            "3. Use proper Chisel idioms (Bundle, Module, IO, etc.)",
-            "4. Each Verilog file should become a Scala file with the same base name",
-            "5. All modules should be in package 'llmverify'",
-            "6. Include proper imports: chisel3._, chisel3.util._",
-            "7. IMPORTANT: Chisel's Clock signals do not need to be explicitly defined; ignore Clock inputs from Verilog",
-            "8. IMPORTANT: Create a main method to generate Verilog",
-            "   Example structure:",
-            "   ```scala",
-            "   package llmverify",
-            "   import chisel3._",
-            "   object VerilogGenerator extends App {",
-            "     emitVerilog(new YourModule(), args)",
-            "   }",
-            "   ```",
-            "9. IMPORTANT: Chisel compiler optimizes the modules and removes unused signals, ",
-            "   so you need to create extra Outputs in the top-level module to preserve the whole design if needed.",
-            ""])
-        
-        # Verilog files with instructions
-        prompt_parts.append("## Verilog Files to Convert")
-        prompt_parts.append("")
-        for filename, content in verilog_files.items():
-            prompt_parts.append(f"### {filename}")
-            prompt_parts.append("")
-            
-            # Add instruction if available
-            if filename in instruction_files:
-                prompt_parts.append("**Design Specification and Requirements:**")
-                prompt_parts.append("```")
-                prompt_parts.append(instruction_files[filename])
-                prompt_parts.append("```")
-                prompt_parts.append("")
-            
-            prompt_parts.append("**Verilog Implementation:**")
-            prompt_parts.extend([
-                "```verilog",
-                content,
-                "```",
-                ""
-            ])
-        # Tool usage instruction
-        prompt_parts.extend([
-            "## Output",
-            "",
-            "Use the write_files tool to generate Chisel files.",
-            "For each Verilog file, create a corresponding .scala file with:",
-            "- file_path: Just the filename (e.g., 'gigamax.scala' for gigamax.sv)",
-            "- content: Complete Chisel source code",
-            "",
-            "Set stage_complete=true when all files are converted.",
-            ""
-        ])
-        
-        return "\n".join(prompt_parts)
-    
-    def build_compilation_error_message(
-        self,
-        compilation_error: str,
-        previous_chisel_files: Dict[str, str]
-    ) -> str:
-        """
-        Build a tool result message containing compilation error for agent loop.
-        
-        Args:
-            compilation_error: Compilation error output
-            previous_chisel_files: Dictionary of previously generated Chisel files
-            
-        Returns:
-            Formatted error message string
-        """
-        parts = [
-            "## Compilation Failed",
-            "",
-            "The generated Chisel code failed to compile.",
-            ""
-        ]
-        
-        # Show compilation error
-        parts.extend([
-            "### Compilation Error",
-            "",
-            "```",
-            compilation_error,
-            "```",
-            "",
-            "Please analyze the error and fix the issues in the Chisel code.",
-            "Make sure to:",
-            "1. Address all compilation errors shown above",
-            "2. Maintain correct Scala/Chisel syntax",
-            "3. Preserve the module functionality",
-            "",
-            "Use the write_files tool to regenerate the fixed Chisel code.",
-            ""
-        ])
-        
-        return "\n".join(parts)
-    
-    def write_chisel_file(self, file_path: str, content: str) -> Tuple[bool, str]:
-        """
-        Write a Chisel file to the chisel directory.
-        
-        Args:
-            file_path: Relative path under chisel/ directory
-            content: File content
-            
-        Returns:
-            Tuple of (success, message)
-        """
-        try:
-            # Ensure file_path is relative and safe
-            if os.path.isabs(file_path) or ".." in file_path:
-                return False, f"Invalid file path (must be relative): {file_path}"
-            
-            full_path = os.path.join(self.chisel_dir, file_path)
-            
-            # Create parent directory if needed
-            parent_dir = os.path.dirname(full_path)
-            if parent_dir:
-                os.makedirs(parent_dir, exist_ok=True)
-            
-            # Write file
-            utils_write_file(full_path, content)
-            self.logger.info(f"Wrote Chisel file: {file_path} ({len(content)} chars)")
-            return True, f"Successfully wrote {file_path}"
-        except Exception as e:
-            error_msg = f"Failed to write {file_path}: {str(e)}"
-            self.logger.error(error_msg)
-            return False, error_msg
-    
-    def _prepare_benchmark_build_files(self) -> Tuple[bool, str]:
-        """
-        Copy build.sbt and Makefile from verilog2chisel/ to the benchmark chisel directory.
-        
-        Returns:
-            Tuple of (success, message)
-        """
-        try:
-            for filename in ["build.sbt", "Makefile"]:
-                src_file = os.path.join(self.verilog2chisel_dir, filename)
-                dest_file = os.path.join(self.chisel_dir, filename)
-                if os.path.exists(src_file) and not os.path.exists(dest_file):
-                    shutil.copy2(src_file, dest_file)
-                    self.logger.info(f"Copied {filename} to {self.chisel_dir}")
-                else:
-                    self.logger.warning(f"Source file {src_file} not found or destination already exists")
-            return True, "Build files copied successfully"
-        except Exception as e:
-            return False, f"Error copying build files: {str(e)}"
-    
-    def run_make(self) -> Tuple[bool, str]:
-        """
-        Run make in the benchmark chisel directory.
-        First copies build.sbt and Makefile to the benchmark directory.
-        
-        Returns:
-            Tuple of (success, output)
-        """
-        try:
-            # Copy build files to benchmark directory
-            ok, msg = self._prepare_benchmark_build_files()
-            if not ok:
-                return False, msg
-            
-            self.logger.info(f"Running make in {self.chisel_dir}...")
-            command = f"cd {self.chisel_dir} && make"
-            
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=300  # 5 minutes timeout
-            )
-            
-            output = result.stdout + "\n" + result.stderr
-            success = result.returncode == 0
-            
-            if success:
-                self.logger.info("Compilation successful")
-            else:
-                self.logger.warning(f"Compilation failed with return code {result.returncode}")
-            
-            return success, output
-        except subprocess.TimeoutExpired:
-            error_msg = "Compilation timeout (5 minutes)"
-            self.logger.error(error_msg)
-            return False, error_msg
-        except Exception as e:
-            error_msg = f"Compilation error: {str(e)}"
-            self.logger.error(error_msg)
-            return False, error_msg
-    
+        self.preflight_only = preflight_only
+        self.publish = publish
+
+        self.verilog2chisel_dir = self.workspace_dir / "verilog2chisel"
+        self.verilog_dir = self.verilog2chisel_dir / "verilog" / benchmark
+        self.chisel_dir = self.verilog2chisel_dir / "chisel" / benchmark
+        self.generated_dir = self.verilog2chisel_dir / "generated" / benchmark
+        self.extra_bench_dir = self.workspace_dir / "chisel" / "extra_bench" / benchmark
+        self.run_dir: Optional[Path] = None
+        self.input_summary: Dict[str, Any] = {}
+        self.compile_attempts_path: Optional[Path] = None
+
+        self.system_prompt = (
+            "You are an expert in VIS Verilog and Chisel formal translation. "
+            "Use only the provided tool."
+        )
+
     def convert(self) -> Dict[str, Any]:
-        """
-        Run the complete Verilog to Chisel conversion workflow using standard agent loop.
-        
-        Uses chat_with_tools with message history for iterative compilation error feedback.
-        
-        Returns:
-            Dictionary containing conversion results
-        """
-        self.logger.info(f"Starting Verilog to Chisel conversion workflow for benchmark: {self.benchmark}")
-        print(f"Starting Verilog to Chisel conversion workflow for benchmark: {self.benchmark}")
-        
-        # Step 1: Read Verilog files and instructions
-        verilog_files, instruction_files = self.read_verilog_files()
-        if not verilog_files:
-            return {
-                "success": False,
-                "error": f"No Verilog files found in verilog2chisel/verilog/{self.benchmark}/"
-            }
-        
-        print(f"Found {len(verilog_files)} Verilog file(s)")
-        if instruction_files:
-            print(f"Found {len(instruction_files)} instruction file(s)")
-            self.logger.info(f"Instruction files: {list(instruction_files.keys())}")
-        
-        # Build initial message history for agent loop
+        self._info(f"Starting Verilog2Chisel v2 workflow for {self.benchmark}")
+        preflight = V2CPreflight(
+            str(self.workspace_dir),
+            self.benchmark,
+            max_iterations=self.max_iterations,
+        )
+        preflight_result = preflight.run()
+        self.run_dir = preflight.run_dir
+        self.compile_attempts_path = self.run_dir / "compile_attempts.jsonl"
+        self._touch_run_logs()
+
+        if not preflight_result.get("success"):
+            return self._finish(
+                success=False,
+                iterations=0,
+                error_kind=preflight_result.get("error_kind", "preflight_failed"),
+                extra={"preflight_result": preflight_result},
+            )
+
+        self.input_summary = self._read_json(self.run_dir / "input_summary.json")
+        source_file = self.verilog_dir / self.input_summary["files"][0]["path"]
+        verilog_text = source_file.read_text(encoding="utf-8", errors="replace")
+
+        if self.preflight_only:
+            return self._finish(
+                success=True,
+                iterations=0,
+                extra={
+                    "preflight_only": True,
+                    "verilog_files": [source_file.name],
+                    "run_dir": str(self.run_dir),
+                },
+            )
+
+        self._clean_output_dirs()
+
+        prompt = build_v2c_conversion_prompt(
+            input_summary=self.input_summary,
+            verilog_text=verilog_text,
+            rules_text=load_vis_rules(),
+        )
+        leak = check_prompt_leak(prompt)
+        if not leak.success:
+            return self._finish(
+                success=False,
+                iterations=0,
+                error_kind="benchmark_specific_prompt_leak",
+                lint=leak,
+            )
+
         tool_schemas = get_verilog2chisel_tool_schemas()
-        user_prompt = self.build_conversion_prompt(verilog_files, instruction_files)
-        
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": prompt},
         ]
-        
-        # Agent loop with compilation retry
+        protocol_failures = 0
+
         for iteration in range(1, self.max_iterations + 1):
-            self.logger.info(f"=== Iteration {iteration}/{self.max_iterations} ===")
-            print(f"\n=== Iteration {iteration}/{self.max_iterations} ===")
-            
-            # Log request with full details
+            self._info(f"=== v2c iteration {iteration}/{self.max_iterations} ===")
             self._log_llm_request(iteration, messages, tool_schemas)
-            
-            try:
-                response = self.llm.chat_with_tools(
-                    messages=messages,
-                    tools=tool_schemas,
-                    temperature=0.3
-                )
-            except Exception as e:
-                self.logger.error(f"LLM API error: {e}")
-                return {
-                    "success": False,
-                    "error": f"LLM API error: {str(e)}"
-                }
-            
-            # Log response with full details
+            response = self._call_llm(messages, tool_schemas, iteration)
             self._log_llm_response(iteration, response)
-            
-            if response["type"] != "function_calls":
-                # Handle unexpected text response
-                text = response.get("content", "")
-                self.logger.warning(f"Got text response instead of function calls: {text[:500]}")
-                
-                # Add assistant text response to history and prompt for tool use
-                if text:
-                    messages.append({"role": "assistant", "content": text})
+
+            if response.get("type") != "function_calls":
+                protocol_failures += 1
+                if protocol_failures > 1:
+                    return self._finish(
+                        success=False,
+                        iterations=iteration,
+                        error_kind="tool_protocol_violation",
+                    )
                 messages.append({
                     "role": "user",
-                    "content": "ERROR: You must respond with tool calls only. Use the write_files tool to generate Chisel code."
+                    "content": "ERROR: respond only with the named write_files tool call.",
                 })
                 continue
-            
-            # Execute tool calls
-            function_calls = response["function_calls"]
+
+            function_calls = response.get("function_calls", [])
             raw_message = response.get("raw_message", {})
-            
-            # Add assistant message with tool_calls to history.
-            assistant_message = build_assistant_tool_call_message(
-                raw_message,
-                function_calls,
-            )
-            messages.append(assistant_message)
-            
-            # Execute actions and build tool result messages
-            stage_complete = False
-            current_iteration_files = {}
-            
-            for fc in function_calls:
-                action = convert_tool_call_to_action(fc)
-                result = execute_action(action, self.write_chisel_file)
-                
-                self.logger.info(f"Action result: {result.get('success')}")
-                
-                # Add tool result message to history
-                tool_message = {
-                    "role": "tool",
-                    "tool_call_id": fc["id"],
-                    "name": fc["name"],
-                    "content": json.dumps(result, ensure_ascii=False)
-                }
-                messages.append(tool_message)
-                
-                if not result["success"]:
-                    # Continue to let LLM see the error and retry
-                    self.logger.warning(f"Action failed: {result.get('error', 'Unknown error')}")
-                    continue
-                
-                # Collect generated files for potential error feedback
-                if "generated_files" in result:
-                    current_iteration_files.update(result["generated_files"])
-                
-                if result.get("stage_complete"):
-                    stage_complete = True
-                    print("Conversion complete.")
-            
-            if not stage_complete:
-                self.logger.warning("LLM did not set stage_complete=true")
-            
-            # Step 3: Compile Chisel code
-            print("Compiling Chisel code...")
-            compile_success, compile_output = self.run_make()
-            
-            if compile_success:
-                print("✓ Compilation successful!")
-                self.logger.info("Compilation successful")
-                
-                # Copy generated Chisel code to chisel/extra_bench/<benchmark>/
-                copy_success, copy_msg = self._copy_to_extra_bench()
-                if copy_success:
-                    print(f"✓ Copied Chisel code to extra_bench/{self.benchmark}/")
-                    self.logger.info(copy_msg)
-                else:
-                    print(f"⚠ Warning: {copy_msg}")
-                    self.logger.warning(copy_msg)
-                
-                return {
-                    "success": True,
-                    "iterations": iteration,
-                    "verilog_files": list(verilog_files.keys()),
-                    "compile_output": compile_output,
-                    "extra_bench_path": os.path.join(self.workspace_dir, "chisel", "extra_bench", self.benchmark)
-                }
-            else:
-                print(f"✗ Compilation failed (attempt {iteration}/{self.max_iterations})")
-                self.logger.warning(f"Compilation failed on iteration {iteration}")
-                self.logger.info(f"Compilation output:\n{compile_output}")
-                
-                # Save current iteration's generated files for error feedback
-                self.previous_chisel_files = current_iteration_files.copy()
-                self.logger.info(f"Saved {len(self.previous_chisel_files)} Chisel files for error feedback")
-                
-                # Prepare error for next iteration
-                error_lines = [line for line in compile_output.splitlines() if '[error]' in line.lower()]
-                compilation_error = '\n'.join(error_lines) if error_lines else compile_output
-                
-                # If this was the last iteration, return failure
+            messages.append(build_assistant_tool_call_message(raw_message, function_calls))
+
+            action_ok, stage_complete, tool_messages = self._execute_tool_calls(function_calls)
+            messages.extend(tool_messages)
+            if not action_ok:
                 if iteration == self.max_iterations:
-                    return {
-                        "success": False,
-                        "error": "Max iterations reached, compilation still failing",
-                        "compile_output": compile_output
-                    }
-                
-                # Add compilation error as user message for next iteration
-                error_message = self.build_compilation_error_message(
-                    compilation_error, 
-                    self.previous_chisel_files
-                )
+                    return self._finish(
+                        success=False,
+                        iterations=iteration,
+                        error_kind="incomplete_tool_output",
+                    )
                 messages.append({
                     "role": "user",
-                    "content": error_message
+                    "content": (
+                        "ERROR: the previous write_files call did not complete the stage. "
+                        "Write 1-3 safe .scala files, combine modules into fewer files if needed, "
+                        "and set stage_complete=true only when the complete translation is present."
+                    ),
                 })
-        
-        # Should not reach here
-        return {
-            "success": False,
-            "error": "Unexpected end of conversion loop"
-        }
-    
-    def _copy_to_extra_bench(self) -> Tuple[bool, str]:
-        """
-        Copy generated Chisel files to chisel/extra_bench/<benchmark>/ directory.
-        
-        This allows the generated code to be used by the formal verification workflow.
-        
-        Returns:
-            Tuple of (success, message)
-        """
-        try:
-            # Target directory: <workspace_dir>/chisel/extra_bench/<benchmark>/
-            extra_bench_dir = os.path.join(self.workspace_dir, "chisel", "extra_bench", self.benchmark)
-            
-            # Create target directory if it doesn't exist
-            os.makedirs(extra_bench_dir, exist_ok=True)
-            
-            # Copy all .scala files from self.chisel_dir to extra_bench_dir
-            scala_files = glob.glob(os.path.join(self.chisel_dir, "*.scala"))
-            copied_files = []
-            
-            for src_file in scala_files:
-                filename = os.path.basename(src_file)
-                dst_file = os.path.join(extra_bench_dir, filename)
-                shutil.copy2(src_file, dst_file)
-                copied_files.append(filename)
-                self.logger.info(f"Copied {filename} to extra_bench/{self.benchmark}/")
-            
-            if copied_files:
-                return True, f"Copied {len(copied_files)} files to extra_bench/{self.benchmark}/: {copied_files}"
-            else:
-                return False, f"No Scala files found in {self.chisel_dir}"
-            
-        except Exception as e:
-            error_msg = f"Failed to copy files to extra_bench: {str(e)}"
-            self.logger.error(error_msg)
-            return False, error_msg
-    
-    def _log_llm_request(self, iteration: int, messages: List[Dict[str, Any]], tool_schemas: List[Dict[str, Any]]) -> None:
-        """Log LLM API request details using LLMLogger utility."""
-        system_prompt = messages[0].get("content", "") if messages else ""
-        user_prompt = messages[1].get("content", "") if len(messages) > 1 else ""
-        dynamic_messages = messages[2:]
-        full_prompt = f"[System Prompt]\n{system_prompt}\n\n[User Prompt]\n{user_prompt}"
-        if dynamic_messages:
-            full_prompt += (
-                "\n\n[Dynamic Conversation Context]\n"
-                + LLMLogger._format_dynamic_messages(dynamic_messages)
+                continue
+            if not stage_complete:
+                self._info("write_files did not set stage_complete=true; continuing to local gates")
+
+            scala_files = sorted(self.chisel_dir.glob("*.scala"))
+            lint = lint_scala_sources(scala_files, self.input_summary)
+            if not lint.success:
+                if iteration == self.max_iterations:
+                    return self._finish(
+                        success=False,
+                        iterations=iteration,
+                        error_kind="local_lint_failed",
+                        lint=lint,
+                    )
+                messages.append({
+                    "role": "user",
+                    "content": self._build_repair_prompt([], lint.errors),
+                })
+                continue
+
+            compile_success, compile_output, returncode = self.run_make(iteration)
+            self._append_compile_attempt(iteration, compile_success, compile_output, returncode)
+            if not compile_success:
+                if iteration == self.max_iterations:
+                    return self._finish(
+                        success=False,
+                        iterations=iteration,
+                        error_kind="compile_failed",
+                        compile_output=compile_output,
+                        lint=lint,
+                    )
+                messages.append({
+                    "role": "user",
+                    "content": self._build_repair_prompt(
+                        self._extract_error_lines(compile_output),
+                        lint.errors,
+                    ),
+                })
+                continue
+
+            top_module = self._top_module_name()
+            generated = check_generated_verilog(self.generated_dir, top_module)
+            if not generated.success:
+                if iteration == self.max_iterations:
+                    return self._finish(
+                        success=False,
+                        iterations=iteration,
+                        error_kind="generated_verilog_failed",
+                        lint=lint,
+                        generated=generated,
+                    )
+                messages.append({
+                    "role": "user",
+                    "content": self._build_repair_prompt(generated.errors, lint.errors),
+                })
+                continue
+
+            publish_result = None
+            if self.publish:
+                publish_result = self._copy_to_extra_bench()
+                if not publish_result[0]:
+                    return self._finish(
+                        success=False,
+                        iterations=iteration,
+                        error_kind="publish_failed",
+                        lint=lint,
+                        generated=generated,
+                        extra={"publish_error": publish_result[1]},
+                    )
+
+            self._persist_success_artifacts()
+            return self._finish(
+                success=True,
+                iterations=iteration,
+                lint=lint,
+                generated=generated,
+                extra={
+                    "verilog_files": [source_file.name],
+                    "output_files": [path.name for path in scala_files],
+                    "published": bool(self.publish),
+                    "publish_message": publish_result[1] if publish_result else None,
+                },
             )
-        log_msg = LLMLogger.format_request(
-            full_prompt,
-            tool_schemas,
-            stage="Verilog2Chisel",
-            iteration=iteration,
-            include_details=(iteration == 1),
-            dynamic_messages=dynamic_messages,
+
+        return self._finish(
+            success=False,
+            iterations=self.max_iterations,
+            error_kind="max_iterations_reached",
         )
-        self.logger.info(log_msg)
-    
+
+    def write_chisel_file(self, file_path: str, content: str) -> Tuple[bool, str]:
+        if os.path.isabs(file_path) or ".." in Path(file_path).parts:
+            return False, f"Invalid file path: {file_path}"
+        full_path = self.chisel_dir / file_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        utils_write_file(str(full_path), content)
+        return True, f"Successfully wrote {file_path}"
+
+    def run_make(self, attempt: int) -> Tuple[bool, str, int]:
+        ok, msg = self._prepare_benchmark_build_files()
+        if not ok:
+            return False, msg, 1
+        self.generated_dir.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["make", f"BUILD_DIR={self.generated_dir}"],
+            cwd=str(self.chisel_dir),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        output = result.stdout + "\n" + result.stderr
+        return result.returncode == 0, output, result.returncode
+
+    def _prepare_benchmark_build_files(self) -> Tuple[bool, str]:
+        try:
+            for filename in ["build.sbt", "Makefile"]:
+                src_file = self.verilog2chisel_dir / filename
+                dest_file = self.chisel_dir / filename
+                if src_file.exists():
+                    shutil.copy2(src_file, dest_file)
+            return True, "Build files copied successfully"
+        except Exception as exc:
+            return False, f"Error copying build files: {exc}"
+
+    def _copy_to_extra_bench(self) -> Tuple[bool, str]:
+        try:
+            scala_files = sorted(self.chisel_dir.glob("*.scala"))
+            if not scala_files:
+                return False, f"No Scala files found in {self.chisel_dir}"
+            if self.extra_bench_dir.exists():
+                shutil.rmtree(self.extra_bench_dir)
+            self.extra_bench_dir.mkdir(parents=True, exist_ok=True)
+            for src_file in scala_files:
+                shutil.copy2(src_file, self.extra_bench_dir / src_file.name)
+            return True, f"Copied {len(scala_files)} files to {self.extra_bench_dir}"
+        except Exception as exc:
+            return False, f"Failed to publish: {exc}"
+
+    def _clean_output_dirs(self) -> None:
+        self.chisel_dir.mkdir(parents=True, exist_ok=True)
+        for path in self.chisel_dir.glob("*.scala"):
+            path.unlink()
+        if self.generated_dir.exists():
+            shutil.rmtree(self.generated_dir)
+        self.generated_dir.mkdir(parents=True, exist_ok=True)
+
+    def _persist_success_artifacts(self) -> None:
+        run_chisel_dir = self.run_dir / "chisel"
+        run_generated_dir = self.run_dir / "generated"
+        if run_chisel_dir.exists():
+            shutil.rmtree(run_chisel_dir)
+        if run_generated_dir.exists():
+            shutil.rmtree(run_generated_dir)
+        run_chisel_dir.mkdir(parents=True, exist_ok=True)
+        run_generated_dir.mkdir(parents=True, exist_ok=True)
+        for path in sorted(self.chisel_dir.glob("*.scala")):
+            shutil.copy2(path, run_chisel_dir / path.name)
+        for path in sorted(self.generated_dir.glob("*")):
+            if path.is_file():
+                shutil.copy2(path, run_generated_dir / path.name)
+
+    def _call_llm(
+        self,
+        messages: List[Dict[str, Any]],
+        tool_schemas: List[Dict[str, Any]],
+        iteration: int,
+    ) -> Dict[str, Any]:
+        request = {
+            "iteration": iteration,
+            "temperature": 0,
+            "tool_choice": {"type": "function", "function": {"name": "write_files"}},
+            "enable_thinking": False,
+            "parallel_tool_calls": False,
+            "max_tokens": 8192,
+        }
+        self._append_jsonl("model_requests.jsonl", request)
+        return self.llm.chat_with_tools(
+            messages=messages,
+            tools=tool_schemas,
+            max_tokens=8192,
+            temperature=0,
+            tool_choice={"type": "function", "function": {"name": "write_files"}},
+            enable_thinking=False,
+            parallel_tool_calls=False,
+        )
+
+    def _execute_tool_calls(
+        self,
+        function_calls: List[Dict[str, Any]],
+    ) -> Tuple[bool, bool, List[Dict[str, Any]]]:
+        action_ok = True
+        stage_complete = False
+        tool_messages: List[Dict[str, Any]] = []
+        for fc in function_calls:
+            action = convert_tool_call_to_action(fc)
+            result = execute_action(action, self.write_chisel_file)
+            action_ok = action_ok and bool(result.get("success"))
+            stage_complete = stage_complete or bool(result.get("stage_complete"))
+            self._append_jsonl("operations.jsonl", result)
+            tool_messages.append({
+                "role": "tool",
+                "tool_call_id": fc["id"],
+                "name": fc["name"],
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+        return action_ok, stage_complete, tool_messages
+
+    def _build_repair_prompt(self, error_lines: List[str], lint_errors: List[str]) -> str:
+        return build_v2c_repair_prompt(
+            error_lines=error_lines,
+            lint_errors=lint_errors,
+            scala_windows=self._scala_windows(),
+        )
+
+    def _scala_windows(self) -> Dict[str, str]:
+        windows: Dict[str, str] = {}
+        for path in sorted(self.chisel_dir.glob("*.scala")):
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            selected = set(range(min(40, len(lines))))
+            patterns = [
+                r"\b[A-Za-z_][A-Za-z0-9_]*\s*\([0-9]+\)\s*:=",
+                r"::\s*Nil\s*=\s*Enum\s*\(",
+                r"\b(?:LFSR|scala\.util\.Random|random\.LFSR)\b",
+                r"chisel3\.experimental\.verification",
+            ]
+            for index, line in enumerate(lines):
+                if any(re.search(pattern, line) for pattern in patterns):
+                    start = max(0, index - 8)
+                    end = min(len(lines), index + 9)
+                    selected.update(range(start, end))
+            numbered = [
+                f"{index + 1}: {lines[index]}"
+                for index in sorted(selected)[:140]
+            ]
+            windows[path.name] = "\n".join(numbered)
+        return windows
+
+    def _extract_error_lines(self, output: str) -> List[str]:
+        lines = [line for line in output.splitlines() if "[error]" in line.lower()]
+        return lines[:40] if lines else output.splitlines()[:40]
+
+    def _append_compile_attempt(
+        self,
+        attempt: int,
+        success: bool,
+        output: str,
+        returncode: int,
+    ) -> None:
+        self._append_jsonl(
+            "compile_attempts.jsonl",
+            {
+                "attempt": attempt,
+                "success": success,
+                "returncode": returncode,
+                "error_lines": self._extract_error_lines(output),
+                "stdout_chars": len(output),
+                "stderr_chars": 0,
+            },
+        )
+
+    def _finish(
+        self,
+        *,
+        success: bool,
+        iterations: int,
+        error_kind: Optional[str] = None,
+        compile_output: Optional[str] = None,
+        lint: Optional[Any] = None,
+        generated: Optional[Any] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        run_dir = self.run_dir or Path("")
+        scala_files = sorted(self.chisel_dir.glob("*.scala"))
+        input_files = [
+            item.get("path")
+            for item in self.input_summary.get("files", [])
+            if isinstance(item, dict)
+        ]
+        result = {
+            "schema_version": "v2c_stage_result.v1",
+            "target": self.benchmark,
+            "success": success,
+            "iterations": iterations,
+            "input_files": input_files,
+            "output_files": [path.name for path in scala_files],
+            "compile_success": bool(success and generated is not None),
+            "generated_verilog": getattr(generated, "generated_files", []),
+            "lint": getattr(lint, "counts", {}),
+            "artifacts": {
+                "manifest": "manifest.json",
+                "input_summary": "input_summary.json",
+                "prompt_bundle": "prompt_bundle.json",
+                "compile_attempts": "compile_attempts.jsonl",
+                "generated": "generated/",
+            },
+            "run_dir": str(run_dir),
+        }
+        if error_kind:
+            result["error_kind"] = error_kind
+        if compile_output:
+            result["compile_output"] = compile_output
+        if lint is not None:
+            result["lint_errors"] = getattr(lint, "errors", [])
+        if generated is not None:
+            result["generated_errors"] = getattr(generated, "errors", [])
+        if extra:
+            result.update(extra)
+
+        if self.run_dir:
+            lint_success = success if lint is None else not getattr(lint, "errors", [])
+            self._write_json(
+                "lint_result.json",
+                {
+                    "schema_version": "v2c_lint_result.v1",
+                    "success": lint_success,
+                    "errors": getattr(lint, "errors", []),
+                    "counts": getattr(lint, "counts", {}),
+                },
+            )
+            self._write_json("stage_result.json", result)
+            self._write_json(
+                "run_cost_summary.json",
+                {
+                    "schema_version": "v2c_run_cost_summary.v1",
+                    "target": self.benchmark,
+                    "iterations": iterations,
+                    "model_requests": self._count_jsonl("model_requests.jsonl"),
+                },
+            )
+        return result
+
+    def _top_module_name(self) -> str:
+        files = self.input_summary.get("files", [])
+        if files and files[0].get("modules"):
+            return files[0]["modules"][0]
+        return "Main"
+
+    def _touch_run_logs(self) -> None:
+        for filename in [
+            "operations.jsonl",
+            "model_requests.jsonl",
+            "model_responses.jsonl",
+            "compile_attempts.jsonl",
+        ]:
+            (self.run_dir / filename).touch()
+
+    def _append_jsonl(self, filename: str, data: Dict[str, Any]) -> None:
+        path = self.run_dir / filename
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(data, ensure_ascii=False, default=str) + "\n")
+
+    def _write_json(self, filename: str, data: Dict[str, Any]) -> None:
+        (self.run_dir / filename).write_text(
+            json.dumps(data, indent=2, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
+
+    def _read_json(self, path: Path) -> Dict[str, Any]:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _count_jsonl(self, filename: str) -> int:
+        path = self.run_dir / filename
+        if not path.exists():
+            return 0
+        return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+
+    def _log_llm_request(
+        self,
+        iteration: int,
+        messages: List[Dict[str, Any]],
+        tool_schemas: List[Dict[str, Any]],
+    ) -> None:
+        try:
+            log_msg = LLMLogger.format_request(
+                messages[-1].get("content", ""),
+                tool_schemas,
+                stage="Verilog2Chisel",
+                iteration=iteration,
+                include_details=(iteration == 1),
+            )
+            self.logger.info(log_msg)
+        except Exception:
+            self.logger.info("Failed to format v2c LLM request log")
+
     def _log_llm_response(self, iteration: int, response: Dict[str, Any]) -> None:
-        """Log LLM API response details using LLMLogger utility."""
-        log_msg = LLMLogger.format_response(
-            response, stage="Verilog2Chisel", iteration=iteration, truncate_content=False
-        )
-        self.logger.info(log_msg)
+        self._append_jsonl("model_responses.jsonl", {"iteration": iteration, "response": response})
+        try:
+            log_msg = LLMLogger.format_response(
+                response,
+                stage="Verilog2Chisel",
+                iteration=iteration,
+                truncate_content=False,
+            )
+            self.logger.info(log_msg)
+        except Exception:
+            self.logger.info("Failed to format v2c LLM response log")
+
+    def _info(self, message: str) -> None:
+        self.logger.info(message)
+        print(message)

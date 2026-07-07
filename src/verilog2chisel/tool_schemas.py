@@ -18,7 +18,7 @@ def get_verilog2chisel_tool_schemas() -> List[Dict[str, Any]]:
             "name": "write_files",
             "description": (
                 "Write Chisel files to the chisel directory. "
-                "Each Verilog file should be converted to a corresponding Chisel file. "
+                "Write at most 3 Scala files; combine multiple modules when needed. "
                 "The generated Chisel code should be syntactically correct and compilable."
             ),
             "parameters": {
@@ -26,15 +26,18 @@ def get_verilog2chisel_tool_schemas() -> List[Dict[str, Any]]:
                 "properties": {
                     "files": {
                         "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
                         "items": {
                             "type": "object",
                             "properties": {
                                 "file_path": {
                                     "type": "string",
-                                    "description": "Relative path under chisel/ directory (e.g., 'Zero.scala' for zero module)"
+                                    "description": "Relative .scala path under chisel/ directory (e.g., 'Zero.scala')"
                                 },
                                 "content": {
                                     "type": "string",
+                                    "maxLength": 80000,
                                     "description": "Complete Scala/Chisel source code"
                                 }
                             },
@@ -48,7 +51,7 @@ def get_verilog2chisel_tool_schemas() -> List[Dict[str, Any]]:
                         "default": False
                     }
                 },
-                "required": ["files"]
+                "required": ["files", "stage_complete"]
             }
         }
     ]

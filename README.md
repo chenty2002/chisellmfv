@@ -366,30 +366,55 @@ reports/jg/<case-id>/quality_record.json
 
 ## Verilog-To-Chisel Conversion
 
-Place Verilog inputs under `verilog2chisel/verilog/<target>/`:
+Place exactly one Verilog/SystemVerilog source under
+`verilog2chisel/verilog/<target>/`:
 
 ```bash
 mkdir -p verilog2chisel/verilog/mydesign
 cp my_design.v verilog2chisel/verilog/mydesign/
 ```
 
-Convert with compile-error feedback:
+Sidecar files such as `label.txt` may exist in the target directory, but v2c
+does not send them to the model. Conversion is source-only: it uses the
+`.v/.sv` text, deterministic source facts, and the generic VIS conversion
+rules in `src/verilog2chisel/context_assets/vis_conversion_rules.md`.
+
+Run preflight without an LLM call:
 
 ```bash
 .venv/bin/python main.py v2c \
   --target mydesign \
-  --max-iterations 5
+  --preflight-only
+```
+
+Convert with bounded repair and publish only after local gates pass:
+
+```bash
+CHISELLMFV_LLM_MODEL=deepseek-v4-pro \
+CHISELLMFV_LLM_EXTRA_BODY='{"thinking":{"type":"disabled"}}' \
+.venv/bin/python main.py v2c \
+  --target mydesign \
+  --max-iterations 5 \
+  --publish
 ```
 
 Successful conversion writes:
 
 ```text
+verilog2chisel/runs/<timestamp>-<target>/
 verilog2chisel/chisel/mydesign/
 verilog2chisel/generated/mydesign/
-chisel/extra_bench/mydesign/
+chisel/extra_bench/mydesign/          # only with --publish
 ```
 
-The converted target can then be checked through the legacy formal workflow:
+Each run directory records `manifest.json`, `input_summary.json`,
+`prompt_bundle.json`, `operations.jsonl`, `model_requests.jsonl`,
+`model_responses.jsonl`, `compile_attempts.jsonl`, `lint_result.json`,
+`stage_result.json`, `run_cost_summary.json`, plus successful `chisel/` and
+`generated/` snapshots.
+
+The converted target can then be checked through the legacy formal workflow
+after publishing:
 
 ```bash
 .venv/bin/python main.py formal --full --target mydesign
