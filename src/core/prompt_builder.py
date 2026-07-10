@@ -213,6 +213,16 @@ def build_user_prompt(
             json.dumps(stage_inputs, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             "```",
         ])
+    v2c = env.get("v2c")
+    if isinstance(v2c, dict):
+        sections.extend([
+            "",
+            "## V2C Translation Contract",
+            "If present, this contract is authoritative for source-only translation readiness. A readiness failure is an environment problem, not a design bug.",
+            "```json",
+            json.dumps(v2c, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            "```",
+        ])
     sections.extend(["", "---", ""])
 
     # Waveform metadata for waveform_explanation stage

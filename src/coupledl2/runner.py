@@ -97,7 +97,11 @@ class CoupledL2Runner:
 
         for current_stage in stages:
             self._validate_predecessor(current_stage)
-            if current_stage == "bind_properties":
+            v2c_block = self._v2c_readiness_block(current_stage)
+            if v2c_block is not None:
+                result = {"success": False, "stage_result": v2c_block}
+                self._write_stage_failure(current_stage, v2c_block)
+            elif current_stage == "bind_properties":
                 result = BindingStage(
                     self.workspace,
                     CoupledL2BuildOperations(self.workspace, self.logger),
@@ -280,6 +284,40 @@ class CoupledL2Runner:
         if payload.get("stage") != stage:
             raise ValueError(f"invalid {stage} stage result")
         return payload
+
+    def _v2c_readiness_block(self, stage: str) -> Optional[Dict[str, Any]]:
+        if stage != "bind_properties":
+            return None
+        path = self.workspace.case_workspace / "formal_readiness.json"
+        if not path.is_file():
+            return None
+        readiness = json.loads(path.read_text(encoding="utf-8"))
+        if readiness.get("ready") is not False:
+            return None
+        return {
+            "schema_version": "stage_result.v2",
+            "stage": stage,
+            "success": False,
+            "termination_reason": "invalid_v2c_environment",
+            "error_kind": "invalid_v2c_environment",
+            "summary": "V2C formal readiness failed before property binding.",
+            "invalid_v2c_environment": True,
+            "blocking_issues": readiness.get("blocking_issues", []),
+            "formal_readiness": "formal_readiness.json",
+        }
+
+    def _write_stage_failure(self, stage: str, stage_result: Dict[str, Any]) -> None:
+        path = self._handoff_path(stage)
+        _write_json(path.with_name("stage_result.json"), stage_result)
+        _write_json(
+            path,
+            {
+                "schema_version": "stage_handoff.v1",
+                "stage": stage,
+                "success": False,
+                "error_kind": stage_result.get("error_kind"),
+            },
+        )
 
     def _bind_state_to_handoff(self, stage: str, state: Dict[str, Any]) -> None:
         path = self._handoff_path(stage)

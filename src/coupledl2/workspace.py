@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from .config import CoupledL2RunConfig
 from .file_policy import ignored_copy_entry
-from .property_catalog import load_property_profile, public_catalog
+from .property_catalog import PropertyCatalog, load_property_profile, public_catalog
 from .prompt_context import build_prompt_bundle
 from .skills import install_context_assets, stage_rule_paths, stage_skill_paths
 from .stages import COUPLEDL2_STAGES, STAGE_SPECS, get_stage_spec
@@ -21,6 +21,7 @@ from .stages import COUPLEDL2_STAGES, STAGE_SPECS, get_stage_spec
 
 STAGE_INPUTS_SCHEMA_VERSION = "stage_inputs.v1"
 MANIFEST_SCHEMA_VERSION = "coupledl2_run_manifest.v2"
+PROTOCOL_ASSET_ROOT = Path(__file__).with_name("protocol_assets") / "tilelink"
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,7 @@ def load_coupledl2_workspace(run_dir: Path) -> CoupledL2Workspace:
     expected_case = Path(manifest["workspace_case_path"]).resolve()
     if case_workspace.resolve() != expected_case or not case_workspace.is_dir():
         raise ValueError("manifest workspace path does not match the resume run directory")
+    install_context_assets(workspace_dir)
     return CoupledL2Workspace(
         run_dir=run_dir,
         workspace_dir=workspace_dir,
@@ -248,7 +250,12 @@ def _build_manifest(
 
 def _load_stage_indexes(indexes_dir: Path, stage: str) -> Dict[str, Dict[str, Any]]:
     required = {
-        "bind_properties": ["build_contract", "formal_surface"],
+        "bind_properties": [
+            "build_contract",
+            "formal_surface",
+            "tl_signal_index",
+            "observer_index",
+        ],
         "invoke_verification": ["build_contract", "formal_surface"],
         "waveform_explanation": ["build_contract", "formal_surface"],
         "propose_bugfix": ["build_contract", "formal_surface"],
@@ -317,6 +324,8 @@ def _build_stage_inputs(
             ],
         }
         payload["formal_surface_summary"] = _formal_surface_summary(formal_surface)
+        payload["tilelink_index_summary"] = _tilelink_index_summary(context_indexes)
+        payload["protocol_evidence"] = build_protocol_evidence(catalog)
         payload["preflight_gate"] = {
             key: preflight_result.get("gate", {}).get(key)
             for key in (
@@ -361,6 +370,11 @@ def _build_stage_inputs(
                                 ),
                                 "template_id": prop.get("template_id"),
                                 "base_label": prop.get("base_label"),
+                                "source": prop.get("source"),
+                                "protocol_rule": prop.get("protocol_rule"),
+                                "binding_manifest_path": prop.get(
+                                    "binding_manifest_path"
+                                ),
                                 "bindings": instance.get("bindings"),
                                 "parameters": instance.get("parameters"),
                                 "rtl_label": result.get("rtl_label"),
@@ -374,6 +388,60 @@ def _build_stage_inputs(
                         )
             payload["failed_property_traces"] = failed
     return payload
+
+
+def build_protocol_evidence(catalog: PropertyCatalog) -> Dict[str, Any]:
+    """Return bounded protocol evidence for protocol-sourced schemas."""
+    protocol_sources = [
+        (schema_id, schema["source"])
+        for schema_id, schema in sorted(catalog.schemas.items())
+        if schema.get("source", {}).get("kind") == "protocol_requirement"
+    ]
+    if not protocol_sources:
+        return {
+            "schema_version": "protocol_evidence.v1",
+            "document": None,
+            "source_sha256": None,
+            "rules": [],
+        }
+
+    rules_path = PROTOCOL_ASSET_ROOT / "rules.json"
+    if not rules_path.is_file():
+        raise ValueError(f"protocol evidence rules not found: {rules_path}")
+    rules_index = json.loads(rules_path.read_text(encoding="utf-8"))
+    if rules_index.get("schema_version") != "tilelink_rule_index.v1":
+        raise ValueError("unsupported protocol rule index schema")
+    source_sha256 = rules_index.get("source_sha256")
+    evidence: List[Dict[str, Any]] = []
+    for schema_id, source in protocol_sources:
+        matches = [
+            rule
+            for rule in rules_index.get("rules", [])
+            if rule.get("document") == source["document"]
+            and rule.get("locator") == source["locator"]
+            and schema_id in rule.get("candidate_schema_ids", [])
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "protocol evidence not found for "
+                f"{schema_id} at {source['document']} {source['locator']}"
+            )
+        rule = matches[0]
+        statement = str(rule.get("statement", ""))
+        evidence.append(
+            {
+                "rule_id": rule["rule_id"],
+                "locator": rule["locator"],
+                "statement": statement[:220],
+                "source_sha256": source_sha256,
+            }
+        )
+    return {
+        "schema_version": "protocol_evidence.v1",
+        "document": rules_index.get("document_id"),
+        "source_sha256": source_sha256,
+        "rules": evidence[:3],
+    }
 
 
 def _load_previous_handoffs(workspace: CoupledL2Workspace, stage: str) -> List[Dict[str, Any]]:
@@ -411,6 +479,29 @@ def _formal_surface_summary(formal_surface: Dict[str, Any]) -> Dict[str, Any]:
         "uses_chiselfv": formal_surface.get("uses_chiselfv"),
         "uses_boring_utils": formal_surface.get("uses_boring_utils"),
         "uses_ltl": formal_surface.get("uses_ltl"),
+    }
+
+
+def _tilelink_index_summary(context_indexes: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    tl_index = context_indexes.get("tl_signal_index", {})
+    observer_index = context_indexes.get("observer_index", {})
+    tl_candidates = tl_index.get("candidates", [])
+    observer_candidates = observer_index.get("candidates", [])
+    top_candidate_ids = [
+        item["candidate_id"]
+        for item in observer_candidates[:4] + tl_candidates[:8]
+        if "candidate_id" in item
+    ]
+    module_counts: Dict[str, int] = {}
+    for source in (tl_index.get("module_counts", {}), observer_index.get("module_counts", {})):
+        for module, count in source.items():
+            module_counts[module] = module_counts.get(module, 0) + int(count)
+    return {
+        "tl_signal_candidate_count": int(tl_index.get("candidate_count", 0)),
+        "observer_candidate_count": int(observer_index.get("candidate_count", 0)),
+        "channels": tl_index.get("channels", []),
+        "module_counts": dict(sorted(module_counts.items())),
+        "top_candidate_ids": top_candidate_ids[:12],
     }
 
 

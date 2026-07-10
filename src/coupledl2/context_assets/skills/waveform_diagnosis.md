@@ -1,7 +1,7 @@
 # Waveform Diagnosis
 
-Classify each counterexample as DUT bug, assertion error, harness/setup error,
-or inconclusive. Tie each conclusion to concrete trace or source evidence.
+Classify each counterexample using exactly one workflow category and tie each
+conclusion to concrete trace, property, binding, or source evidence.
 
 ## Evidence Order
 
@@ -17,13 +17,22 @@ or inconclusive. Tie each conclusion to concrete trace or source evidence.
 
 ## Classification
 
-- `dut_bug`: the original design logic violates a valid property.
-- `assertion_error`: the property is wrong, over-constrained, has bad timing, or
-  samples the wrong signal.
-- `setup_error`: the harness, reset, assumptions, or verification environment
-  creates an unrealistic or invalid trace.
+- `design_bug`: the original design logic violates a valid property.
+- `property_schema_error`: the protocol/property meaning, trigger, expectation,
+  bound, or required preconditions are wrong.
+- `template_error`: the repository-owned assertion template has incorrect timing
+  or assertion semantics.
+- `binding_error`: the selected observation point samples the wrong design state
+  or does not implement the declared schema slots.
+- `environment_error`: the harness or formal setup creates an unrealistic or
+  invalid trace.
+- `assumption_error`: a missing, incorrect, or contradictory assumption is the
+  direct cause.
 - `inconclusive`: evidence is insufficient or the solver result cannot support a
   stronger claim.
+
+Only `design_bug` permits Stage 5 design repair. Every other classification must
+identify the asset or environment layer that should be revised.
 
 ## Signal Lookup Rules
 

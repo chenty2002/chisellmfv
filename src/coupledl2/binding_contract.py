@@ -9,7 +9,7 @@ from typing import Any, Dict
 from .property_catalog import PropertyCatalog
 
 
-BASE_LABEL_RE = re.compile(r"^CL2_[A-Z0-9_]{1,80}$")
+BASE_LABEL_RE = re.compile(r"^(?:CL2|TL)_[A-Z0-9_]{1,80}$")
 PATCH_OPERATIONS = {"replace_binding", "replace_parameter", "replace_template"}
 REPAIRABLE_ERROR_KINDS = {
     "candidate_incompatible",
@@ -110,7 +110,7 @@ def binding_manifest_tool(catalog: PropertyCatalog) -> Dict[str, Any]:
                             "parameters": {"type": "object"},
                             "base_label": {
                                 "type": "string",
-                                "pattern": r"^CL2_[A-Z0-9_]{1,80}$",
+                                "pattern": r"^(?:CL2|TL)_[A-Z0-9_]{1,80}$",
                             },
                             "evidence": {
                                 "type": "array",
@@ -222,7 +222,7 @@ def validate_binding_manifest(
     _equal(target["file_id"], catalog.profile["target"]["file_id"], "$.instances[0].target.file_id")
     _equal(target["marker_id"], catalog.profile["target"]["marker_id"], "$.instances[0].target.marker_id")
     if not isinstance(instance["base_label"], str) or not BASE_LABEL_RE.fullmatch(instance["base_label"]):
-        raise BindingContractError("$.instances[0].base_label", "invalid_value", "invalid CL2 base label")
+        raise BindingContractError("$.instances[0].base_label", "invalid_value", "invalid CL2/TL base label")
 
     bindings = instance["bindings"]
     if not isinstance(bindings, dict) or set(bindings) != set(template["slots"]):

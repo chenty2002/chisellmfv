@@ -10,7 +10,7 @@ from typing import Dict, Sequence
 from .property_catalog import PropertyCatalog
 
 
-CONCRETE_LABEL_RE = re.compile(r"\bCL2_[A-Z0-9_]+__E\d+\b")
+CONCRETE_LABEL_RE = re.compile(r"\b(?:CL2|TL)_[A-Z0-9_]+__E\d+\b")
 ASSERT_RE = re.compile(
     r"^(?P<indent>\s*)(?:(?P<label>[A-Za-z_][A-Za-z0-9_$]*)\s*:\s*)?"
     r"(?P<body>assert\s*(?:property\s*)?\()",
@@ -90,7 +90,7 @@ def label_rtl_properties(
             occurrences.append((path, index, label_line, existing_label))
 
     if existing:
-        raise RTLPropertyLabelError("generated RTL contains baseline or duplicate CL2 labels")
+        raise RTLPropertyLabelError("generated RTL contains baseline or duplicate CL2/TL labels")
     minimum = int(match_contract["minimum_occurrences"])
     if len(occurrences) < minimum:
         raise RTLPropertyLabelError("no matching generated RTL properties")

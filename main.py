@@ -630,7 +630,7 @@ def get_default_query(stage: Optional[str] = None, target: str = "gigamax") -> s
     )
 
 
-def parse_args():
+def parse_args(argv=None):
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
         description="ChiselLMFV - LLM 驱动的 Chisel 形式化验证工具",
@@ -741,8 +741,9 @@ def parse_args():
     run_parser.add_argument('--input-mode', type=str, default='coupledl2asl1',
                             choices=['coupledl2asl1'],
                             help='VERIFY_INPUT_MODE（默认: coupledl2asl1）')
+    from src.coupledl2.config import list_property_profiles
     run_parser.add_argument('--property-profile', type=str, default=None,
-                            choices=['write_read_poc', 'mshr_wait_bound_poc'],
+                            choices=list_property_profiles(),
                             help='新建 run 使用的 repository-owned property profile')
     run_parser.add_argument('--run-root', type=str, default='runs',
                             help='run workspace 根目录（默认: runs）')
@@ -760,7 +761,7 @@ def parse_args():
     run_parser.add_argument('--max-repair-rounds', type=int, default=3,
                             help='stage 5 repair-regression loop 最大轮数（默认: 3）')
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main():

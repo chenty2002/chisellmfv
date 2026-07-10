@@ -65,48 +65,69 @@ def prepare_profile_surface(
     if not target_path.is_file():
         raise PropertySurfaceError(f"profile target not found: {target['relative_path']}")
     original = target_path.read_text(encoding="utf-8")
-    marker = target["marker_text"]
-    marker_after = target["marker_after"]
-    if original.count(marker):
-        raise PropertySurfaceError("profile marker already exists")
-    if original.count(marker_after) != 1:
-        raise PropertySurfaceError("marker selector must match exactly once")
-    cleanup = target["cleanup_region"]
-    if cleanup is not None:
-        if original.count(cleanup["start_text"]) != 1:
-            raise PropertySurfaceError("cleanup start selector must match exactly once")
-        start = original.index(cleanup["start_text"])
-        if original.find(cleanup["block_start_text"], start) < 0:
-            raise PropertySurfaceError("cleanup block selector not found")
-        if original.count(cleanup["block_start_text"], start) != 1:
-            raise PropertySurfaceError("cleanup block selector must match exactly once")
+    _validate_marker_target(case_workspace, target, "profile target")
+    for index, source_target in enumerate(catalog.profile.get("source_targets", [])):
+        _validate_marker_target(case_workspace, source_target, f"profile source target {index}")
     _validate_candidate_provenance(case_workspace, catalog)
 
     cleanup_result = clean_formal_surface(case_workspace)
     if not cleanup_result["success"]:
         raise PropertySurfaceError("generic formal-surface cleanup failed")
     updated = target_path.read_text(encoding="utf-8")
+    updated = _install_marker(updated, target)
+    target_path.write_text(updated, encoding="utf-8")
+    for source_target in catalog.profile.get("source_targets", []):
+        source_path = case_workspace / source_target["relative_path"]
+        source_text = source_path.read_text(encoding="utf-8")
+        source_path.write_text(_install_marker(source_text, source_target), encoding="utf-8")
+    return PreparedPropertySurface(
+        target_path=target_path,
+        marker_text=target["marker_text"],
+        sha256_before=hashlib.sha256(original.encode("utf-8")).hexdigest(),
+        sha256_after=hashlib.sha256(updated.encode("utf-8")).hexdigest(),
+    )
+
+
+def _validate_marker_target(case_workspace: Path, target: Dict[str, Any], label: str) -> None:
+    target_path = case_workspace / target["relative_path"]
+    if not target_path.is_file():
+        raise PropertySurfaceError(f"{label} not found: {target['relative_path']}")
+    original = target_path.read_text(encoding="utf-8")
+    marker = target["marker_text"]
+    marker_after = target["marker_after"]
+    if original.count(marker):
+        raise PropertySurfaceError(f"{label} marker already exists")
+    if original.count(marker_after) != 1:
+        raise PropertySurfaceError(f"{label} marker selector must match exactly once")
+    cleanup = target["cleanup_region"]
     if cleanup is not None:
-        updated = _remove_profile_cleanup_region(updated, cleanup)
-    if updated.count(marker_after) != 1:
+        if original.count(cleanup["start_text"]) != 1:
+            raise PropertySurfaceError(f"{label} cleanup start selector must match exactly once")
+        start = original.index(cleanup["start_text"])
+        if original.find(cleanup["block_start_text"], start) < 0:
+            raise PropertySurfaceError(f"{label} cleanup block selector not found")
+        if original.count(cleanup["block_start_text"], start) != 1:
+            raise PropertySurfaceError(f"{label} cleanup block selector must match exactly once")
+
+
+def _install_marker(text: str, target: Dict[str, Any]) -> str:
+    cleanup = target["cleanup_region"]
+    if cleanup is not None:
+        text = _remove_profile_cleanup_region(text, cleanup)
+    marker = target["marker_text"]
+    marker_after = target["marker_after"]
+    if text.count(marker_after) != 1:
         raise PropertySurfaceError("marker selector changed during cleanup")
-    lines = updated.splitlines(keepends=True)
+    lines = text.splitlines(keepends=True)
     selector_line = next(
         index for index, line in enumerate(lines) if marker_after in line
     )
     indent = re.match(r"\s*", lines[selector_line]).group(0)
-    marker_line = f"{indent}{marker}\n"
-    lines.insert(selector_line + 1, marker_line)
+    lines.insert(selector_line + 1, f"{indent}{marker}\n")
     updated = "".join(lines)
     if updated.count(marker) != 1:
         raise PropertySurfaceError("profile marker installation is not unique")
-    target_path.write_text(updated, encoding="utf-8")
-    return PreparedPropertySurface(
-        target_path=target_path,
-        marker_text=marker,
-        sha256_before=hashlib.sha256(original.encode("utf-8")).hexdigest(),
-        sha256_after=hashlib.sha256(updated.encode("utf-8")).hexdigest(),
-    )
+    return updated
 
 
 def _validate_candidate_provenance(

@@ -138,7 +138,7 @@ def _source_manifest(case_workspace: Path) -> Dict[str, Any]:
 
 def _scan_generated_assertions(paths: Iterable[str]) -> Dict[str, Any]:
     records = []
-    cl2_labels = []
+    property_labels = []
     pattern = re.compile(
         r"(?:\bassert\s*(?:property)?\s*\(|\$assert\b|"
         r"\$(?:error|fatal)\s*\(\s*\"Assertion failed)"
@@ -150,16 +150,16 @@ def _scan_generated_assertions(paths: Iterable[str]) -> Dict[str, Any]:
         for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
             if pattern.search(line.split("//", 1)[0]):
                 records.append({"path": str(path), "line": line_no, "text": line.strip()})
-            for label in re.findall(r"\bCL2_[A-Z0-9_]+\b", line):
-                cl2_labels.append(
+            for label in re.findall(r"\b(?:CL2|TL)_[A-Z0-9_]+\b", line):
+                property_labels.append(
                     {"path": str(path), "line": line_no, "label": label}
                 )
     return {
         "schema_version": "generated_assertion_scan.v1",
         "assertion_count": len(records),
         "assertions": records,
-        "cl2_label_count": len(cl2_labels),
-        "cl2_labels": cl2_labels,
+        "cl2_label_count": len(property_labels),
+        "cl2_labels": property_labels,
     }
 
 

@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 
 ASSET_ROOT = Path(__file__).with_name("property_assets")
@@ -71,25 +71,18 @@ def load_property_profile(profile_id: str) -> PropertyCatalog:
     )
 
 
+def list_property_profiles() -> List[str]:
+    """Return repository-owned property profile IDs discovered from assets."""
+    return sorted(path.stem for path in (ASSET_ROOT / "profiles").glob("*.json"))
+
+
 def public_catalog(catalog: PropertyCatalog) -> Dict[str, Any]:
     """Return the model-visible catalog without template bodies or expressions."""
     return {
         "schema_version": "property_catalog_view.v1",
         "property_profile_id": catalog.profile["property_profile_id"],
         "schemas": list(catalog.schemas.values()),
-        "templates": [
-            {
-                key: template[key]
-                for key in (
-                    "template_id",
-                    "chisel_family",
-                    "property_schema_ids",
-                    "slots",
-                    "parameters",
-                )
-            }
-            for template in catalog.templates.values()
-        ],
+        "templates": [_public_template(template) for template in catalog.templates.values()],
         "candidates": [
             {
                 key: candidate[key]
@@ -101,7 +94,26 @@ def public_catalog(catalog: PropertyCatalog) -> Dict[str, Any]:
             key: catalog.profile["target"][key]
             for key in ("file_id", "marker_id")
         },
+        "source_targets": [
+            {key: item[key] for key in ("file_id", "marker_id")}
+            for item in catalog.profile.get("source_targets", [])
+        ],
     }
+
+
+def _public_template(template: Dict[str, Any]) -> Dict[str, Any]:
+    keys = (
+        "template_id",
+        "chisel_family",
+        "property_schema_ids",
+        "slots",
+        "parameters",
+        "api_family",
+        "api_primitive",
+        "semantic_shape",
+        "requires_formal_mixin",
+    )
+    return {key: template[key] for key in keys if key in template}
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -158,13 +170,31 @@ def _validate_template(value: Dict[str, Any]) -> None:
     fields = {
         "schema_version", "template_id", "chisel_family",
         "property_schema_ids", "slots", "parameters", "fragments", "rtl_match",
+        "api_family", "api_primitive", "semantic_shape", "requires_formal_mixin",
+        "allowed_profile_ids",
     }
-    _exact_fields(value, fields, fields, "assertion_template")
+    required = fields - {
+        "api_family", "api_primitive", "semantic_shape", "requires_formal_mixin",
+        "allowed_profile_ids",
+    }
+    _exact_fields(value, fields, required, "assertion_template")
     if value["schema_version"] != "assertion_template.v1":
         raise PropertyCatalogError("unsupported assertion template version")
+    if "requires_formal_mixin" in value and not isinstance(value["requires_formal_mixin"], bool):
+        raise PropertyCatalogError("requires_formal_mixin must be boolean")
+    for key in ("api_family", "api_primitive", "semantic_shape"):
+        if key in value and (not isinstance(value[key], str) or not value[key]):
+            raise PropertyCatalogError(f"{key} must be a non-empty string")
+    if "allowed_profile_ids" in value:
+        if (
+            not isinstance(value["allowed_profile_ids"], list)
+            or not value["allowed_profile_ids"]
+            or not all(isinstance(item, str) and item for item in value["allowed_profile_ids"])
+        ):
+            raise PropertyCatalogError("allowed_profile_ids must be a non-empty string list")
     _exact_fields(
         value["fragments"],
-        {"support_block", "assertion_block"},
+        {"support_block", "assertion_block", "source_block"},
         {"support_block", "assertion_block"},
         "assertion_template.fragments",
     )
@@ -192,15 +222,21 @@ def _validate_template(value: Dict[str, Any]) -> None:
     support = value["fragments"]["support_block"]
     if support and support.count("{{ASSERTION_BLOCK}}") != 1:
         raise PropertyCatalogError("support block must contain one ASSERTION_BLOCK placeholder")
+    source = value["fragments"].get("source_block", "")
+    source_placeholders = set(PLACEHOLDER_RE.findall(source))
+    allowed_source = allowed | {"source_label"}
+    if source_placeholders - allowed_source:
+        raise PropertyCatalogError("source block has undeclared placeholders")
 
 
 def _validate_profile(value: Dict[str, Any], requested_id: str) -> None:
     fields = {
         "schema_version", "property_profile_id", "case_name", "chisel_family",
         "property_schema_ids", "template_ids", "build", "target",
-        "binding_candidates",
+        "source_targets", "binding_candidates",
     }
-    _exact_fields(value, fields, fields, "property_profile")
+    required = fields - {"source_targets"}
+    _exact_fields(value, fields, required, "property_profile")
     if value["schema_version"] != "property_profile.v1":
         raise PropertyCatalogError("unsupported property profile version")
     if value["property_profile_id"] != requested_id:
@@ -237,6 +273,21 @@ def _validate_profile(value: Dict[str, Any], requested_id: str) -> None:
             },
             "property_profile.target.cleanup_region",
         )
+    for index, source_target in enumerate(value.get("source_targets", [])):
+        _exact_fields(
+            source_target,
+            {
+                "file_id", "relative_path", "cleanup_region", "marker_id",
+                "marker_text", "marker_after",
+            },
+            {
+                "file_id", "relative_path", "cleanup_region", "marker_id",
+                "marker_text", "marker_after",
+            },
+            f"property_profile.source_targets[{index}]",
+        )
+        if source_target["cleanup_region"] is not None:
+            raise PropertyCatalogError("source target cleanup regions are not supported")
     for item in value["binding_candidates"]:
         _exact_fields(
             item,
@@ -282,6 +333,12 @@ def _validate_cross_references(
             template = templates[template_id]
             if schema["property_schema_id"] not in template["property_schema_ids"]:
                 raise PropertyCatalogError("schema/template cross reference mismatch")
+            allowed_profile_ids = template.get("allowed_profile_ids")
+            if (
+                allowed_profile_ids is not None
+                and profile["property_profile_id"] not in allowed_profile_ids
+            ):
+                raise PropertyCatalogError("template is not allowed for this profile")
             expected = schema["required_slots"]
             actual = {
                 name: definition["type"]

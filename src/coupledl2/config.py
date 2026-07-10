@@ -5,11 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .property_catalog import load_property_profile
+from .property_catalog import list_property_profiles, load_property_profile
 
 VALID_VERIFY_MODES = {"small"}
 VALID_INPUT_MODES = {"coupledl2asl1"}
-VALID_PROPERTY_PROFILES = {"write_read_poc", "mshr_wait_bound_poc"}
+VALID_PROPERTY_PROFILES = set(list_property_profiles())
 
 
 @dataclass(frozen=True)
@@ -33,9 +33,10 @@ class CoupledL2RunConfig:
             raise ValueError(f"verify_mode must be one of {sorted(VALID_VERIFY_MODES)}")
         if self.input_mode not in VALID_INPUT_MODES:
             raise ValueError(f"input_mode must be one of {sorted(VALID_INPUT_MODES)}")
-        if self.property_profile not in VALID_PROPERTY_PROFILES:
+        valid_property_profiles = set(list_property_profiles())
+        if self.property_profile not in valid_property_profiles:
             raise ValueError(
-                f"property_profile must be one of {sorted(VALID_PROPERTY_PROFILES)}"
+                f"property_profile must be one of {sorted(valid_property_profiles)}"
             )
         profile = load_property_profile(self.property_profile).profile
         if profile["case_name"] != case_path.name:

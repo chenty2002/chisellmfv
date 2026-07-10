@@ -7,7 +7,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from .config import CoupledL2RunConfig
 from .file_policy import PathIntent, evaluate_workspace_path
@@ -16,7 +16,7 @@ from .workspace import CoupledL2Workspace
 
 
 def generate_indexes(run_dir: Path, case_workspace: Path, config: CoupledL2RunConfig) -> Dict[str, Dict[str, Any]]:
-    """Generate the minimal indexes required by commit 1."""
+    """Generate deterministic context indexes for the CoupledL2 workflow."""
     indexes_dir = run_dir / "indexes"
     indexes_dir.mkdir(parents=True, exist_ok=True)
 
@@ -24,6 +24,8 @@ def generate_indexes(run_dir: Path, case_workspace: Path, config: CoupledL2RunCo
         "project_tree": build_project_tree(case_workspace),
         "build_contract": build_build_contract(case_workspace, config),
         "formal_surface": build_formal_surface(case_workspace),
+        "tl_signal_index": build_tl_signal_index(case_workspace),
+        "observer_index": build_observer_index(case_workspace),
     }
     for name, value in indexes.items():
         _write_json(indexes_dir / f"{name}.json", value)
@@ -191,6 +193,195 @@ def build_formal_surface(case_workspace: Path) -> Dict[str, Any]:
     }
 
 
+TL_FIELDS = {
+    "opcode",
+    "param",
+    "size",
+    "source",
+    "address",
+    "mask",
+    "data",
+    "corrupt",
+    "sink",
+    "denied",
+}
+
+OBSERVER_MODULES = {
+    "SinkA",
+    "SinkC",
+    "SourceB",
+    "SourceC",
+    "RefillUnit",
+    "GrantBuffer",
+    "RequestBuffer",
+    "MSHRCtl",
+    "MSHR",
+    "Directory",
+    "MainPipe",
+}
+
+_TL_BUNDLE_RE = re.compile(r"\bTLBundle([A-E])?\b")
+_IO_CHANNEL_RE = re.compile(r"\bio\.(in|out)\.([a-e])\b")
+_TL_FIELD_RE = re.compile(
+    r"\b((?:io\.(?:in|out)\.)?[a-e]|[A-Za-z_][A-Za-z0-9_]*(?:\.io)?\.[a-e]|io\.[A-Za-z_][A-Za-z0-9_]*)"
+    r"\.bits\.(" + "|".join(sorted(TL_FIELDS)) + r")\b"
+)
+_HANDSHAKE_RE = re.compile(
+    r"\b((?:io\.(?:in|out)\.)?[a-e]|[A-Za-z_][A-Za-z0-9_]*(?:\.io)?\.[a-e]|io\.[A-Za-z_][A-Za-z0-9_]*)"
+    r"\.(valid|ready)\b"
+)
+_SCALA_SCOPE_RE = re.compile(r"\b(?:class|object|trait)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def build_tl_signal_index(case_workspace: Path) -> Dict[str, Any]:
+    """Index discoverable Scala TileLink signals without reading generated output."""
+    candidates: List[Dict[str, Any]] = []
+    module_counts: Dict[str, int] = {}
+    channels: Set[str] = set()
+    files_scanned = 0
+
+    for path in _discoverable_scala_sources(case_workspace):
+        files_scanned += 1
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        current_scope = path.stem
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            scope_match = _SCALA_SCOPE_RE.search(line)
+            if scope_match:
+                current_scope = scope_match.group(1)
+
+            for match in _TL_BUNDLE_RE.finditer(line):
+                channel = match.group(1)
+                roles = ["tl_bundle"]
+                if channel:
+                    roles.append(f"channel_{channel.lower()}")
+                    channels.add(channel.lower())
+                candidates.append(
+                    _candidate(
+                        candidate_type="tl_bundle",
+                        roles=roles,
+                        path=path,
+                        case_workspace=case_workspace,
+                        line_no=line_no,
+                        expression=match.group(0),
+                        module=current_scope,
+                        description="TileLink bundle declaration or construction.",
+                    )
+                )
+
+            for match in _IO_CHANNEL_RE.finditer(line):
+                direction, channel = match.groups()
+                channels.add(channel)
+                candidates.append(
+                    _candidate(
+                        candidate_type="tl_channel_endpoint",
+                        roles=[f"channel_{channel}", f"direction_{direction}"],
+                        path=path,
+                        case_workspace=case_workspace,
+                        line_no=line_no,
+                        expression=match.group(0),
+                        module=current_scope,
+                        description=f"TileLink {channel.upper()} channel endpoint on io.{direction}.",
+                    )
+                )
+
+            for match in _HANDSHAKE_RE.finditer(line):
+                signal, handshake = match.groups()
+                channel = _infer_channel(signal)
+                roles = [f"handshake_{handshake}"]
+                if channel:
+                    roles.append(f"channel_{channel}")
+                    channels.add(channel)
+                candidates.append(
+                    _candidate(
+                        candidate_type="tl_handshake",
+                        roles=roles,
+                        path=path,
+                        case_workspace=case_workspace,
+                        line_no=line_no,
+                        expression=match.group(0),
+                        module=current_scope,
+                        description=f"TileLink handshake {handshake} signal.",
+                    )
+                )
+
+            for match in _TL_FIELD_RE.finditer(line):
+                signal, field = match.groups()
+                channel = _infer_channel(signal)
+                roles = [f"field_{field}"]
+                if channel:
+                    roles.append(f"channel_{channel}")
+                    channels.add(channel)
+                candidates.append(
+                    _candidate(
+                        candidate_type="tl_field",
+                        roles=roles,
+                        path=path,
+                        case_workspace=case_workspace,
+                        line_no=line_no,
+                        expression=match.group(0),
+                        module=current_scope,
+                        description=f"TileLink bits.{field} field reference.",
+                    )
+                )
+
+    candidates = _assign_candidate_ids(candidates, prefix="tl_sig")
+    for item in candidates:
+        module = item["provenance"]["module"]
+        module_counts[module] = module_counts.get(module, 0) + 1
+
+    return {
+        "schema_version": "tl_signal_index.v1",
+        "case_root": "workspace/case",
+        "files_scanned": files_scanned,
+        "candidate_count": len(candidates),
+        "channels": sorted(channels),
+        "module_counts": dict(sorted(module_counts.items())),
+        "candidates": candidates,
+    }
+
+
+def build_observer_index(case_workspace: Path) -> Dict[str, Any]:
+    """Index high-value CoupledL2 modules that can host or explain TL properties."""
+    candidates: List[Dict[str, Any]] = []
+    module_counts: Dict[str, int] = {}
+    files_scanned = 0
+
+    module_pattern = re.compile(r"\b(" + "|".join(sorted(OBSERVER_MODULES, key=len, reverse=True)) + r")\b")
+    for path in _discoverable_scala_sources(case_workspace):
+        files_scanned += 1
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        current_scope = path.stem
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            scope_match = _SCALA_SCOPE_RE.search(line)
+            if scope_match:
+                current_scope = scope_match.group(1)
+            for match in module_pattern.finditer(line):
+                module_name = match.group(1)
+                module_counts[module_name] = module_counts.get(module_name, 0) + 1
+                candidates.append(
+                    _candidate(
+                        candidate_type="observer_module",
+                        roles=[f"module_{module_name.lower()}"],
+                        path=path,
+                        case_workspace=case_workspace,
+                        line_no=line_no,
+                        expression=module_name,
+                        module=current_scope,
+                        description=f"CoupledL2 observer or protocol component: {module_name}.",
+                    )
+                )
+
+    candidates = _assign_candidate_ids(candidates, prefix="obs")
+    return {
+        "schema_version": "observer_index.v1",
+        "case_root": "workspace/case",
+        "files_scanned": files_scanned,
+        "candidate_count": len(candidates),
+        "module_counts": dict(sorted(module_counts.items())),
+        "candidates": candidates,
+    }
+
+
 def _discoverable_files(root: Path, *, policy_root: Optional[Path] = None) -> List[Path]:
     """Walk without following links and prune paths denied for default discovery."""
     policy_root = policy_root or root
@@ -216,6 +407,76 @@ def _discoverable_files(root: Path, *, policy_root: Optional[Path] = None) -> Li
             if decision.allowed:
                 files.append(path)
     return sorted(files)
+
+
+def _discoverable_scala_sources(case_workspace: Path) -> List[Path]:
+    chisel_dir = case_workspace / "Chisel"
+    if not chisel_dir.is_dir():
+        return []
+    return [
+        path
+        for path in _discoverable_files(chisel_dir, policy_root=case_workspace)
+        if path.suffix == ".scala"
+    ]
+
+
+def _candidate(
+    *,
+    candidate_type: str,
+    roles: List[str],
+    path: Path,
+    case_workspace: Path,
+    line_no: int,
+    expression: str,
+    module: str,
+    description: str,
+) -> Dict[str, Any]:
+    return {
+        "type": candidate_type,
+        "roles": sorted(set(roles)),
+        "description": description,
+        "provenance": {
+            "path": _rel(path, case_workspace),
+            "line": line_no,
+            "module": module,
+            "expression": expression,
+        },
+    }
+
+
+def _assign_candidate_ids(candidates: List[Dict[str, Any]], *, prefix: str) -> List[Dict[str, Any]]:
+    keyed = sorted(
+        candidates,
+        key=lambda item: (
+            item["provenance"]["path"],
+            item["provenance"]["line"],
+            item["type"],
+            item["provenance"]["expression"],
+            ",".join(item["roles"]),
+        ),
+    )
+    result = []
+    seen = set()
+    for item in keyed:
+        dedupe_key = (
+            item["type"],
+            tuple(item["roles"]),
+            item["provenance"]["path"],
+            item["provenance"]["line"],
+            item["provenance"]["expression"],
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        numbered = dict(item)
+        numbered["candidate_id"] = f"{prefix}_{len(result) + 1:04d}"
+        result.append(numbered)
+    return result
+
+
+def _infer_channel(signal: str) -> Optional[str]:
+    match = re.search(r"(?:^|\.)([a-e])(?:$|\.)", signal)
+    return match.group(1) if match else None
 
 
 def detect_chisel_compatibility(chisel_dir: Path, case_workspace: Path) -> Dict[str, Any]:

@@ -203,6 +203,9 @@ class FormalWorkflow:
         if self.run_context is not None:
             self.stage_context = initialize_stage_context(self.run_context, self.current_stage)
             env_info["coupledl2"] = self._coupledl2_environment()
+            v2c_artifacts = self._load_v2c_artifacts()
+            if v2c_artifacts is not None:
+                env_info["v2c"] = v2c_artifacts
         
         env_info["work_dir"] = self.work_dir
         
@@ -242,6 +245,29 @@ class FormalWorkflow:
                 else None
             ),
         }
+
+    def _load_v2c_artifacts(self) -> Optional[Dict[str, Any]]:
+        """Load optional Verilog2Chisel readiness artifacts for this case."""
+        candidates = [
+            Path(self.work_dir),
+            Path(self.workspace_dir) / "chisel" / "extra_bench" / self.target,
+        ]
+        for directory in candidates:
+            contract_path = directory / "translation_contract.json"
+            readiness_path = directory / "formal_readiness.json"
+            if not contract_path.is_file() and not readiness_path.is_file():
+                continue
+            artifacts: Dict[str, Any] = {"artifact_dir": str(directory)}
+            if contract_path.is_file():
+                artifacts["translation_contract"] = json.loads(
+                    contract_path.read_text(encoding="utf-8")
+                )
+            if readiness_path.is_file():
+                artifacts["formal_readiness"] = json.loads(
+                    readiness_path.read_text(encoding="utf-8")
+                )
+            return artifacts
+        return None
     
     def process_task(self, user_query: str) -> Dict[str, Any]:
         """
@@ -270,6 +296,21 @@ class FormalWorkflow:
         }
         
         context["iterations"] = []
+
+        v2c = context.get("environment", {}).get("v2c")
+        readiness = v2c.get("formal_readiness") if isinstance(v2c, dict) else None
+        if stage == "bind_properties" and isinstance(readiness, dict) and readiness.get("ready") is False:
+            stage_result = {
+                "success": False,
+                "summary": "V2C formal readiness failed before property binding.",
+                "termination_reason": "invalid_v2c_environment",
+                "error_kind": "invalid_v2c_environment",
+                "invalid_v2c_environment": True,
+                "blocking_issues": readiness.get("blocking_issues", []),
+            }
+            result["stage_result"] = stage_result
+            self._record_coupledl2_stage_result(stage, stage_result, result)
+            return result
         
         self.logger.info(f"=== Running stage: {stage} ===")
         print(f"\n=== Running stage: {stage} ===")
@@ -646,13 +687,21 @@ class FormalWorkflow:
                 token_budget_metadata,
             ):
                 stage_budget.enter_token_finalization()
-                return self._finalize_stage_locally(
-                    stage,
-                    context,
-                    iterations,
-                    stage_budget,
-                    trigger="token_soft_limit",
-                )
+                if stage == "waveform_explanation":
+                    priority_turn = True
+                    self._record_budget_event(
+                        stage,
+                        "token_finalization",
+                        stage_budget,
+                    )
+                else:
+                    return self._finalize_stage_locally(
+                        stage,
+                        context,
+                        iterations,
+                        stage_budget,
+                        trigger="token_soft_limit",
+                    )
             budget_snapshot = stage_budget.snapshot()
             if budget_snapshot.tool_calls_remaining <= 1:
                 stage_budget.force_finalization()
@@ -699,6 +748,12 @@ class FormalWorkflow:
                     else spec.request_max_tokens
                 ),
             )
+            request_policy = self._apply_token_finalization_request_policy(
+                stage,
+                tool_schemas,
+                stage_budget,
+                request_policy,
+            )
             request_max_tokens = request_policy["max_tokens"]
             messages.append(
                 {
@@ -719,13 +774,44 @@ class FormalWorkflow:
                     "token_finalization",
                     stage_budget,
                 )
-                return self._finalize_stage_locally(
+                if stage != "waveform_explanation":
+                    return self._finalize_stage_locally(
+                        stage,
+                        context,
+                        iterations,
+                        stage_budget,
+                        trigger="token_soft_limit",
+                    )
+                priority_turn = True
+                budget_snapshot = stage_budget.snapshot()
+                tool_schemas = get_budgeted_tool_schemas(
                     stage,
-                    context,
-                    iterations,
-                    stage_budget,
-                    trigger="token_soft_limit",
+                    phase=budget_snapshot.phase,
+                    tool_calls_remaining=budget_snapshot.tool_calls_remaining,
+                    forced_finalization=budget_snapshot.forced_finalization,
+                    completion_required=budget_snapshot.completion_required,
+                    repair_edit_required=False,
+                    discovery_calls_remaining=0,
                 )
+                cache_metadata = self._build_prompt_cache_metadata(stage, tool_schemas)
+                cache_metadata.update(token_budget_metadata)
+                request_policy = self._stage_request_policy(
+                    stage,
+                    tool_schemas,
+                    discovery_calls_remaining=0,
+                    default_max_tokens=spec.request_max_tokens,
+                )
+                request_policy = self._apply_token_finalization_request_policy(
+                    stage,
+                    tool_schemas,
+                    stage_budget,
+                    request_policy,
+                )
+                request_max_tokens = request_policy["max_tokens"]
+                messages[-1] = {
+                    "role": "user",
+                    "content": build_budget_directive(budget_snapshot),
+                }
             hard_compaction_required = (
                 self._stage_request_needs_compaction(
                     stage,
@@ -944,7 +1030,31 @@ class FormalWorkflow:
             "enable_thinking": None,
             "parallel_tool_calls": None,
         }
+        if len(tool_schemas) == 1:
+            policy["tool_choice"] = self._named_tool_choice(tool_schemas[0]["name"])
+            policy["parallel_tool_calls"] = False
         return policy
+
+    def _apply_token_finalization_request_policy(
+        self,
+        stage: str,
+        tool_schemas: List[Dict[str, Any]],
+        stage_budget: StageBudget,
+        policy: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Force the next durable waveform artifact during token finalization."""
+        if stage != "waveform_explanation" or not stage_budget.snapshot().token_finalization:
+            return policy
+        report_path = Path(self.work_dir) / "counterexample_analysis.md"
+        required_tool = "complete_stage" if report_path.is_file() else "write_report"
+        if required_tool not in {schema["name"] for schema in tool_schemas}:
+            return policy
+        updated = dict(policy)
+        updated["tool_choice"] = self._named_tool_choice(required_tool)
+        updated["parallel_tool_calls"] = False
+        updated["temperature"] = 0
+        updated["enable_thinking"] = False
+        return updated
 
     def _build_prompt_cache_metadata(
         self,
@@ -1237,6 +1347,14 @@ class FormalWorkflow:
             for action, result in zip(actions, raw_action_results)
         ):
             runtime_state["parse_recovery_pending"] = False
+        if stage == "waveform_explanation":
+            for action, raw_result in zip(actions, raw_action_results):
+                if (
+                    action.get("type") == "write_report"
+                    and raw_result.get("success")
+                    and action.get("error_type")
+                ):
+                    context["error_type"] = action["error_type"]
         
         # Keep only a compact audit summary in stage state.
         iteration = {

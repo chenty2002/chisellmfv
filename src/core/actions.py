@@ -907,7 +907,8 @@ def _execute_write_report(
         return {
             "type": "write_report",
             "file_path": full_path,
-            "success": True
+            "success": True,
+            "error_type": action.get("error_type"),
         }
     except Exception as e:
         return {
