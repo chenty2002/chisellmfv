@@ -333,12 +333,16 @@ def _build_stage_inputs(
                 "source_boringutils_count",
                 "baseline_build_success",
                 "generated_assertion_count",
+                "inventory_complete",
+                "formal_contract_sha256",
             )
         }
         payload["preflight"] = {
             "result": "results/preflight/preflight_result.json",
             "baseline_build": "results/preflight/baseline_build_result.json",
             "generated_assertion_scan": "results/preflight/generated_assertion_scan.json",
+            "baseline_assertion_inventory": "results/preflight/baseline_assertion_inventory.json",
+            "formal_contract": "results/preflight/formal_contract.json",
         }
         payload["property_catalog"] = public_catalog(catalog)
     elif stage == "waveform_explanation":
@@ -360,7 +364,7 @@ def _build_stage_inputs(
             instance = manifest["instances"][0]
             failed = []
             for prop in result_map.get("properties", []):
-                for result in prop.get("jaspergold_properties", []):
+                for result in prop.get("primary_results", []):
                     if result.get("status") == "cex":
                         failed.append(
                             {
@@ -379,10 +383,10 @@ def _build_stage_inputs(
                                 "parameters": instance.get("parameters"),
                                 "rtl_label": result.get("rtl_label"),
                                 "jaspergold_property_id": result.get(
-                                    "jaspergold_property_id"
+                                    "observed_property_id"
                                 ),
                                 "counterexample_path": result.get(
-                                    "counterexample_path"
+                                    "trace_path"
                                 ),
                             }
                         )

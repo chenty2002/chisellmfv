@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable
 
 from .indexer import generate_indexes
+from .formal_contract import load_formal_contract
 from .preprocess import (
+    build_baseline_assertion_inventory,
     patch_autoverify_outputs,
     prepare_profile_surface,
     scan_formal_surface,
@@ -32,6 +34,22 @@ class CoupledL2Preflight:
         _write_json(self.results_dir / "formal_surface_before.json", before_surface)
 
         catalog = load_property_profile(self.workspace.config.property_profile)
+        formal_contract = load_formal_contract(
+            catalog.formal_contract_id,
+            profile_id=catalog.profile["property_profile_id"],
+            case_name=catalog.profile["case_name"],
+            case_workspace=self.workspace.case_workspace,
+        )
+        formal_contract_artifact = formal_contract.artifact()
+        _write_json(self.results_dir / "formal_contract.json", formal_contract_artifact)
+        baseline_inventory_before = build_baseline_assertion_inventory(
+            self.workspace.case_workspace,
+            disabled_labels=formal_contract.payload["disabled_baseline_properties"],
+        )
+        _write_json(
+            self.results_dir / "baseline_assertion_inventory_before.json",
+            baseline_inventory_before,
+        )
         patched_autoverify = patch_autoverify_outputs(self.workspace.case_workspace)
         prepared = prepare_profile_surface(self.workspace.case_workspace, catalog)
         preprocess = {
@@ -55,9 +73,21 @@ class CoupledL2Preflight:
         )
         after_manifest = _source_manifest(self.workspace.case_workspace)
         after_surface = scan_formal_surface(self.workspace.case_workspace)
+        preserved_inventory = build_baseline_assertion_inventory(
+            self.workspace.case_workspace,
+            disabled_labels=formal_contract.payload["disabled_baseline_properties"],
+        )
+        baseline_inventory = _merge_baseline_inventory(
+            baseline_inventory_before,
+            preserved_inventory,
+        )
         _write_json(self.results_dir / "preprocess_report.json", preprocess)
         _write_json(self.results_dir / "source_manifest_after.json", after_manifest)
         _write_json(self.results_dir / "formal_surface_after.json", after_surface)
+        _write_json(
+            self.results_dir / "baseline_assertion_inventory.json",
+            baseline_inventory,
+        )
 
         cleanup_ok = bool(preprocess.get("success"))
         if cleanup_ok:
@@ -80,22 +110,27 @@ class CoupledL2Preflight:
         _write_json(self.results_dir / "generated_assertion_scan.json", generated_scan)
         gate = {
             "cleanup_completed": cleanup_ok,
+            "inventory_complete": baseline_inventory["entry_count"]
+            == baseline_inventory["preserved_count"] + baseline_inventory["disabled_count"],
             "source_assertion_count": after_surface["assertion_count"],
             "source_boringutils_count": after_surface["boringutils_count"],
             "baseline_build_success": bool(baseline.get("success")),
             "generated_assertion_count": generated_scan["assertion_count"],
             "baseline_cl2_label_count": generated_scan["cl2_label_count"],
+            "formal_contract_sha256": formal_contract.sha256,
+            "top_policy_satisfied": bool(baseline.get("top_module"))
+            and str(baseline.get("top_module")).startswith(
+                formal_contract.payload["top"]["name_prefix"]
+            ),
         }
         success = (
             gate["cleanup_completed"]
-            and gate["source_assertion_count"] == 0
-            and gate["source_boringutils_count"] == 0
+            and gate["inventory_complete"]
             and gate["baseline_build_success"]
-            and gate["generated_assertion_count"] == 0
-            and gate["baseline_cl2_label_count"] == 0
+            and gate["top_policy_satisfied"]
         )
         result = {
-            "schema_version": "coupledl2_preflight.v1",
+            "schema_version": "coupledl2_preflight.v2",
             "success": success,
             "termination_reason": _termination_reason(gate),
             "gate": gate,
@@ -107,6 +142,9 @@ class CoupledL2Preflight:
                 "source_manifest_after": "results/preflight/source_manifest_after.json",
                 "baseline_build": "results/preflight/baseline_build_result.json",
                 "generated_assertion_scan": "results/preflight/generated_assertion_scan.json",
+                "baseline_assertion_inventory": "results/preflight/baseline_assertion_inventory.json",
+                "baseline_assertion_inventory_before": "results/preflight/baseline_assertion_inventory_before.json",
+                "formal_contract": "results/preflight/formal_contract.json",
             },
         }
         _write_json(self.results_dir / "preflight_result.json", result)
@@ -115,12 +153,12 @@ class CoupledL2Preflight:
 
 
 def _termination_reason(gate: Dict[str, Any]) -> str:
-    if not gate["cleanup_completed"] or gate["source_assertion_count"] or gate["source_boringutils_count"]:
+    if not gate["cleanup_completed"] or not gate["inventory_complete"]:
         return "preflight_cleanup_failed"
     if not gate["baseline_build_success"]:
         return "preflight_build_failed"
-    if gate["generated_assertion_count"] or gate["baseline_cl2_label_count"]:
-        return "preflight_generated_assertions_found"
+    if not gate["top_policy_satisfied"]:
+        return "preflight_formal_top_mismatch"
     return "preflight_completed"
 
 
@@ -134,6 +172,35 @@ def _source_manifest(case_workspace: Path) -> Dict[str, Any]:
             "sha256": hashlib.sha256(data).hexdigest(),
         })
     return {"schema_version": "source_manifest.v1", "files": files}
+
+
+def _merge_baseline_inventory(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Retain explicit records for profile-owned baseline removals."""
+    after_keys = {
+        (item["source_path"], item["kind"], item["sha256"])
+        for item in after.get("entries", [])
+    }
+    disabled = []
+    for original in before.get("entries", []):
+        key = (original["source_path"], original["kind"], original["sha256"])
+        if key in after_keys:
+            continue
+        item = dict(original)
+        item["policy"] = "disabled"
+        item["reason"] = "profile_owned_cleanup_or_generated_region"
+        disabled.append(item)
+    entries = [*after.get("entries", []), *disabled]
+    entries.sort(key=lambda item: (item["source_path"], item["line"], item["kind"]))
+    return {
+        "schema_version": "baseline_assertion_inventory.v1",
+        "entries": entries,
+        "entry_count": len(entries),
+        "preserved_count": sum(item["policy"] == "preserved" for item in entries),
+        "disabled_count": sum(item["policy"] == "disabled" for item in entries),
+    }
 
 
 def _scan_generated_assertions(paths: Iterable[str]) -> Dict[str, Any]:

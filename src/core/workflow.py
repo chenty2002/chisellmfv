@@ -1350,11 +1350,16 @@ class FormalWorkflow:
         if stage == "waveform_explanation":
             for action, raw_result in zip(actions, raw_action_results):
                 if (
+                    action.get("type") == "submit_property_diagnoses"
+                    and raw_result.get("success")
+                ):
+                    context["property_diagnoses"] = action.get("diagnoses", [])
+                    context["property_diagnosis_summary"] = action.get("summary", "")
+                if (
                     action.get("type") == "write_report"
                     and raw_result.get("success")
-                    and action.get("error_type")
                 ):
-                    context["error_type"] = action["error_type"]
+                    context["diagnosis_report_written"] = True
         
         # Keep only a compact audit summary in stage state.
         iteration = {
@@ -2136,7 +2141,16 @@ class FormalWorkflow:
                 "files_modified": metadata.get("files_modified", []),
             }
 
-        if error_type:
+            diagnosis_error = self._validate_property_diagnoses(context)
+            if diagnosis_error is not None:
+                return {
+                    "accepted": False,
+                    "error_kind": "property_diagnoses_incomplete",
+                    "error": diagnosis_error,
+                }
+            metadata["diagnoses"] = context["validated_property_diagnoses"]
+
+        if error_type and stage != "waveform_explanation":
             result["error_type"] = error_type
         if stage == "waveform_explanation":
             self._write_coupledl2_diagnosis(metadata, result)
@@ -2600,7 +2614,15 @@ class FormalWorkflow:
             formal = stage_result.get("jaspergold_result") or stage_result.get("formal_result")
             if isinstance(formal, dict):
                 self._write_json(stage_dir / "formal_result.json", formal)
-                self._write_json(stage_dir / "property_status.json", formal.get("property_statuses", {}))
+                self._write_json(
+                    stage_dir / "property_status.json",
+                    {
+                        "schema_version": "property_status.v2",
+                        "expected_count": formal.get("expected_count", 0),
+                        "accounted_count": formal.get("accounted_count", 0),
+                        "primary_results": formal.get("primary_results", []),
+                    },
+                )
 
         if stage == "propose_bugfix":
             repair = stage_result.get("repair_loop") or stage_result
@@ -2656,14 +2678,28 @@ class FormalWorkflow:
                 "verification_passed": stage_result.get("verification_passed"),
                 "counterexample_path": stage_result.get("counterexample_path"),
                 "cex_count": stage_result.get("cex_count"),
+                "execution_status": stage_result.get("execution_status"),
+                "verification_outcome": stage_result.get("verification_outcome"),
+                "accounted_count": stage_result.get("accounted_count"),
+                "expected_count": stage_result.get("expected_count"),
                 "formal_result": "formal_result.json",
                 "property_status": "property_status.json",
                 "property_result_map": "property_result_map.json",
             }
         elif stage == "waveform_explanation":
+            diagnosis_path = stage_dir / "diagnosis.json"
+            diagnosis_payload = (
+                json.loads(diagnosis_path.read_text(encoding="utf-8"))
+                if diagnosis_path.is_file()
+                else {"diagnoses": []}
+            )
             handoff["diagnosis"] = {
-                "error_type": stage_result.get("error_type"),
-                "root_cause": stage_result.get("root_cause"),
+                "diagnosis_count": len(diagnosis_payload.get("diagnoses", [])),
+                "classifications": sorted({
+                    item.get("classification")
+                    for item in diagnosis_payload.get("diagnoses", [])
+                    if item.get("classification")
+                }),
                 "counterexample_path": stage_result.get("counterexample_path"),
                 "diagnosis": "diagnosis.json",
                 "counterexample_analysis": "counterexample_analysis.md",
@@ -2723,57 +2759,28 @@ class FormalWorkflow:
         if stage_dir is None:
             return
 
-        classification = args.get("error_type") or "inconclusive"
-        allowed = {
-            "design_bug",
-            "property_schema_error",
-            "template_error",
-            "binding_error",
-            "environment_error",
-            "assumption_error",
-            "inconclusive",
-        }
-        if classification not in allowed:
-            classification = "inconclusive"
-        evidence = []
-        for key in ("summary", "root_cause", "counterexample_path"):
-            value = args.get(key) or result.get(key)
-            if value:
-                evidence.append({"kind": key, "value": value})
         failed_traces = []
         if self.stage_context is not None:
             failed_traces = self.stage_context.stage_inputs.get(
                 "failed_property_traces",
                 [],
             )
-        if not failed_traces:
-            failed_traces = [
-                {
-                    "rtl_label": (
-                        args.get("property")
-                        or args.get("target_assertion_label")
-                        or self._first_failing_property()
-                        or "unknown"
-                    ),
-                    "jaspergold_property_id": self._first_failing_property(),
-                }
-            ]
+        submitted = args.get("diagnoses") or []
+        trace_by_label = {item.get("rtl_label"): item for item in failed_traces}
         diagnoses = []
-        for trace in failed_traces:
-            diagnoses.append(
-                {
-                    "property": trace.get("rtl_label") or "unknown",
-                    "jaspergold_property_id": trace.get(
-                        "jaspergold_property_id"
-                    ),
-                    "instance_id": trace.get("instance_id"),
-                    "property_schema_id": trace.get("property_schema_id"),
-                    "template_id": trace.get("template_id"),
-                    "classification": classification,
-                    "evidence": evidence,
-                    "uncertainty": args.get("uncertainty") or "not_reported",
-                }
-            )
+        for item in submitted:
+            trace = trace_by_label.get(item.get("property"), {})
+            diagnoses.append({
+                **item,
+                "jaspergold_property_id": trace.get("jaspergold_property_id"),
+                "instance_id": trace.get("instance_id"),
+                "property_schema_id": trace.get("property_schema_id"),
+                "template_id": trace.get("template_id"),
+                "evidence": [
+                    {"kind": "artifact_ref", "value": value}
+                    for value in item.get("evidence_refs", [])
+                ],
+            })
         diagnosis = {
             "schema_version": "property_diagnosis.v1",
             "diagnoses": diagnoses,
@@ -2784,18 +2791,53 @@ class FormalWorkflow:
         if not report_path.exists():
             report_path.write_text(str(diagnosis["summary"]), encoding="utf-8")
 
-    def _first_failing_property(self) -> Optional[str]:
-        data = self.last_verification_result or {}
-        for key in ("failing_properties", "inconclusive_properties"):
-            values = data.get(key)
-            if isinstance(values, list) and values:
-                return str(values[0])
-        nested = data.get("jaspergold_result")
-        if isinstance(nested, dict):
-            for key in ("failing_properties", "inconclusive_properties"):
-                values = nested.get(key)
-                if isinstance(values, list) and values:
-                    return str(values[0])
+    def _validate_property_diagnoses(self, context: Dict[str, Any]) -> Optional[str]:
+        expected = {
+            item.get("rtl_label")
+            for item in (
+                self.stage_context.stage_inputs.get("failed_property_traces", [])
+                if self.stage_context is not None
+                else []
+            )
+            if item.get("rtl_label")
+        }
+        diagnoses = context.get("property_diagnoses")
+        if not isinstance(diagnoses, list):
+            return "submit_property_diagnoses must be called before complete_stage"
+        allowed_classifications = {
+            "design_bug", "property_schema_error", "template_error",
+            "binding_error", "environment_error", "assumption_error",
+            "inconclusive",
+        }
+        allowed_revision_targets = {
+            "design_source", "property_schema", "assertion_template",
+            "binding_manifest", "formal_contract", "assumptions", "none",
+        }
+        for item in diagnoses:
+            if not isinstance(item, dict):
+                return "each property diagnosis must be an object"
+            if item.get("classification") not in allowed_classifications:
+                return "property diagnosis has an invalid classification"
+            if item.get("revision_target") not in allowed_revision_targets:
+                return "property diagnosis has an invalid revision_target"
+            refs = item.get("evidence_refs")
+            if (
+                not isinstance(refs, list)
+                or not refs
+                or not all(isinstance(value, str) and value.strip() for value in refs)
+            ):
+                return "property diagnosis requires non-empty evidence_refs"
+            if not isinstance(item.get("uncertainty"), str) or not item["uncertainty"].strip():
+                return "property diagnosis requires explicit uncertainty"
+        actual = [item.get("property") for item in diagnoses if isinstance(item, dict)]
+        if len(actual) != len(set(actual)):
+            return "property diagnoses contain duplicate property labels"
+        if set(actual) != expected:
+            return (
+                "property diagnosis set must exactly equal the CEX primary set: "
+                f"expected={sorted(expected)}, actual={sorted(set(actual))}"
+            )
+        context["validated_property_diagnoses"] = diagnoses
         return None
 
     @staticmethod

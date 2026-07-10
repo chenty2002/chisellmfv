@@ -12,16 +12,19 @@ JasperGold quality evaluator, and the Verilog-to-Chisel converter. Treat
 
 ## What This Version Provides
 
-- Preflight-gated four-stage formal workflow:
-  `write_assertions -> invoke_verification -> waveform_explanation -> propose_bugfix`.
+- Preflight-gated four-stage CoupledL2 workflow:
+  `bind_properties -> invoke_verification -> waveform_explanation -> propose_bugfix`.
 - CoupledL2 run isolation under `runs/<timestamp>-<case>-<id>/`.
 - Stage-local context files, skills, rules, source snapshots, tool operation
   ledgers, stage results, handoff files, and run cost summaries.
-- Workspace-scoped model tools: source reads, bounded `rg`, focused edits,
-  deterministic build/proof calls, waveform queries, causal-analysis queries,
-  and explicit `complete_stage` completion. Token or turn pressure instead
-  invokes the same deterministic completion gate locally without another LLM
-  request.
+- Repository-owned property assets for CoupledL2: the model selects a strict
+  `property_schema`, template, binding candidates, and bounded parameters; Python
+  renders source edits, labels elaborated RTL properties, and records
+  traceability.
+- Workspace-scoped model tools for later agent stages: source reads, bounded
+  `rg`, focused edits, waveform queries, causal-analysis queries, and explicit
+  `complete_stage` completion. CoupledL2 Stage 2 does not expose the old source
+  editing tool loop.
 - Dual-model routing through `CHISELLMFV_LLM_MODEL_PRO` and
   `CHISELLMFV_LLM_MODEL_FLASH`, with `CHISELLMFV_LLM_MODEL` as a fallback.
 
@@ -135,13 +138,14 @@ not edited by the model-facing tools.
 
 ### Preflight A New Run
 
-Preflight copies and cleans the case, generates indexes, performs the baseline
-build, and rejects residual source or generated assertions before any LLM call:
+Preflight copies and cleans the case, installs the selected property profile's
+stable marker, generates indexes, performs the baseline build, and rejects
+residual source or generated CL2 assertions before any LLM call:
 
 ```bash
 .venv/bin/python main.py run \
   --case CoupledL2-Verification/<case-name> \
-  --property deadlock \
+  --property-profile write_read_poc \
   --preflight-only
 ```
 
@@ -150,7 +154,7 @@ Useful options:
 ```text
 --mode small
 --input-mode coupledl2asl1
---property deadlock|write_read|copy_equality|peer_l2|custom
+--property-profile write_read_poc|mshr_wait_bound_poc
 --run-root runs
 ```
 
@@ -162,25 +166,32 @@ The current checked-in configuration accepts `small` mode and
 ```bash
 .venv/bin/python main.py run \
   --case CoupledL2-Verification/<case-name> \
-  --property deadlock \
+  --property-profile write_read_poc \
   --full \
   --max-tokens 160000 \
   --max-repair-rounds 3
 ```
 
-Fresh runs can execute only `write_assertions` as a single stage; later stages
+Fresh runs can execute only `bind_properties` as a single stage; later stages
 must resume a run whose predecessor handoff succeeded:
 
 ```bash
 .venv/bin/python main.py run \
   --case CoupledL2-Verification/<case-name> \
-  --property deadlock \
-  --stage write_assertions \
+  --property-profile mshr_wait_bound_poc \
+  --stage bind_properties \
   --max-tokens 160000
 ```
 
 If `invoke_verification` proves all assertions, the workflow stops without
 running counterexample diagnosis or repair.
+
+The current M0 property profiles are case-specific feasibility checks:
+`write_read_poc` targets `XiangShan-CoupledL2-write_read`, and
+`mshr_wait_bound_poc` targets `XiangShan-CoupledL2-deadlock-v0`. Their
+`review_status=not_reviewed` traceability means the generated results are
+candidate verification evidence, not final proof that the property semantics are
+manually approved.
 
 ### Token, Tool-Result, and Workspace Boundaries
 
@@ -225,7 +236,7 @@ handoff before starting the requested stage:
   --max-tokens 160000
 ```
 
-Valid stages are `write_assertions`, `invoke_verification`,
+Valid stages are `bind_properties`, `invoke_verification`,
 `waveform_explanation`, and `propose_bugfix`. `waveform_explanation` additionally
 requires a Stage 3 counterexample path.
 
@@ -249,7 +260,7 @@ results/preflight/preflight_result.json
 results/preflight/baseline_build_result.json
 results/run_cost_summary.json
 results/final_result.json
-results/by_stage/02_write_assertions/
+results/by_stage/02_bind_properties/
 results/by_stage/03_invoke_verification/
 results/by_stage/04_waveform_explanation/
 results/by_stage/05_propose_bugfix/
@@ -274,8 +285,8 @@ Stage-specific artifacts include:
 
 | Stage | Typical artifacts |
 |---|---|
-| `write_assertions` | assertion scan, assertion map/plan, source snapshots |
-| `invoke_verification` | `verify.tcl`, `formal_result.json`, `property_status.json`, traces |
+| `bind_properties` | `binding_manifest.json`, `assertion_traceability.json`, `rtl_label_result.json`, source snapshots |
+| `invoke_verification` | `verify.tcl`, `formal_result.json`, `property_status.json`, `property_result_map.json`, traces |
 | `waveform_explanation` | causal/waveform evidence, `diagnosis.json`, `counterexample_analysis.md` |
 | `propose_bugfix` | repair result, repair history, final result |
 

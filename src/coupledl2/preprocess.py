@@ -252,184 +252,134 @@ def scan_formal_surface(case_workspace: Path) -> Dict[str, Any]:
     }
 
 
-def clean_formal_surface(case_workspace: Path) -> Dict[str, Any]:
-    """Remove complete inherited formal statements from copied VerifyTop sources.
-
-    Statement ranges are selected with balanced delimiters. Ambiguous or
-    unterminated calls fail closed and leave the source unchanged.
-    """
-    changed_files: List[str] = []
-    removed: List[Dict[str, Any]] = []
-    failures: List[Dict[str, Any]] = []
-
+def build_baseline_assertion_inventory(
+    case_workspace: Path,
+    *,
+    disabled_labels: Iterable[str] = (),
+) -> Dict[str, Any]:
+    """Inventory inherited verification statements without changing them."""
+    disabled = set(disabled_labels)
+    entries: List[Dict[str, Any]] = []
+    call_re = re.compile(
+        r"(?P<kind>assert|assume|cover|fvAssert|AssertProperty|astLiveness|"
+        r"astRelaxedLiveness|assertLivenessTimer|assertAt|"
+        r"assertAfterNStepWhen|assertNextStepWhen|assertAlwaysAfterNStepWhen)\s*\("
+    )
+    label_re = re.compile(r"\b((?:CL2|TL)_[A-Z0-9_]+)\b")
     for path in verification_source_files(case_workspace):
         if _is_formal_library(path, case_workspace):
             continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for line_no, raw in enumerate(text.splitlines(), 1):
+            code = _code_without_line_comment(raw)
+            matches = list(call_re.finditer(code))
+            if matches:
+                match = matches[0]
+                raw_kind = match.group("kind")
+                kind = "assume" if raw_kind == "assume" else (
+                    "cover" if raw_kind == "cover" else "assert"
+                )
+                label_match = label_re.search(raw)
+                label = label_match.group(1) if label_match else None
+                normalized = " ".join(raw.strip().split())
+                is_disabled = bool(label and label in disabled)
+                entries.append({
+                    "source_path": _rel(path, case_workspace),
+                    "line": line_no,
+                    "kind": kind,
+                    "label": label,
+                    "sha256": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+                    "policy": "disabled" if is_disabled else "preserved",
+                    "reason": (
+                        "formal_contract.disabled_baseline_properties"
+                        if is_disabled
+                        else "inherited_formal_surface"
+                    ),
+                    "text": normalized[:240],
+                })
+            if BORING_CALL_RE.search(code):
+                normalized = " ".join(raw.strip().split())
+                entries.append({
+                    "source_path": _rel(path, case_workspace),
+                    "line": line_no,
+                    "kind": "boring_observer",
+                    "label": None,
+                    "sha256": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+                    "policy": "preserved",
+                    "reason": "inherited_observer_surface",
+                    "text": normalized[:240],
+                })
+    entries.sort(key=lambda item: (item["source_path"], item["line"], item["kind"]))
+    return {
+        "schema_version": "baseline_assertion_inventory.v1",
+        "entries": entries,
+        "entry_count": len(entries),
+        "preserved_count": sum(item["policy"] == "preserved" for item in entries),
+        "disabled_count": sum(item["policy"] == "disabled" for item in entries),
+    }
+
+
+def clean_formal_surface(case_workspace: Path) -> Dict[str, Any]:
+    """Remove only ChiselLMFV-owned generated regions from a copied case.
+
+    Inherited assertions, assumptions, covers, and BoringUtils observers are
+    deliberately preserved.  Profile-specific historical oracle removal is
+    handled separately by the reviewed profile cleanup selector.
+    """
+    begin = "// CHISELLMFV_GENERATED_BEGIN"
+    end = "// CHISELLMFV_GENERATED_END"
+    changed_files: List[str] = []
+    removed: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    for path in verification_source_files(case_workspace):
         original = path.read_text(encoding="utf-8", errors="ignore")
         lines = original.splitlines(keepends=True)
-        code_lines = _code_lines_without_comments(original)
-        hardware_ranges = _scope_ranges(lines, HARDWARE_SCOPE_RE)
-        formal_ranges = _scope_ranges(lines, FORMAL_MIXIN_RE)
-        assert_aliases = _chisel_assert_aliases(code_lines)
-        harness = _is_verification_harness(path, case_workspace)
-        formal_library = path.stem == "Formal"
-        ranges: List[Tuple[int, int]] = []
-        removed_identifiers: Set[str] = set()
-        removed_names: Set[str] = set()
-        file_failures: List[Dict[str, Any]] = []
-        helper_ranges: Dict[int, Tuple[int, int, str]] = {}
-        replacements: Dict[int, str] = {}
-        boring_indices = {
-            index
-            for index, code in enumerate(code_lines)
-            if BORING_CALL_RE.search(code)
-            and (harness or _index_in_ranges(index, formal_ranges))
-        }
-        all_boring_indices = {
-            index for index, code in enumerate(code_lines) if BORING_CALL_RE.search(code)
-        }
-        remove_boring_import = (
-            (harness or bool(formal_ranges))
-            and boring_indices == all_boring_indices
-        )
-
-        for index, line in enumerate(lines):
-            if FORMAL_MIXIN_RE.search(code_lines[index]):
-                replacements[index] = FORMAL_MIXIN_RE.sub("", line)
-
-        for index, line in enumerate(lines):
-            if index not in boring_indices:
+        output: List[str] = []
+        index = 0
+        changed = False
+        while index < len(lines):
+            if begin not in lines[index]:
+                output.append(lines[index])
+                index += 1
                 continue
-            helper = _enclosing_definition(lines, index)
-            if helper:
-                helper_ranges[index] = helper
-                ranges.append((helper[0], helper[1]))
-                removed_names.add(helper[2])
-                removed_text = "".join(lines[helper[0]:helper[1] + 1])
-                removed_identifiers.update(_identifiers(removed_text))
-                continue
-            declaration = _enclosing_declaration(lines, index)
-            if declaration:
-                ranges.append(declaration)
-                declaration_text = "".join(lines[declaration[0]:declaration[1] + 1])
-                match = VAL_RE.match(_code_without_line_comment(lines[declaration[0]]))
-                if match:
-                    removed_names.add(match.group(1))
-                removed_identifiers.update(_identifiers(declaration_text))
-
-        for index, line in enumerate(lines):
-            code = code_lines[index]
-            if remove_boring_import and re.match(
-                r"^\s*import\b.*\bBoringUtils\b",
-                code,
-            ):
-                ranges.append((index, index))
-                continue
-            if index in helper_ranges or any(start <= index <= end for start, end, _ in helper_ranges.values()):
-                continue
-            if any(start <= index <= end for start, end in ranges):
-                continue
-            helper_call = next(
-                (name for name in removed_names if re.search(rf"\b{re.escape(name)}\s*\(", code)),
-                None,
-            )
-            if helper_call:
-                end = _balanced_statement_end(lines, index)
-                if end is None:
-                    file_failures.append({
+            start = index
+            cursor = index + 1
+            while cursor < len(lines) and end not in lines[cursor]:
+                if begin in lines[cursor]:
+                    failures.append({
                         "path": _rel(path, case_workspace),
-                        "line": index + 1,
-                        "reason": f"unbalanced call to removed helper {helper_call}",
+                        "line": cursor + 1,
+                        "reason": "nested generated region",
                     })
-                else:
-                    ranges.append((index, end))
-                    removed_identifiers.update(_identifiers("".join(lines[index:end + 1])))
-                continue
-            formal_trigger = _formal_call_trigger(
-                code,
-                index,
-                hardware_ranges,
-                formal_library=formal_library,
-                assert_aliases=assert_aliases,
-            )
-            boring_trigger = BORING_CALL_RE.search(code) if index in boring_indices else None
-            if not (formal_trigger or boring_trigger):
-                continue
-            trigger = formal_trigger or boring_trigger
-            prefix = code[:trigger.start()] if trigger else code
-            expression_prefix = re.match(
-                r"^\s*(?:"
-                r"(?:private\s+|protected\s+|override\s+)*def\b.*=|"
-                r"case\b.*=>|"
-                r"(?:when|if)\s*\(.*\)\s*\{"
-                r")\s*$",
-                prefix,
-            )
-            call_end = _call_end_on_line(code, trigger.start()) if trigger else None
-            if formal_trigger and expression_prefix and call_end is not None:
-                raw_line = lines[index]
-                replacements[index] = (
-                    raw_line[:trigger.start()]
-                    + "()"
-                    + raw_line[call_end + 1:]
-                )
-                removed.append({
+                    break
+                cursor += 1
+            if cursor >= len(lines) or (cursor < len(lines) and begin in lines[cursor]):
+                failures.append({
                     "path": _rel(path, case_workspace),
-                    "line_start": index + 1,
-                    "line_end": index + 1,
-                    "text": raw_line.strip(),
+                    "line": start + 1,
+                    "reason": "unterminated generated region",
                 })
-                continue
-            inline_guard = re.match(r"^\s*(?:when|if)\s*\(", prefix)
-            if ("{" in prefix or "}" in prefix or ";" in prefix) and not inline_guard:
-                file_failures.append({
-                    "path": _rel(path, case_workspace),
-                    "line": index + 1,
-                    "reason": "formal call shares a line with an enclosing Scala structure",
-                })
-                continue
-            end = _balanced_statement_end(lines, index)
-            if end is None:
-                file_failures.append({
-                    "path": _rel(path, case_workspace),
-                    "line": index + 1,
-                    "reason": "unbalanced formal statement",
-                })
-                continue
-            ranges.append((index, end))
-            removed_text = "".join(lines[index:end + 1])
-            match = VAL_RE.match(_code_without_line_comment(lines[index]))
-            if match:
-                removed_names.add(match.group(1))
-            removed_identifiers.update(_identifiers(removed_text))
+                output = lines
+                changed = False
+                break
+            removed_text = "".join(lines[start:cursor + 1])
             removed.append({
                 "path": _rel(path, case_workspace),
-                "line_start": index + 1,
-                "line_end": end + 1,
-                "text": removed_text.strip(),
+                "line_start": start + 1,
+                "line_end": cursor + 1,
+                "sha256": hashlib.sha256(removed_text.encode("utf-8")).hexdigest(),
+                "reason": "profile_owned_generated_region",
             })
-
-        if file_failures:
-            failures.extend(file_failures)
-            continue
-        for index, replacement in replacements.items():
-            lines[index] = replacement
-        updated_lines = _remove_ranges(lines, ranges)
-        updated_lines, removed_names = _remove_dependent_verification_code(
-            updated_lines,
-            removed_names,
-        )
-        updated_lines = _remove_unused_verification_bindings(updated_lines, removed_identifiers)
-        updated = "".join(updated_lines)
-        if updated != original:
-            path.write_text(updated, encoding="utf-8")
+            changed = True
+            index = cursor + 1
+        if changed and not any(item["path"] == _rel(path, case_workspace) for item in failures):
+            path.write_text("".join(output), encoding="utf-8")
             changed_files.append(_rel(path, case_workspace))
-
     after = scan_formal_surface(case_workspace)
-    success = not failures and after["assertion_count"] == 0 and after["boringutils_count"] == 0
     return {
-        "schema_version": "formal_surface_cleanup.v1",
-        "success": success,
+        "schema_version": "formal_surface_cleanup.v2",
+        "success": not failures,
+        "policy": "profile_owned_generated_regions_only",
         "changed_files": changed_files,
         "removed_statements": removed,
         "failures": failures,

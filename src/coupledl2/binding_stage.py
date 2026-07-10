@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 from dataclasses import asdict
@@ -116,7 +117,12 @@ class BindingStage:
                 manifest,
                 self.catalog,
             )
-            self._write_success_artifacts(manifest, rtl_properties, target)
+            self._write_success_artifacts(
+                manifest,
+                rtl_properties,
+                target,
+                top_module=str(build.get("top_module") or ""),
+            )
             result = {
                 "schema_version": "stage_result.v2",
                 "stage": "bind_properties",
@@ -125,6 +131,7 @@ class BindingStage:
                 "model_calls": self.model_calls,
                 "binding_manifest_path": "binding_manifest.json",
                 "assertion_traceability_path": "assertion_traceability.json",
+                "assertion_delta_path": "assertion_delta.json",
                 "rtl_property_count": len(rtl_properties),
             }
             _write_json(self.stage_dir / "stage_result.json", result)
@@ -138,6 +145,7 @@ class BindingStage:
                         "binding_manifest": "binding_manifest.json",
                         "assertion_traceability": "assertion_traceability.json",
                         "rtl_label_result": "rtl_label_result.json",
+                        "assertion_delta": "assertion_delta.json",
                     },
                 },
             )
@@ -188,7 +196,13 @@ class BindingStage:
         manifest = self._load_reusable_manifest()
         trace_path = self.stage_dir / "assertion_traceability.json"
         labels_path = self.stage_dir / "rtl_label_result.json"
-        if manifest is None or not trace_path.is_file() or not labels_path.is_file():
+        delta_path = self.stage_dir / "assertion_delta.json"
+        if (
+            manifest is None
+            or not trace_path.is_file()
+            or not labels_path.is_file()
+            or not delta_path.is_file()
+        ):
             return None
         try:
             traceability = json.loads(trace_path.read_text(encoding="utf-8"))
@@ -230,6 +244,7 @@ class BindingStage:
             "model_calls": 0,
             "binding_manifest_path": "binding_manifest.json",
             "assertion_traceability_path": "assertion_traceability.json",
+            "assertion_delta_path": "assertion_delta.json",
             "rtl_property_count": len(labels),
         }
         _write_json(self.stage_dir / "stage_result.json", result)
@@ -243,6 +258,7 @@ class BindingStage:
                     "binding_manifest": "binding_manifest.json",
                     "assertion_traceability": "assertion_traceability.json",
                     "rtl_label_result": "rtl_label_result.json",
+                    "assertion_delta": "assertion_delta.json",
                 },
             },
         )
@@ -418,6 +434,8 @@ class BindingStage:
         manifest: Dict[str, Any],
         properties: tuple[RTLProperty, ...],
         target: Path,
+        *,
+        top_module: str,
     ) -> None:
         records = [
             {
@@ -464,11 +482,60 @@ class BindingStage:
         }
         if protocol_rule is not None:
             trace_record["protocol_rule"] = protocol_rule
+        traceability = {
+            "schema_version": "assertion_traceability.v1",
+            "properties": [trace_record],
+        }
+        traceability_path = self.stage_dir / "assertion_traceability.json"
+        _write_json(traceability_path, traceability)
+        baseline_path = (
+            self.workspace.results_dir / "preflight" / "baseline_assertion_inventory.json"
+        )
+        baseline_sha = _file_sha256(baseline_path) if baseline_path.is_file() else None
+        delta_records = []
+        for record in records:
+            label = record["rtl_label"]
+            delta_records.append({
+                **record,
+                "expected_property_id": f"{top_module}.{label}" if top_module else None,
+            })
+        baseline_scan_path = (
+            self.workspace.results_dir / "preflight" / "generated_assertion_scan.json"
+        )
+        baseline_labels = set()
+        if baseline_scan_path.is_file():
+            baseline_scan = json.loads(baseline_scan_path.read_text(encoding="utf-8"))
+            baseline_labels = {
+                item.get("label")
+                for item in baseline_scan.get("cl2_labels", [])
+                if item.get("label")
+            }
+        delta_labels = {item["rtl_label"] for item in delta_records}
+        if baseline_labels & delta_labels:
+            raise BindingStageError(
+                "assertion delta overlaps inherited baseline property labels"
+            )
         _write_json(
-            self.stage_dir / "assertion_traceability.json",
+            self.stage_dir / "assertion_delta.json",
             {
-                "schema_version": "assertion_traceability.v1",
-                "properties": [trace_record],
+                "schema_version": "assertion_delta.v1",
+                "property_profile_id": self.catalog.profile["property_profile_id"],
+                "instance_id": instance["instance_id"],
+                "base_label": instance["base_label"],
+                "top_module": top_module or None,
+                "source": {
+                    "path": _relative(target, self.workspace.run_dir),
+                    "sha256": _file_sha256(target),
+                    "render_result": "render_result.json",
+                },
+                "baseline_inventory": {
+                    "path": "../../preflight/baseline_assertion_inventory.json",
+                    "sha256": baseline_sha,
+                },
+                "traceability_sha256": _file_sha256(traceability_path),
+                "rtl_properties": delta_records,
+                "rtl_property_count": len(delta_records),
+                "baseline_label_overlap": [],
             },
         )
         self._snapshot_source(target, "after")
@@ -523,3 +590,7 @@ def _write_json(path: Path, value: Dict[str, Any]) -> None:
         json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()

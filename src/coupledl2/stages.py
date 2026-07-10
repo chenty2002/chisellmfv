@@ -62,6 +62,7 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         artifact_contract=(
             "binding_manifest.json",
             "assertion_traceability.json",
+            "assertion_delta.json",
             "rtl_label_result.json",
         ),
     ),
@@ -88,6 +89,7 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
             "formal_result.json",
             "property_status.json",
             "property_result_map.json",
+            "proof_events.jsonl",
         ),
     ),
     StageSpec(

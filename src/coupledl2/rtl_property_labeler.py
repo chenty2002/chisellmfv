@@ -89,8 +89,13 @@ def label_rtl_properties(
                     )
             occurrences.append((path, index, label_line, existing_label))
 
-    if existing:
-        raise RTLPropertyLabelError("generated RTL contains baseline or duplicate CL2/TL labels")
+    conflicting = sorted(
+        label for label in existing if label.startswith(base_label + "__E")
+    )
+    if conflicting:
+        raise RTLPropertyLabelError(
+            "generated RTL already contains labels owned by the selected property instance"
+        )
     minimum = int(match_contract["minimum_occurrences"])
     if len(occurrences) < minimum:
         raise RTLPropertyLabelError("no matching generated RTL properties")

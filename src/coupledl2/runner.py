@@ -141,6 +141,8 @@ class CoupledL2Runner:
                 self.last_verification_result = detail
                 if detail.get("verification_passed"):
                     break
+                if detail.get("verification_outcome") != "cex":
+                    break
             if current_stage == "waveform_explanation":
                 diagnoses = self._read_diagnoses()
                 if not diagnoses_allow_bugfix(diagnoses):

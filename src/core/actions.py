@@ -211,6 +211,13 @@ def execute_stage_actions(
             
             elif action_type == "write_report":
                 result = _execute_write_report(action, work_dir, logger)
+
+            elif action_type == "submit_property_diagnoses":
+                result = {
+                    "type": action_type,
+                    "success": True,
+                    "diagnosis_count": len(action.get("diagnoses", [])),
+                }
             
             elif action_type.startswith("waveform_"):
                 result = _execute_waveform_action(action, waveform_actions)

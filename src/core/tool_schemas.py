@@ -453,6 +453,59 @@ WRITE_REPORT_TOOL = {
 }
 
 
+SUBMIT_PROPERTY_DIAGNOSES_TOOL = {
+    "name": "submit_property_diagnoses",
+    "description": (
+        "Submit one complete diagnosis array covering every CEX primary property. "
+        "Each property must have its own conclusion even when evidence is shared."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "diagnoses": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "property": {"type": "string"},
+                        "classification": {
+                            "type": "string",
+                            "enum": [
+                                "design_bug", "property_schema_error", "template_error",
+                                "binding_error", "environment_error", "assumption_error",
+                                "inconclusive",
+                            ],
+                        },
+                        "evidence_refs": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "string"},
+                        },
+                        "uncertainty": {"type": "string"},
+                        "revision_target": {
+                            "type": "string",
+                            "enum": [
+                                "design_source", "property_schema", "assertion_template",
+                                "binding_manifest", "formal_contract", "assumptions", "none",
+                            ],
+                        },
+                    },
+                    "required": [
+                        "property", "classification", "evidence_refs",
+                        "uncertainty", "revision_target",
+                    ],
+                },
+            },
+            "summary": {"type": "string"},
+        },
+        "required": ["diagnoses"],
+        "additionalProperties": False,
+    },
+}
+
+
 def _completion_capable(schema: Dict[str, Any]) -> bool:
     return schema["name"] == "complete_stage"
 
@@ -495,7 +548,7 @@ def get_default_tool_registry() -> ToolRegistry:
     )
     _register_many(
         registry,
-        WAVEFORM_TOOLS + CAUSAL_TOOLS + [WRITE_REPORT_TOOL],
+        WAVEFORM_TOOLS + CAUSAL_TOOLS + [WRITE_REPORT_TOOL, SUBMIT_PROPERTY_DIAGNOSES_TOOL],
         {"waveform_explanation"},
         audit_level="evidence",
     )
@@ -545,10 +598,11 @@ def get_budgeted_tool_schemas(
             schema["name"]
             for schema in WAVEFORM_TOOLS + CAUSAL_TOOLS
         }
+        evidence_tools.add("submit_property_diagnoses")
         allowed = (
             evidence_tools | {"read_files", "write_report", "complete_stage"}
             if phase is BudgetPhase.EXECUTION
-            else {"write_report", "complete_stage"}
+            else {"submit_property_diagnoses", "write_report", "complete_stage"}
         )
     else:
         allowed = set()

@@ -28,6 +28,7 @@ class PropertyCatalog:
     schemas: Dict[str, Dict[str, Any]]
     templates: Dict[str, Dict[str, Any]]
     candidates: Dict[str, Dict[str, Any]]
+    formal_contract_id: str = ""
 
 
 def load_property_profile(profile_id: str) -> PropertyCatalog:
@@ -68,6 +69,9 @@ def load_property_profile(profile_id: str) -> PropertyCatalog:
         schemas=schemas,
         templates=templates,
         candidates=candidates,
+        formal_contract_id=profile.get(
+            "formal_contract_id", profile["property_profile_id"]
+        ),
     )
 
 
@@ -81,6 +85,7 @@ def public_catalog(catalog: PropertyCatalog) -> Dict[str, Any]:
     return {
         "schema_version": "property_catalog_view.v1",
         "property_profile_id": catalog.profile["property_profile_id"],
+        "formal_contract_id": catalog.formal_contract_id,
         "schemas": list(catalog.schemas.values()),
         "templates": [_public_template(template) for template in catalog.templates.values()],
         "candidates": [
@@ -233,14 +238,18 @@ def _validate_profile(value: Dict[str, Any], requested_id: str) -> None:
     fields = {
         "schema_version", "property_profile_id", "case_name", "chisel_family",
         "property_schema_ids", "template_ids", "build", "target",
-        "source_targets", "binding_candidates",
+        "source_targets", "binding_candidates", "formal_contract_id",
     }
-    required = fields - {"source_targets"}
+    required = fields - {"source_targets", "formal_contract_id"}
     _exact_fields(value, fields, required, "property_profile")
     if value["schema_version"] != "property_profile.v1":
         raise PropertyCatalogError("unsupported property profile version")
     if value["property_profile_id"] != requested_id:
         raise PropertyCatalogError("property profile id does not match filename")
+    if "formal_contract_id" in value and not re.fullmatch(
+        r"[a-z0-9_]+", value["formal_contract_id"]
+    ):
+        raise PropertyCatalogError("invalid formal contract id")
     _exact_fields(
         value["build"],
         {"recommended_make_target"},

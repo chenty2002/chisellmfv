@@ -12,8 +12,9 @@ conclusion to concrete trace, property, binding, or source evidence.
    from Chisel source alone.
 4. Check prior causal-analysis output when present, but verify each candidate
    against waveform values and source logic.
-5. Write `counterexample_analysis.md` with `write_report`, then finish with
-   `complete_stage`.
+5. Write `counterexample_analysis.md` with `write_report`.
+6. Call `submit_property_diagnoses` once with an entry for every CEX primary
+   property, then finish with `complete_stage`.
 
 ## Classification
 
@@ -33,6 +34,10 @@ conclusion to concrete trace, property, binding, or source evidence.
 
 Only `design_bug` permits Stage 5 design repair. Every other classification must
 identify the asset or environment layer that should be revised.
+
+The submitted property set must exactly equal the CEX primary set. Each entry
+must include concrete artifact `evidence_refs`, remaining `uncertainty`, and a
+`revision_target`; one global classification is not accepted.
 
 ## Signal Lookup Rules
 
