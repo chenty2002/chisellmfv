@@ -67,10 +67,26 @@ If a repair turn cannot compile `assume(...)`, use `assert(...)` only as a compi
 If the Verilog semantics are "arbitrary initial value, then updated by logic later", use arbitrary initial state supported by the formal flow. Do not replace it with a fixed `RegInit` value unless the Verilog has an explicit deterministic initial assignment.
 For Chisel registers that should be arbitrary initially, prefer resetless `Reg(...)` plus normal next-state updates.
 
+## Clock mapping
+
+For a single-clock VIS module, map clocked always blocks to the Chisel implicit clock unless the source has multiple clocks.
+Do not create an unused ordinary clk IO while registers use the implicit Chisel clock.
+If a source clock IO is preserved, every translated register from that clock domain must be enclosed in withClock(...).
+
 ## Initial blocks
 
 Preserve deterministic Verilog `initial` assignments with Chisel reset initialization only when the Verilog explicitly fixes the value.
 Do not silently "improve" suspicious-looking initialization or range logic. If the Verilog assigns or compares a value in a way that seems unreachable, translate that source behavior faithfully.
+Deterministic Verilog initial assignments are source behavior.
+Translate fixed initial constants to RegInit.
+If an initial assignment depends on a source input, preserve that dependency in the reset or initialization cone.
+Do not replace deterministic initial assignments with resetless arbitrary Reg.
+
+## Nondeterministic connectivity
+
+Every `$ND(...)` occurrence must become a real free input or documented arbitrary initial value.
+For free inputs, create a unique top-level or harness IO and connect it through every hierarchy level to the use site.
+Never drive a constrained nondeterministic input with DontCare, a fixed constant, or an unconnected internal wire.
 
 ## Arrays and ranges
 

@@ -14,7 +14,13 @@ from ..core.prompt_builder import build_assistant_tool_call_message
 from ..utils.file_utils import write_file as utils_write_file
 from ..utils.llm_logging import LLMLogger
 from .actions import execute_action
-from .gates import check_generated_verilog, check_prompt_leak, lint_scala_sources
+from .contract import build_translation_contract
+from .gates import (
+    check_generated_verilog,
+    check_prompt_leak,
+    evaluate_formal_readiness,
+    lint_scala_sources,
+)
 from .preflight import V2CPreflight
 from .prompt_builder import (
     build_v2c_conversion_prompt,
@@ -215,6 +221,46 @@ class Verilog2ChiselWorkflow:
                 })
                 continue
 
+            generated_text = self._generated_verilog_text()
+            contract = build_translation_contract(
+                target=self.benchmark,
+                input_summary=self.input_summary,
+                scala_files=scala_files,
+                input_hash=preflight_result.get("input_hash"),
+                top_module=top_module,
+            )
+            readiness = evaluate_formal_readiness(
+                input_summary=self.input_summary,
+                scala_files=scala_files,
+                compile_success=compile_success,
+                generated_verilog_success=generated.success,
+                generated_verilog_text=generated_text,
+            )
+            self._write_json("translation_contract.json", contract)
+            self._write_json("formal_readiness.json", readiness)
+            if not readiness.get("ready"):
+                if iteration == self.max_iterations:
+                    return self._finish(
+                        success=False,
+                        iterations=iteration,
+                        error_kind="formal_readiness_failed",
+                        lint=lint,
+                        generated=generated,
+                        extra={
+                            "translation_contract": "translation_contract.json",
+                            "formal_readiness": "formal_readiness.json",
+                            "blocking_issues": readiness.get("blocking_issues", []),
+                        },
+                    )
+                messages.append({
+                    "role": "user",
+                    "content": self._build_repair_prompt(
+                        readiness.get("blocking_issues", []),
+                        [*lint.errors, *readiness.get("blocking_issues", [])],
+                    ),
+                })
+                continue
+
             publish_result = None
             if self.publish:
                 publish_result = self._copy_to_extra_bench()
@@ -239,6 +285,8 @@ class Verilog2ChiselWorkflow:
                     "output_files": [path.name for path in scala_files],
                     "published": bool(self.publish),
                     "publish_message": publish_result[1] if publish_result else None,
+                    "translation_contract": "translation_contract.json",
+                    "formal_readiness": "formal_readiness.json",
                 },
             )
 
@@ -292,6 +340,10 @@ class Verilog2ChiselWorkflow:
             self.extra_bench_dir.mkdir(parents=True, exist_ok=True)
             for src_file in scala_files:
                 shutil.copy2(src_file, self.extra_bench_dir / src_file.name)
+            for filename in ("translation_contract.json", "formal_readiness.json"):
+                src_file = self.run_dir / filename
+                if src_file.is_file():
+                    shutil.copy2(src_file, self.extra_bench_dir / filename)
             return True, f"Copied {len(scala_files)} files to {self.extra_bench_dir}"
         except Exception as exc:
             return False, f"Failed to publish: {exc}"
@@ -318,6 +370,16 @@ class Verilog2ChiselWorkflow:
         for path in sorted(self.generated_dir.glob("*")):
             if path.is_file():
                 shutil.copy2(path, run_generated_dir / path.name)
+
+    def _generated_verilog_text(self) -> str:
+        chunks = []
+        for path in sorted(
+            item
+            for suffix in ("*.v", "*.sv")
+            for item in self.generated_dir.glob(suffix)
+        ):
+            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+        return "\n".join(chunks)
 
     def _call_llm(
         self,
@@ -443,7 +505,7 @@ class Verilog2ChiselWorkflow:
             "iterations": iterations,
             "input_files": input_files,
             "output_files": [path.name for path in scala_files],
-            "compile_success": bool(success and generated is not None),
+            "compile_success": bool(generated is not None),
             "generated_verilog": getattr(generated, "generated_files", []),
             "lint": getattr(lint, "counts", {}),
             "artifacts": {
@@ -452,6 +514,8 @@ class Verilog2ChiselWorkflow:
                 "prompt_bundle": "prompt_bundle.json",
                 "compile_attempts": "compile_attempts.jsonl",
                 "generated": "generated/",
+                "translation_contract": "translation_contract.json",
+                "formal_readiness": "formal_readiness.json",
             },
             "run_dir": str(run_dir),
         }
@@ -467,6 +531,11 @@ class Verilog2ChiselWorkflow:
             result.update(extra)
 
         if self.run_dir:
+            self._ensure_terminal_contract_artifacts(
+                result,
+                scala_files=scala_files,
+                generated=generated,
+            )
             lint_success = success if lint is None else not getattr(lint, "errors", [])
             self._write_json(
                 "lint_result.json",
@@ -488,6 +557,40 @@ class Verilog2ChiselWorkflow:
                 },
             )
         return result
+
+    def _ensure_terminal_contract_artifacts(
+        self,
+        result: Dict[str, Any],
+        *,
+        scala_files: List[Path],
+        generated: Optional[Any],
+    ) -> None:
+        if not self.input_summary or result.get("preflight_only"):
+            return
+        contract_path = self.run_dir / "translation_contract.json"
+        readiness_path = self.run_dir / "formal_readiness.json"
+        if not contract_path.is_file():
+            manifest_path = self.run_dir / "manifest.json"
+            input_hash = None
+            if manifest_path.is_file():
+                input_hash = self._read_json(manifest_path).get("input_hash")
+            contract = build_translation_contract(
+                target=self.benchmark,
+                input_summary=self.input_summary,
+                scala_files=scala_files,
+                input_hash=input_hash,
+                top_module=self._top_module_name(),
+            )
+            self._write_json("translation_contract.json", contract)
+        if not readiness_path.is_file():
+            readiness = evaluate_formal_readiness(
+                input_summary=self.input_summary,
+                scala_files=scala_files,
+                compile_success=bool(generated is not None),
+                generated_verilog_success=bool(getattr(generated, "success", False)),
+                generated_verilog_text=self._generated_verilog_text(),
+            )
+            self._write_json("formal_readiness.json", readiness)
 
     def _top_module_name(self) -> str:
         files = self.input_summary.get("files", [])

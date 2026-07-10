@@ -71,6 +71,7 @@ def build_v2c_repair_prompt(
             "Use only the supplied Verilog source semantics and deterministic source summary.",
             "Do not infer benchmark-specific repairs, labels, README facts, or external bug knowledge.",
             "Return a complete replacement file through `write_files`.",
+            "Fix the formal-readiness gate failures without changing source-only semantics; do not use DontCare for nondeterministic or assumed inputs, do not leave source clocks unused, and do not turn deterministic initial assignments into resetless Reg.",
             "",
             "The previous compile failed with these bounded errors:",
             "",
