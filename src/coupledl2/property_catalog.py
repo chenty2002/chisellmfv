@@ -36,6 +36,7 @@ class PropertyCatalog:
     candidates: Dict[str, Dict[str, Any]]
     formal_contract_id: str = ""
     review: Dict[str, Any] | None = None
+    gold_bindings: Dict[str, Any] | None = None
 
 
 def load_property_profile(profile_id: str, *, require_approved: bool = True) -> PropertyCatalog:
@@ -69,6 +70,16 @@ def load_property_profile(profile_id: str, *, require_approved: bool = True) -> 
     if any(template["chisel_family"] != profile["chisel_family"] for template in templates.values()):
         raise PropertyCatalogError("template chisel family does not match profile")
 
+    gold_binding_id = profile.get("gold_binding_id")
+    gold_binding_path = None
+    gold_bindings = None
+    if gold_binding_id:
+        gold_binding_path = ASSET_ROOT / "gold_bindings" / f"{gold_binding_id}.json"
+        gold_bindings = _read_json(gold_binding_path)
+        _validate_gold_bindings(
+            gold_bindings, gold_binding_id, profile, schemas, templates
+        )
+
     candidates = {
         item["candidate_id"]: item for item in profile["binding_candidates"]
     }
@@ -89,6 +100,15 @@ def load_property_profile(profile_id: str, *, require_approved: bool = True) -> 
             ASSET_ROOT / "formal_contracts" / f"{profile.get('formal_contract_id', profile_id)}.json"
         ),
     }
+    if gold_binding_path is not None:
+        assets[f"gold_bindings/{gold_binding_path.name}"] = gold_binding_path
+    if any(
+        schema["source"]["kind"] == "protocol_requirement"
+        for schema in schemas.values()
+    ):
+        assets["../protocol_assets/tilelink/rules.json"] = (
+            ASSET_ROOT.parent / "protocol_assets" / "tilelink" / "rules.json"
+        )
     try:
         review = load_property_review(profile_id)
         verify_review_assets(review, assets)
@@ -107,6 +127,7 @@ def load_property_profile(profile_id: str, *, require_approved: bool = True) -> 
             "formal_contract_id", profile["property_profile_id"]
         ),
         review=review,
+        gold_bindings=gold_bindings,
     )
 
 
@@ -325,8 +346,9 @@ def _validate_profile(value: Dict[str, Any], requested_id: str) -> None:
         "schema_version", "property_profile_id", "case_name", "chisel_family",
         "property_schema_ids", "template_ids", "build", "target",
         "source_targets", "binding_candidates", "formal_contract_id", "index_roots",
+        "gold_binding_id",
     }
-    required = fields - {"source_targets", "formal_contract_id"}
+    required = fields - {"source_targets", "formal_contract_id", "gold_binding_id"}
     _exact_fields(value, fields, required, "property_profile")
     if value["schema_version"] != "property_profile.v1":
         raise PropertyCatalogError("unsupported property profile version")
@@ -336,6 +358,10 @@ def _validate_profile(value: Dict[str, Any], requested_id: str) -> None:
         r"[a-z0-9_]+", value["formal_contract_id"]
     ):
         raise PropertyCatalogError("invalid formal contract id")
+    if "gold_binding_id" in value and not re.fullmatch(
+        r"[a-z0-9_]+", value["gold_binding_id"]
+    ):
+        raise PropertyCatalogError("invalid gold binding id")
     if (
         not isinstance(value["index_roots"], list)
         or not value["index_roots"]
@@ -474,3 +500,82 @@ def _validate_cross_references(
             and provenance["template_id"] not in templates
         ):
             raise PropertyCatalogError("candidate references template outside profile")
+
+
+def _validate_gold_bindings(
+    value: Dict[str, Any],
+    requested_id: str,
+    profile: Dict[str, Any],
+    schemas: Dict[str, Dict[str, Any]],
+    templates: Dict[str, Dict[str, Any]],
+) -> None:
+    fields = {
+        "schema_version", "gold_binding_id", "property_profile_id", "bindings",
+        "selection_trials",
+    }
+    _exact_fields(value, fields, fields, "gold_binding_list")
+    if value["schema_version"] != "gold_binding_list.v1":
+        raise PropertyCatalogError("unsupported gold binding list version")
+    if value["gold_binding_id"] != requested_id:
+        raise PropertyCatalogError("gold binding id does not match filename")
+    if value["property_profile_id"] != profile["property_profile_id"]:
+        raise PropertyCatalogError("gold binding profile mismatch")
+    bindings = value["bindings"]
+    if not isinstance(bindings, dict) or set(bindings) != set(schemas):
+        raise PropertyCatalogError("gold binding list must cover every profile schema")
+    candidates = {
+        candidate["candidate_id"]: candidate
+        for candidate in profile["binding_candidates"]
+    }
+    for schema_id, binding in bindings.items():
+        _exact_fields(
+            binding,
+            {"template_id", "bindings", "parameters", "base_label", "evidence"},
+            {"template_id", "bindings", "parameters", "base_label", "evidence"},
+            f"gold_binding_list.bindings.{schema_id}",
+        )
+        template_id = binding["template_id"]
+        if template_id not in templates or schema_id not in templates[template_id]["property_schema_ids"]:
+            raise PropertyCatalogError("gold binding template does not implement schema")
+        template = templates[template_id]
+        if set(binding["bindings"]) != set(template["slots"]):
+            raise PropertyCatalogError("gold binding must cover template slots")
+        for role, candidate_id in binding["bindings"].items():
+            candidate = candidates.get(candidate_id)
+            if (
+                candidate is None
+                or role not in candidate["roles"]
+                or candidate["type"] != template["slots"][role]["type"]
+            ):
+                raise PropertyCatalogError("gold binding candidate is incompatible")
+        if set(binding["parameters"]) != set(template["parameters"]):
+            raise PropertyCatalogError("gold binding parameters do not match template")
+    trials = value["selection_trials"]
+    if not isinstance(trials, list):
+        raise PropertyCatalogError("gold binding selection trials must be a list")
+    for trial in trials:
+        _exact_fields(
+            trial,
+            {
+                "slot", "ranked_candidate_ids", "gold_candidate_id",
+                "manual_corrected", "model", "evidence_ref", "reason",
+            },
+            {
+                "slot", "ranked_candidate_ids", "gold_candidate_id",
+                "manual_corrected", "model", "evidence_ref", "reason",
+            },
+            "gold_binding_list.selection_trials[]",
+        )
+        ranked = trial["ranked_candidate_ids"]
+        if (
+            not isinstance(ranked, list)
+            or len(ranked) < 2
+            or len(set(ranked)) != len(ranked)
+            or trial["gold_candidate_id"] not in ranked
+            or not isinstance(trial["manual_corrected"], bool)
+            or not all(
+                isinstance(trial[field], str) and trial[field]
+                for field in ("model", "evidence_ref", "reason")
+            )
+        ):
+            raise PropertyCatalogError("invalid gold binding selection trial")

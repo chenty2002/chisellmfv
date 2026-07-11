@@ -130,7 +130,10 @@ def _approved_executable_protocol_schemas() -> Dict[str, str]:
             continue
         assets = review.get("assets", [])
         kinds = {item.get("kind") for item in assets if isinstance(item, dict)}
-        if not {"profile", "schema", "template", "formal_contract"} <= kinds:
+        if not {
+            "rule_index", "profile", "schema", "template", "binding",
+            "formal_contract",
+        } <= kinds:
             continue
         for item in assets:
             if not isinstance(item, dict) or item.get("kind") != "schema":

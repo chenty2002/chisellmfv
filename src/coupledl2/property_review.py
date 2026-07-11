@@ -10,7 +10,9 @@ from typing import Dict, Mapping
 
 ASSET_ROOT = Path(__file__).with_name("property_assets")
 REVIEW_ROOT = ASSET_ROOT / "reviews"
-ASSET_KINDS = {"profile", "schema", "template", "formal_contract"}
+ASSET_KINDS = {
+    "rule_index", "profile", "schema", "template", "binding", "formal_contract"
+}
 
 
 class PropertyReviewError(ValueError):
