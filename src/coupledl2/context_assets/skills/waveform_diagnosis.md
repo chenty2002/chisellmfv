@@ -8,12 +8,17 @@ conclusion to concrete trace, property, binding, or source evidence.
 1. Locate the failed assertion or property label from the verification result or
    waveform filename.
 2. Read the assertion and surrounding source before interpreting the trace.
-3. Use waveform search tools to resolve exact signal names. Do not guess names
-   from Chisel source alone.
-4. Check prior causal-analysis output when present, but verify each candidate
+3. Read `transaction_trace.json`, `state_trace.json`, `wait_chain.json`, and
+   `diagnosis_evidence.json` when present. These deterministic artifacts are the
+   authority for event ordering and matching; never reconstruct a transaction
+   from signal-name intuition or prose.
+4. Use waveform search tools to resolve exact signal names only when the
+   structured evidence declares an observation missing. Do not guess names from
+   Chisel source alone.
+5. Check prior causal-analysis output when present, but verify each candidate
    against waveform values and source logic.
-5. Write `counterexample_analysis.md` with `write_report`.
-6. Call `submit_property_diagnoses` once with an entry for every CEX primary
+6. Write `counterexample_analysis.md` with `write_report`.
+7. Call `submit_property_diagnoses` once with an entry for every CEX primary
    property, then finish with `complete_stage`.
 
 ## Classification
