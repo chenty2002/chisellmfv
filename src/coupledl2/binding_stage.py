@@ -22,6 +22,7 @@ from .binding_contract import (
 from .property_catalog import load_property_profile, public_catalog
 from .rtl_property_labeler import RTLProperty, label_rtl_properties
 from .workspace import build_protocol_evidence
+from .campaign import write_campaign
 
 
 class BindingStageError(RuntimeError):
@@ -97,6 +98,7 @@ class BindingStage:
                 self._event("binding_manifest_reused", {})
 
             _write_json(self.stage_dir / "binding_manifest.json", manifest)
+            self._write_campaign(manifest)
             render = render_property_source(target, manifest, self.catalog)
             self._write_render_artifacts(render)
             build = self.backend.verify_compilation(require_assertions=False)
@@ -459,29 +461,23 @@ class BindingStage:
                 "properties": records,
             },
         )
-        instance = manifest["instances"][0]
-        schema = self.catalog.schemas[instance["property_schema_id"]]
         protocol_rules = build_protocol_evidence(self.catalog).get("rules", [])
-        protocol_rule = next(
-            (
-                rule
-                for rule in protocol_rules
-                if rule.get("locator") == schema["source"].get("locator")
-            ),
-            None,
-        )
-        trace_record = {
-            "instance_id": instance["instance_id"],
-            "property_schema_id": instance["property_schema_id"],
-            "template_id": instance["template_id"],
-            "base_label": instance["base_label"],
-            "binding_manifest_path": "binding_manifest.json",
-            "source": schema["source"],
-            "review_status": self.catalog.review["review_status"] if self.catalog.review else "not_reviewed",
-            "rtl_properties": records,
-        }
-        if self.catalog.review:
-            trace_record["review"] = {
+        trace_records = []
+        for instance in manifest["instances"]:
+            schema = self.catalog.schemas[instance["property_schema_id"]]
+            protocol_rule = next((rule for rule in protocol_rules if rule.get("locator") == schema["source"].get("locator")), None)
+            trace_record = {
+                "instance_id": instance["instance_id"],
+                "property_schema_id": instance["property_schema_id"],
+                "template_id": instance["template_id"],
+                "base_label": instance["base_label"],
+                "binding_manifest_path": "binding_manifest.json",
+                "source": schema["source"],
+                "review_status": self.catalog.review["review_status"] if self.catalog.review else "not_reviewed",
+                "rtl_properties": [item for item in records if item["rtl_label"].startswith(instance["base_label"] + "__E")],
+            }
+            if self.catalog.review:
+                trace_record["review"] = {
                 "review_id": self.catalog.review["review_id"],
                 "reviewer": self.catalog.review["reviewer"],
                 "reviewed_at": self.catalog.review["reviewed_at"],
@@ -489,12 +485,13 @@ class BindingStage:
                     item["path"]: item["sha256"]
                     for item in self.catalog.review["assets"]
                 },
-            }
-        if protocol_rule is not None:
-            trace_record["protocol_rule"] = protocol_rule
+                }
+            if protocol_rule is not None:
+                trace_record["protocol_rule"] = protocol_rule
+            trace_records.append(trace_record)
         traceability = {
             "schema_version": "assertion_traceability.v1",
-            "properties": [trace_record],
+            "properties": trace_records,
         }
         traceability_path = self.stage_dir / "assertion_traceability.json"
         _write_json(traceability_path, traceability)
@@ -530,8 +527,8 @@ class BindingStage:
             {
                 "schema_version": "assertion_delta.v1",
                 "property_profile_id": self.catalog.profile["property_profile_id"],
-                "instance_id": instance["instance_id"],
-                "base_label": instance["base_label"],
+                "instance_ids": [item["instance_id"] for item in manifest["instances"]],
+                "base_labels": [item["base_label"] for item in manifest["instances"]],
                 "top_module": top_module or None,
                 "source": {
                     "path": _relative(target, self.workspace.run_dir),
@@ -549,6 +546,78 @@ class BindingStage:
             },
         )
         self._snapshot_source(target, "after")
+
+    def _write_campaign(self, manifest: Dict[str, Any]) -> None:
+        formal_path = self.workspace.results_dir / "preflight" / "formal_contract.json"
+        formal_sha = _file_sha256(formal_path) if formal_path.is_file() else "0" * 64
+        formal = (
+            json.loads(formal_path.read_text(encoding="utf-8"))
+            if formal_path.is_file()
+            else {}
+        )
+        reviewed_hashes = {
+            item["path"]: item["sha256"]
+            for item in (self.catalog.review or {}).get("assets", [])
+        }
+        packages = []
+        for instance in manifest["instances"]:
+            package = {
+                key: instance[key]
+                for key in ("instance_id", "property_schema_id", "template_id", "base_label")
+            }
+            schema_name = next(
+                path for path in reviewed_hashes
+                if path.startswith("schemas/")
+                and Path(path).stem.lower() == instance["property_schema_id"].lower()
+            )
+            template_name = next(
+                path for path in reviewed_hashes
+                if path.startswith("templates/")
+                and Path(path).stem == instance["template_id"]
+            )
+            package_material = {
+                "instance": instance,
+                "review_id": (self.catalog.review or {}).get("review_id"),
+                "asset_hashes": {
+                    path: reviewed_hashes[path]
+                    for path in sorted(reviewed_hashes)
+                    if path in {
+                        schema_name,
+                        template_name,
+                        f"profiles/{self.catalog.profile['property_profile_id']}.json",
+                        f"formal_contracts/{self.catalog.formal_contract_id}.json",
+                        f"gold_bindings/{self.catalog.profile.get('gold_binding_id')}.json",
+                    }
+                },
+            }
+            package["package_sha256"] = hashlib.sha256(
+                json.dumps(package_material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            package["proof_budget_s"] = int(
+                formal.get("resources", {}).get("per_property_timeout_s", 300)
+            )
+            packages.append(package)
+        payload = {
+            "schema_version": "verification_campaign.v1",
+            "campaign_id": self.workspace.run_dir.name.lower().replace(".", "-")[:96],
+            "case_name": getattr(self.workspace.config, "case_name", self.workspace.run_dir.name),
+            "property_profile_id": self.catalog.profile["property_profile_id"],
+            "formal_contract": {
+                "path": "../../preflight/formal_contract.json",
+                "sha256": formal_sha,
+            },
+            "groups": [{
+                "group_id": "bounded_batch_0",
+                "selector": {"mode": "approved_manifest"},
+                "property_packages": packages,
+            }],
+            "run_config": {
+                "seed": 0,
+                "tool": formal.get("tool", {}).get("name", "jaspergold"),
+                "tool_version": formal.get("tool", {}).get("version", "unknown"),
+            },
+        }
+        write_campaign(self.stage_dir / "verification_campaign.json", payload)
 
     def _snapshot_source(self, target: Path, phase: str) -> None:
         destination = self.stage_dir / "source_snapshot" / phase / target.name

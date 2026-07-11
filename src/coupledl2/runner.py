@@ -12,6 +12,8 @@ from .indexer import compute_index_hashes, compute_workspace_hash, refresh_index
 from .preflight import CoupledL2Preflight
 from .stages import COUPLEDL2_STAGES, get_stage_spec
 from .workspace import CoupledL2Workspace
+from .revision import design_bug_is_eligible
+from .transaction_reconstructor import materialize_diagnosis_artifacts
 from ..core.records import (
     build_run_cost_summary,
     merge_run_cost_summaries,
@@ -109,6 +111,8 @@ class CoupledL2Runner:
                     self.logger,
                 ).run()
             else:
+                if current_stage == "waveform_explanation":
+                    self._materialize_trace_evidence()
                 waveform_path = self._counterexample_path() if current_stage == "waveform_explanation" else None
                 workflow = self.workflow_cls(
                     llm_client=self.llm_client,
@@ -145,7 +149,7 @@ class CoupledL2Runner:
                     break
             if current_stage == "waveform_explanation":
                 diagnoses = self._read_diagnoses()
-                if not diagnoses_allow_bugfix(diagnoses):
+                if not self._diagnoses_allow_bugfix(diagnoses):
                     self._write_revision_request(diagnoses)
                     break
 
@@ -201,7 +205,7 @@ class CoupledL2Runner:
                 raise ValueError("waveform_explanation requires a counterexample path")
         if stage == "propose_bugfix":
             diagnoses = self._read_diagnoses()
-            if not diagnoses_allow_bugfix(diagnoses):
+            if not self._diagnoses_allow_bugfix(diagnoses):
                 raise ValueError(
                     "propose_bugfix requires every diagnosis to be design_bug"
                 )
@@ -213,6 +217,13 @@ class CoupledL2Runner:
             return None
         path = Path(value)
         return str(path if path.is_absolute() else self.workspace.run_dir / path)
+
+    def _materialize_trace_evidence(self) -> None:
+        stage3 = self.workspace.results_dir / "by_stage" / get_stage_spec("invoke_verification").directory_name
+        stage4 = self.workspace.results_dir / "by_stage" / get_stage_spec("waveform_explanation").directory_name
+        decode_input = stage3 / "trace_decode_input.json"
+        if decode_input.is_file():
+            materialize_diagnosis_artifacts(decode_input, stage4)
 
     def _read_diagnoses(self) -> list[Dict[str, Any]]:
         path = (
@@ -230,11 +241,11 @@ class CoupledL2Runner:
     def _write_revision_request(self, diagnoses: list[Dict[str, Any]]) -> None:
         layer_by_classification = {
             "property_schema_error": "property_schema",
-            "template_error": "assertion_template",
-            "binding_error": "binding_manifest",
+            "template_error": "template",
+            "binding_error": "binding",
             "environment_error": "environment",
-            "assumption_error": "assumptions",
-            "inconclusive": "analysis",
+            "assumption_error": "formal_contract",
+            "inconclusive": "environment",
         }
         requests = []
         for item in diagnoses:
@@ -248,11 +259,17 @@ class CoupledL2Runner:
                         "jaspergold_property_id"
                     ),
                     "classification": classification,
-                    "asset_layer": layer_by_classification.get(
+                    "revision_target": layer_by_classification.get(
                         classification,
-                        "analysis",
+                        "environment",
                     ),
-                    "evidence": item.get("evidence", []),
+                    "parent_run_id": self.workspace.run_dir.name,
+                    "old_asset_sha256": self._revision_asset_hash(
+                        layer_by_classification.get(classification, "environment"),
+                        item,
+                    ),
+                    "reason": item.get("uncertainty") or classification,
+                    "evidence_refs": item.get("evidence_refs", []),
                 }
             )
         path = (
@@ -261,12 +278,61 @@ class CoupledL2Runner:
             / get_stage_spec("waveform_explanation").directory_name
             / "revision_request.json"
         )
+
+    def _revision_asset_hash(self, target: str, diagnosis: Dict[str, Any]) -> str:
+        import hashlib
+
+        stage2 = self.workspace.results_dir / "by_stage" / get_stage_spec("bind_properties").directory_name
+        if target == "binding":
+            path = stage2 / "binding_manifest.json"
+        elif target in {"formal_contract", "environment"}:
+            path = self.workspace.results_dir / "preflight" / "formal_contract.json"
+        else:
+            traceability = json.loads((stage2 / "assertion_traceability.json").read_text(encoding="utf-8"))
+            prop = next(
+                item for item in traceability.get("properties", [])
+                if item.get("instance_id") == diagnosis.get("instance_id")
+                or item.get("property_schema_id") == diagnosis.get("property_schema_id")
+            )
+            prefix = "schemas/" if target == "property_schema" else "templates/"
+            asset_id = prop["property_schema_id"] if target == "property_schema" else prop["template_id"]
+            reviewed = prop.get("review", {}).get("asset_hashes", {})
+            return next(
+                sha for asset_path, sha in reviewed.items()
+                if asset_path.startswith(prefix) and Path(asset_path).stem.lower() == asset_id.lower()
+            )
+        return hashlib.sha256(path.read_bytes()).hexdigest()
         _write_json(
             path,
             {
-                "schema_version": "revision_request.v1",
+                "schema_version": "revision_request.v2",
                 "requests": requests,
             },
+        )
+
+    def _diagnoses_allow_bugfix(self, diagnoses: list[Dict[str, Any]]) -> bool:
+        stage2 = self.workspace.results_dir / "by_stage" / get_stage_spec("bind_properties").directory_name
+        stage4 = self.workspace.results_dir / "by_stage" / get_stage_spec("waveform_explanation").directory_name
+        evidence_path = stage4 / "diagnosis_evidence.json"
+        review_ok = False
+        traceability = stage2 / "assertion_traceability.json"
+        if traceability.is_file():
+            payload = json.loads(traceability.read_text(encoding="utf-8"))
+            review_ok = bool(payload.get("properties")) and all(item.get("review_status") == "approved" for item in payload["properties"])
+        evidence_properties = set()
+        if evidence_path.is_file():
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence_properties = {
+                item.get("property") for item in evidence.get("properties", [])
+            }
+        return bool(diagnoses) and all(
+            design_bug_is_eligible(
+                item,
+                package_approved=review_ok,
+                formal_contract_approved=review_ok,
+                reconstruction_available=item.get("property") in evidence_properties,
+            )
+            for item in diagnoses
         )
 
     def _read_handoff(self, stage: str) -> Optional[Dict[str, Any]]:

@@ -52,7 +52,7 @@ def binding_manifest_tool(catalog: PropertyCatalog) -> Dict[str, Any]:
     return {
         "name": "submit_binding_manifest",
         "description": (
-            "Submit one property binding using repository candidate IDs. Slots with "
+            "Submit one to eight property bindings using repository candidate IDs. Slots with "
             "one compatible candidate are deterministic; only slots listed by "
             "model_selectable_slots represent a model choice."
         ),
@@ -70,7 +70,7 @@ def binding_manifest_tool(catalog: PropertyCatalog) -> Dict[str, Any]:
                 "instances": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 1,
+                    "maxItems": 8,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
@@ -202,28 +202,40 @@ def validate_binding_manifest(
         "$.property_profile_id",
     )
     instances = payload["instances"]
-    if not isinstance(instances, list) or len(instances) != 1:
-        raise BindingContractError("$.instances", "cardinality", "must contain exactly one instance")
-    instance = instances[0]
+    if not isinstance(instances, list) or not 1 <= len(instances) <= 8:
+        raise BindingContractError("$.instances", "cardinality", "must contain one to eight instances")
+    instance_ids = [item.get("instance_id") for item in instances if isinstance(item, dict)]
+    base_labels = [item.get("base_label") for item in instances if isinstance(item, dict)]
+    if len(set(instance_ids)) != len(instances):
+        raise BindingContractError("$.instances", "duplicate_value", "instance ids must be globally unique")
+    if len(set(base_labels)) != len(instances):
+        raise BindingContractError("$.instances", "duplicate_value", "base labels must be globally unique")
+    for index, instance in enumerate(instances):
+        _validate_instance(instance, catalog, index)
+    return copy.deepcopy(payload)
+
+
+def _validate_instance(instance: Dict[str, Any], catalog: PropertyCatalog, index: int) -> None:
+    path = f"$.instances[{index}]"
     fields = {
         "instance_id", "property_schema_id", "template_id", "target",
         "bindings", "parameters", "base_label", "evidence",
     }
-    _object(instance, fields, "$.instances[0]")
+    _object(instance, fields, path)
     if not re.fullmatch(r"[a-z0-9_]{1,96}", instance["instance_id"]):
-        raise BindingContractError("$.instances[0].instance_id", "invalid_value", "invalid instance id")
+        raise BindingContractError(f"{path}.instance_id", "invalid_value", "invalid instance id")
     schema_id = instance["property_schema_id"]
     template_id = instance["template_id"]
     if schema_id not in catalog.schemas:
         raise BindingContractError(
-            "$.instances[0].property_schema_id",
+            f"{path}.property_schema_id",
             "unknown_value",
             "unknown property schema",
             sorted(catalog.schemas),
         )
     if template_id not in catalog.templates:
         raise BindingContractError(
-            "$.instances[0].template_id",
+            f"{path}.template_id",
             "template_incompatible",
             "template is not allowed by profile",
             sorted(catalog.templates),
@@ -231,22 +243,22 @@ def validate_binding_manifest(
     template = catalog.templates[template_id]
     if schema_id not in template["property_schema_ids"]:
         raise BindingContractError(
-            "$.instances[0].template_id",
+            f"{path}.template_id",
             "template_incompatible",
             "template does not implement selected schema",
             catalog.schemas[schema_id]["template_ids"],
         )
     target = instance["target"]
-    _object(target, {"file_id", "marker_id"}, "$.instances[0].target")
-    _equal(target["file_id"], catalog.profile["target"]["file_id"], "$.instances[0].target.file_id")
-    _equal(target["marker_id"], catalog.profile["target"]["marker_id"], "$.instances[0].target.marker_id")
+    _object(target, {"file_id", "marker_id"}, f"{path}.target")
+    _equal(target["file_id"], catalog.profile["target"]["file_id"], f"{path}.target.file_id")
+    _equal(target["marker_id"], catalog.profile["target"]["marker_id"], f"{path}.target.marker_id")
     if not isinstance(instance["base_label"], str) or not BASE_LABEL_RE.fullmatch(instance["base_label"]):
-        raise BindingContractError("$.instances[0].base_label", "invalid_value", "invalid CL2/TL base label")
+        raise BindingContractError(f"{path}.base_label", "invalid_value", "invalid CL2/TL base label")
 
     bindings = instance["bindings"]
     if not isinstance(bindings, dict) or set(bindings) != set(template["slots"]):
         raise BindingContractError(
-            "$.instances[0].bindings",
+            f"{path}.bindings",
             "candidate_incompatible",
             "bindings must cover exactly the template slots",
             sorted(template["slots"]),
@@ -265,7 +277,7 @@ def validate_binding_manifest(
                 if role in item["roles"] and item["type"] == expected_type
             )
             raise BindingContractError(
-                f"$.instances[0].bindings.{role}",
+                f"{path}.bindings.{role}",
                 "candidate_incompatible",
                 "candidate role or type is incompatible",
                 allowed,
@@ -273,7 +285,7 @@ def validate_binding_manifest(
     parameters = instance["parameters"]
     if not isinstance(parameters, dict) or set(parameters) != set(template["parameters"]):
         raise BindingContractError(
-            "$.instances[0].parameters",
+            f"{path}.parameters",
             "parameter_out_of_range",
             "parameters must cover exactly the template parameters",
             sorted(template["parameters"]),
@@ -288,24 +300,23 @@ def validate_binding_manifest(
             or value > definition["maximum"]
         ):
             raise BindingContractError(
-                f"$.instances[0].parameters.{name}",
+                f"{path}.parameters.{name}",
                 "parameter_out_of_range",
                 "parameter is outside the allowed range",
                 [definition["minimum"], definition["maximum"]],
             )
     evidence = instance["evidence"]
     if not isinstance(evidence, list) or len(evidence) > 4:
-        raise BindingContractError("$.instances[0].evidence", "cardinality", "evidence has at most four items")
+        raise BindingContractError(f"{path}.evidence", "cardinality", "evidence has at most four items")
     for index, item in enumerate(evidence):
-        _object(item, {"candidate_id"}, f"$.instances[0].evidence[{index}]")
+        _object(item, {"candidate_id"}, f"{path}.evidence[{index}]")
         if item["candidate_id"] not in catalog.candidates:
             raise BindingContractError(
-                f"$.instances[0].evidence[{index}].candidate_id",
+                f"{path}.evidence[{index}].candidate_id",
                 "unknown_value",
                 "unknown candidate",
                 sorted(catalog.candidates),
             )
-    return copy.deepcopy(payload)
 
 
 def apply_binding_patch(
@@ -315,13 +326,20 @@ def apply_binding_patch(
 ) -> Dict[str, Any]:
     _object(patch, {"schema_version", "instance_id", "operations"}, "$")
     _equal(patch["schema_version"], "binding_patch.v1", "$.schema_version")
-    instance = manifest["instances"][0]
-    _equal(patch["instance_id"], instance["instance_id"], "$.instance_id")
+    matching = [
+        item for item in manifest["instances"]
+        if item.get("instance_id") == patch["instance_id"]
+    ]
+    if len(matching) != 1:
+        raise BindingContractError("$.instance_id", "unknown_value", "instance id is not present in manifest")
     operations = patch["operations"]
     if not isinstance(operations, list) or not 1 <= len(operations) <= 4:
         raise BindingContractError("$.operations", "cardinality", "patch requires one to four operations")
     updated = copy.deepcopy(manifest)
-    target = updated["instances"][0]
+    target = next(
+        item for item in updated["instances"]
+        if item["instance_id"] == patch["instance_id"]
+    )
     for index, operation in enumerate(operations):
         path = f"$.operations[{index}]"
         _object(operation, {"op", "name", "value"}, path)

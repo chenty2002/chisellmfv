@@ -361,9 +361,12 @@ def _build_stage_inputs(
         if result_map_path.is_file() and manifest_path.is_file():
             result_map = json.loads(result_map_path.read_text(encoding="utf-8"))
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            instance = manifest["instances"][0]
+            instances = {
+                item["instance_id"]: item for item in manifest["instances"]
+            }
             failed = []
             for prop in result_map.get("properties", []):
+                instance = instances.get(prop.get("instance_id"), {})
                 for result in prop.get("primary_results", []):
                     if result.get("status") == "cex":
                         failed.append(
@@ -391,6 +394,12 @@ def _build_stage_inputs(
                             }
                         )
             payload["failed_property_traces"] = failed
+            stage4_dir = workspace.results_dir / "by_stage" / get_stage_spec("waveform_explanation").directory_name
+            payload["deterministic_trace_evidence"] = {
+                name: f"results/by_stage/{get_stage_spec('waveform_explanation').directory_name}/{name}.json"
+                for name in ("transaction_trace", "state_trace", "wait_chain", "diagnosis_evidence")
+                if (stage4_dir / f"{name}.json").is_file()
+            }
     return payload
 
 

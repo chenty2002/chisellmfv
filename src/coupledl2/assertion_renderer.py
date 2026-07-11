@@ -25,6 +25,7 @@ class RenderResult:
     target_path: Path
     rendered_fragments: tuple[str, ...]
     base_label: str
+    base_labels: tuple[str, ...]
     sha256_before: str
     sha256_after: str
     diff: str
@@ -44,44 +45,46 @@ def render_property_source(
     if GENERATED_BEGIN in original or GENERATED_END in original:
         raise AssertionRenderError("generated fragment markers already exist")
 
-    instance = manifest["instances"][0]
-    template = catalog.templates[instance["template_id"]]
-    replacements = {
-        role: catalog.candidates[candidate_id]["expression"]
-        for role, candidate_id in instance["bindings"].items()
-    }
-    replacements.update(
-        {name: str(value) for name, value in instance["parameters"].items()}
-    )
-    replacements["base_label"] = instance["base_label"]
-    assertion = _render_fragment(
-        template["fragments"]["assertion_block"],
-        replacements,
-    )
-    support = template["fragments"]["support_block"]
-    if support:
-        allowed_support = set(replacements) | {"ASSERTION_BLOCK"}
-        unknown_support = set(PLACEHOLDER_RE.findall(support)) - allowed_support
-        if unknown_support:
-            raise AssertionRenderError(
-                f"undeclared placeholder in support block: {sorted(unknown_support)}"
-            )
-        if support.count("{{ASSERTION_BLOCK}}") != 1:
-            raise AssertionRenderError("support block must contain one assertion placeholder")
-        rendered_support = _render_fragment(
-            support.replace("{{ASSERTION_BLOCK}}", assertion),
-            replacements,
-        )
-        rendered = rendered_support
-        fragments = (support, assertion)
-    else:
-        rendered = assertion
-        fragments = (assertion,)
-    if PLACEHOLDER_RE.search(rendered):
-        raise AssertionRenderError("undeclared placeholder remains after rendering")
+    rendered_instances = []
+    fragments = ()
+    source_renderings: Dict[Path, list[str]] = {}
+    case_root = _case_root_for_target(target_path, catalog.profile["target"]["relative_path"])
+    for instance in manifest["instances"]:
+        template = catalog.templates[instance["template_id"]]
+        replacements = {
+            role: catalog.candidates[candidate_id]["expression"]
+            for role, candidate_id in instance["bindings"].items()
+        }
+        replacements.update({name: str(value) for name, value in instance["parameters"].items()})
+        replacements["base_label"] = instance["base_label"]
+        assertion = _render_fragment(template["fragments"]["assertion_block"], replacements)
+        support = template["fragments"]["support_block"]
+        if support:
+            allowed_support = set(replacements) | {"ASSERTION_BLOCK"}
+            unknown_support = set(PLACEHOLDER_RE.findall(support)) - allowed_support
+            if unknown_support or support.count("{{ASSERTION_BLOCK}}") != 1:
+                raise AssertionRenderError("invalid support block placeholders")
+            rendered = _render_fragment(support.replace("{{ASSERTION_BLOCK}}", assertion), replacements)
+            fragments = (*fragments, support, assertion)
+        else:
+            rendered = assertion
+            fragments = (*fragments, assertion)
+        rendered_instances.append(rendered)
+        source_block = template["fragments"].get("source_block", "")
+        source_targets = catalog.profile.get("source_targets", [])
+        if bool(source_block) != bool(source_targets):
+            raise AssertionRenderError("source block and source targets must be declared together")
+        for source_target in source_targets:
+            source_path = case_root / source_target["relative_path"]
+            source_replacements = dict(replacements)
+            source_replacements["source_label"] = instance["base_label"]
+            rendered_source = _render_fragment(source_block, source_replacements)
+            source_renderings.setdefault(source_path, []).append(rendered_source)
+            fragments = (*fragments, rendered_source)
 
+    rendered = "\n".join(rendered_instances)
     updated = _render_into_marker(original, marker, rendered)
-    if template.get("requires_formal_mixin") or "fvAssert(" in rendered:
+    if any(catalog.templates[item["template_id"]].get("requires_formal_mixin") for item in manifest["instances"]) or "fvAssert(" in rendered:
         formal_anchor = "new LazyModuleImp(this) with Formal {"
         plain_anchor = "new LazyModuleImp(this) {"
         if updated.count(formal_anchor) == 0:
@@ -94,30 +97,16 @@ def render_property_source(
             raise AssertionRenderError("Formal mixin must be unique")
 
     source_updates: Dict[Path, tuple[str, str]] = {}
-    source_block = template["fragments"].get("source_block", "")
-    source_targets = catalog.profile.get("source_targets", [])
-    if source_block and not source_targets:
-        raise AssertionRenderError("source block requires at least one source target")
-    if source_targets and not source_block:
-        raise AssertionRenderError("source target requires a source block")
-    case_root = _case_root_for_target(
-        target_path,
-        catalog.profile["target"]["relative_path"],
-    )
-    for source_target in source_targets:
-        source_path = case_root / source_target["relative_path"]
+    for source_path, blocks in source_renderings.items():
         if not source_path.is_file():
-            raise AssertionRenderError(f"source target not found: {source_target['relative_path']}")
+            raise AssertionRenderError(f"source target not found: {source_path}")
         source_original = source_path.read_text(encoding="utf-8")
+        source_target = next(item for item in catalog.profile["source_targets"] if case_root / item["relative_path"] == source_path)
         source_marker = source_target["marker_text"]
         if source_original.count(source_marker) != 1:
             raise AssertionRenderError("source marker must occur exactly once")
-        source_replacements = dict(replacements)
-        source_replacements["source_label"] = instance["base_label"]
-        rendered_source = _render_fragment(source_block, source_replacements)
-        source_updated = _render_into_marker(source_original, source_marker, rendered_source)
+        source_updated = _render_into_marker(source_original, source_marker, "\n".join(blocks))
         source_updates[source_path] = (source_original, source_updated)
-        fragments = (*fragments, rendered_source)
 
     before_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
     after_hash = hashlib.sha256(updated.encode("utf-8")).hexdigest()
@@ -144,7 +133,8 @@ def render_property_source(
     return RenderResult(
         target_path=target_path,
         rendered_fragments=fragments,
-        base_label=instance["base_label"],
+        base_label=manifest["instances"][0]["base_label"],
+        base_labels=tuple(item["base_label"] for item in manifest["instances"]),
         sha256_before=before_hash,
         sha256_after=after_hash,
         diff=diff,

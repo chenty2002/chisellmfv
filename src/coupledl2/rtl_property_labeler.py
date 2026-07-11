@@ -39,10 +39,36 @@ def label_rtl_properties(
     catalog: PropertyCatalog,
 ) -> tuple[RTLProperty, ...]:
     """Label every elaboration matching the selected template source annotation."""
-    instance = manifest["instances"][0]
+    suffixes = (
+        [catalog.templates[manifest["instances"][0]["template_id"]]["rtl_match"]["source_annotation_suffix"]]
+        if len(manifest["instances"]) == 1
+        else [
+            _instance_source_suffix(generated_files, item, catalog)
+            for item in manifest["instances"]
+        ]
+    )
+    if len(suffixes) != len(set(suffixes)):
+        raise RTLPropertyLabelError(
+            "batch instances require distinct RTL source annotations"
+        )
+    results: list[RTLProperty] = []
+    for instance, suffix in zip(manifest["instances"], suffixes):
+        results.extend(_label_single(generated_files, instance, catalog, suffix))
+    labels = [item.rtl_label for item in results]
+    if len(set(labels)) != len(labels):
+        raise RTLPropertyLabelError("concrete RTL labels are not globally unique")
+    return tuple(results)
+
+
+def _label_single(
+    generated_files: Sequence[Path],
+    instance: Dict,
+    catalog: PropertyCatalog,
+    source_suffix: str,
+) -> tuple[RTLProperty, ...]:
     template = catalog.templates[instance["template_id"]]
     match_contract = template["rtl_match"]
-    suffix = match_contract["source_annotation_suffix"]
+    suffix = source_suffix
     base_label = instance["base_label"]
     files = sorted({Path(path).resolve() for path in generated_files})
     existing: list[str] = []
@@ -147,3 +173,33 @@ def label_rtl_properties(
         if len(re.findall(rf"\b{re.escape(result.rtl_label)}\b", all_text)) != 1:
             raise RTLPropertyLabelError("concrete RTL label is not globally unique")
     return tuple(results)
+
+
+def _instance_source_suffix(
+    generated_files: Sequence[Path],
+    instance: Dict,
+    catalog: PropertyCatalog,
+) -> str:
+    """Resolve the rendered assertion's exact source line for batch ownership."""
+    relative = Path(catalog.profile["target"]["relative_path"])
+    for generated in generated_files:
+        path = Path(generated).resolve()
+        chisel_root = next(
+            (parent for parent in (path, *path.parents) if parent.name == "Chisel"),
+            None,
+        )
+        if chisel_root is None:
+            continue
+        source_relative = Path(*relative.parts[1:]) if relative.parts and relative.parts[0] == "Chisel" else relative
+        source = chisel_root / source_relative
+        if not source.is_file():
+            continue
+        matches = [
+            index
+            for index, line in enumerate(source.read_text(encoding="utf-8").splitlines(), 1)
+            if instance["base_label"] in line and "assert" in line
+        ]
+        if len(matches) == 1:
+            annotation_path = source_relative.as_posix()
+            return f"{annotation_path} {matches[0]}:"
+    return catalog.templates[instance["template_id"]]["rtl_match"]["source_annotation_suffix"]

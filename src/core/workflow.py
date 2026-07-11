@@ -2687,6 +2687,9 @@ class FormalWorkflow:
                 "property_result_map": "property_result_map.json",
             }
         elif stage == "waveform_explanation":
+            stage_dir = self._coupledl2_stage_dir(stage)
+            if stage_dir is None:
+                raise RuntimeError("CoupledL2 waveform handoff requires a run context")
             diagnosis_path = stage_dir / "diagnosis.json"
             diagnosis_payload = (
                 json.loads(diagnosis_path.read_text(encoding="utf-8"))
