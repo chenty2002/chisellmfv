@@ -1,0 +1,19 @@
+{
+  "schema_version": "assertion_template.v1",
+  "template_id": "chisel3_tl_identifier_pairing",
+  "chisel_family": "chisel3",
+  "api_family": "chisel_builtin",
+  "api_primitive": "assert",
+  "semantic_shape": "grant_ack_scoreboard",
+  "requires_formal_mixin": true,
+  "allowed_profile_ids": ["tilelink_gold_poc"],
+  "property_schema_ids": ["TL_IDENTIFIER_PAIRING"],
+  "slots": {"identifier_pair_violation": {"type": "Bool"}},
+  "parameters": {},
+  "fragments": {
+    "source_block": "if (cacheParams.prefetch.isEmpty) {\nval sinkCount = 1 << io.in.d.bits.sink.getWidth\nval grantPending = RegInit(VecInit(Seq.fill(sinkCount)(false.B)))\nval grantFire = io.in.d.fire && (io.in.d.bits.opcode === Grant || io.in.d.bits.opcode === GrantData)\nval (grantFirst, _, _, _) = edgeIn.count(io.in.d)\nval grantAckFire = io.in.e.fire\nval duplicateGrantSink = grantFire && grantFirst && grantPending(io.in.d.bits.sink)\nval grantAckMissingGrant = grantAckFire && !grantPending(io.in.e.bits.sink)\nval identifierPairViolation = duplicateGrantSink || grantAckMissingGrant\nwhen(grantFire && grantFirst) { grantPending(io.in.d.bits.sink) := true.B }\nwhen(grantAckFire) { grantPending(io.in.e.bits.sink) := false.B }\nchisel3.util.experimental.BoringUtils.addSource(grantAckMissingGrant, s\"${cacheParams.name}_{{source_label}}_identifier_missing\", disableDedup = true)\nchisel3.util.experimental.BoringUtils.addSource(duplicateGrantSink, s\"${cacheParams.name}_{{source_label}}_identifier_reuse\", disableDedup = true)\nchisel3.util.experimental.BoringUtils.addSource(identifierPairViolation, s\"${cacheParams.name}_{{source_label}}_identifier_combined\", disableDedup = true)\n}",
+    "support_block": "coupledL2.foreach { l2 =>\n  val grantAckMissingGrant = WireDefault(false.B)\n  val duplicateGrantSink = WireDefault(false.B)\n  val identifierPairViolation = WireDefault(false.B)\n  chisel3.util.experimental.BoringUtils.addSink(grantAckMissingGrant, s\"${l2.cacheParams.name}_{{base_label}}_identifier_missing\")\n  chisel3.util.experimental.BoringUtils.addSink(duplicateGrantSink, s\"${l2.cacheParams.name}_{{base_label}}_identifier_reuse\")\n  chisel3.util.experimental.BoringUtils.addSink(identifierPairViolation, s\"${l2.cacheParams.name}_{{base_label}}_identifier_combined\")\n  {{ASSERTION_BLOCK}}\n}",
+    "assertion_block": "chisel3.assert(!{{identifier_pair_violation}}, \"{{base_label}}\")"
+  },
+  "rtl_match": {"source_annotation_suffix": "src/test/scala/coupledL2/VerifyTop.scala", "minimum_occurrences": 1, "allow_multiple_occurrences": true}
+}

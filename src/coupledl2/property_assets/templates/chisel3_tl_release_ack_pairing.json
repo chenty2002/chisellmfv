@@ -1,0 +1,19 @@
+{
+  "schema_version": "assertion_template.v1",
+  "template_id": "chisel3_tl_release_ack_pairing",
+  "chisel_family": "chisel3",
+  "api_family": "chisel_builtin",
+  "api_primitive": "assert",
+  "semantic_shape": "request_response_scoreboard",
+  "requires_formal_mixin": true,
+  "allowed_profile_ids": ["tilelink_gold_poc"],
+  "property_schema_ids": ["TL_RELEASE_ACK_PAIRING"],
+  "slots": {"release_ack_violation": {"type": "Bool"}},
+  "parameters": {},
+  "fragments": {
+    "source_block": "if (cacheParams.prefetch.isEmpty) {\nval sourceCount = 1 << io.out.c.bits.source.getWidth\nval releasePending = RegInit(VecInit(Seq.fill(sourceCount)(false.B)))\nval releaseFire = io.out.c.fire && (io.out.c.bits.opcode === Release || io.out.c.bits.opcode === ReleaseData)\nval releaseAckFire = io.out.d.fire && io.out.d.bits.opcode === ReleaseAck\nval releaseSourceReuse = releaseFire && releasePending(io.out.c.bits.source)\nval releaseAckMissingPending = releaseAckFire && !releasePending(io.out.d.bits.source)\nval releaseAckViolation = releaseSourceReuse || releaseAckMissingPending\nwhen(releaseFire) { releasePending(io.out.c.bits.source) := true.B }\nwhen(releaseAckFire) { releasePending(io.out.d.bits.source) := false.B }\nchisel3.util.experimental.BoringUtils.addSource(releaseAckMissingPending, s\"${cacheParams.name}_{{source_label}}_release_missing\", disableDedup = true)\nchisel3.util.experimental.BoringUtils.addSource(releaseSourceReuse, s\"${cacheParams.name}_{{source_label}}_release_reuse\", disableDedup = true)\nchisel3.util.experimental.BoringUtils.addSource(releaseAckViolation, s\"${cacheParams.name}_{{source_label}}_release_combined\", disableDedup = true)\n}",
+    "support_block": "coupledL2.foreach { l2 =>\n  val releaseAckMissingPending = WireDefault(false.B)\n  val releaseSourceReuse = WireDefault(false.B)\n  val releaseAckViolation = WireDefault(false.B)\n  chisel3.util.experimental.BoringUtils.addSink(releaseAckMissingPending, s\"${l2.cacheParams.name}_{{base_label}}_release_missing\")\n  chisel3.util.experimental.BoringUtils.addSink(releaseSourceReuse, s\"${l2.cacheParams.name}_{{base_label}}_release_reuse\")\n  chisel3.util.experimental.BoringUtils.addSink(releaseAckViolation, s\"${l2.cacheParams.name}_{{base_label}}_release_combined\")\n  {{ASSERTION_BLOCK}}\n}",
+    "assertion_block": "chisel3.assert(!{{release_ack_violation}}, \"{{base_label}}\")"
+  },
+  "rtl_match": {"source_annotation_suffix": "src/test/scala/coupledL2/VerifyTop.scala", "minimum_occurrences": 1, "allow_multiple_occurrences": true}
+}

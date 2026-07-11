@@ -1,0 +1,19 @@
+{
+  "schema_version": "assertion_template.v1",
+  "template_id": "chisel3_tl_burst_control_stable",
+  "chisel_family": "chisel3",
+  "api_family": "chisel_builtin",
+  "api_primitive": "assert",
+  "semantic_shape": "safety_scoreboard",
+  "requires_formal_mixin": true,
+  "allowed_profile_ids": ["tilelink_gold_poc"],
+  "property_schema_ids": ["TL_BURST_CONTROL_STABLE"],
+  "slots": {"burst_control_violation": {"type": "Bool"}},
+  "parameters": {},
+  "fragments": {
+    "source_block": "if (cacheParams.prefetch.isEmpty) {\nval aControl = Cat(io.in.a.bits.opcode, io.in.a.bits.param, io.in.a.bits.size, io.in.a.bits.source, io.in.a.bits.address, io.in.a.bits.mask)\nval cControl = Cat(io.in.c.bits.opcode, io.in.c.bits.param, io.in.c.bits.size, io.in.c.bits.source, io.in.c.bits.address)\nval dControl = Cat(io.in.d.bits.opcode, io.in.d.bits.param, io.in.d.bits.size, io.in.d.bits.source, io.in.d.bits.sink, io.in.d.bits.denied, io.in.d.bits.corrupt)\nval (aFirst, aLast, _, _) = edgeIn.count(io.in.a)\nval (cFirst, cLast, _, _) = edgeIn.count(io.in.c)\nval (dFirst, dLast, _, _) = edgeIn.count(io.in.d)\nval aActive = RegInit(false.B)\nval cActive = RegInit(false.B)\nval dActive = RegInit(false.B)\nval aReference = Reg(chiselTypeOf(aControl))\nval cReference = Reg(chiselTypeOf(cControl))\nval dReference = Reg(chiselTypeOf(dControl))\nwhen(io.in.a.fire && aFirst && !aLast) { aActive := true.B; aReference := aControl }\nwhen(io.in.c.fire && cFirst && !cLast) { cActive := true.B; cReference := cControl }\nwhen(io.in.d.fire && dFirst && !dLast) { dActive := true.B; dReference := dControl }\nwhen(io.in.a.fire && aLast) { aActive := false.B }\nwhen(io.in.c.fire && cLast) { cActive := false.B }\nwhen(io.in.d.fire && dLast) { dActive := false.B }\nval aBurstControlViolation = aActive && io.in.a.valid && aControl =/= aReference\nval cBurstControlViolation = cActive && io.in.c.valid && cControl =/= cReference\nval dBurstControlViolation = dActive && io.in.d.valid && dControl =/= dReference\nchisel3.util.experimental.BoringUtils.addSource(aBurstControlViolation, s\"${cacheParams.name}_{{source_label}}_burst_a\", disableDedup = true)\nchisel3.util.experimental.BoringUtils.addSource(cBurstControlViolation, s\"${cacheParams.name}_{{source_label}}_burst_c\", disableDedup = true)\nchisel3.util.experimental.BoringUtils.addSource(dBurstControlViolation, s\"${cacheParams.name}_{{source_label}}_burst_d\", disableDedup = true)\n}",
+    "support_block": "coupledL2.foreach { l2 =>\n  val aBurstControlViolation = WireDefault(false.B)\n  val cBurstControlViolation = WireDefault(false.B)\n  val dBurstControlViolation = WireDefault(false.B)\n  chisel3.util.experimental.BoringUtils.addSink(aBurstControlViolation, s\"${l2.cacheParams.name}_{{base_label}}_burst_a\")\n  chisel3.util.experimental.BoringUtils.addSink(cBurstControlViolation, s\"${l2.cacheParams.name}_{{base_label}}_burst_c\")\n  chisel3.util.experimental.BoringUtils.addSink(dBurstControlViolation, s\"${l2.cacheParams.name}_{{base_label}}_burst_d\")\n  {{ASSERTION_BLOCK}}\n}",
+    "assertion_block": "chisel3.assert(!{{burst_control_violation}}, \"{{base_label}}\")"
+  },
+  "rtl_match": {"source_annotation_suffix": "src/test/scala/coupledL2/VerifyTop.scala", "minimum_occurrences": 1, "allow_multiple_occurrences": true}
+}
