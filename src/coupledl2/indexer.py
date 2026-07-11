@@ -20,12 +20,14 @@ def generate_indexes(run_dir: Path, case_workspace: Path, config: CoupledL2RunCo
     indexes_dir = run_dir / "indexes"
     indexes_dir.mkdir(parents=True, exist_ok=True)
 
+    profile = load_property_profile(config.property_profile).profile
+    roots = profile["index_roots"]
     indexes = {
         "project_tree": build_project_tree(case_workspace),
         "build_contract": build_build_contract(case_workspace, config),
         "formal_surface": build_formal_surface(case_workspace),
-        "tl_signal_index": build_tl_signal_index(case_workspace),
-        "observer_index": build_observer_index(case_workspace),
+        "tl_signal_index": build_tl_signal_index(case_workspace, roots=roots),
+        "observer_index": build_observer_index(case_workspace, roots=roots),
     }
     for name, value in indexes.items():
         _write_json(indexes_dir / f"{name}.json", value)
@@ -233,14 +235,16 @@ _HANDSHAKE_RE = re.compile(
 _SCALA_SCOPE_RE = re.compile(r"\b(?:class|object|trait)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
 
 
-def build_tl_signal_index(case_workspace: Path) -> Dict[str, Any]:
+def build_tl_signal_index(
+    case_workspace: Path, *, roots: Optional[List[str]] = None
+) -> Dict[str, Any]:
     """Index discoverable Scala TileLink signals without reading generated output."""
     candidates: List[Dict[str, Any]] = []
     module_counts: Dict[str, int] = {}
     channels: Set[str] = set()
     files_scanned = 0
 
-    for path in _discoverable_scala_sources(case_workspace):
+    for path in _discoverable_scala_sources(case_workspace, roots=roots):
         files_scanned += 1
         text = path.read_text(encoding="utf-8", errors="ignore")
         current_scope = path.stem
@@ -330,8 +334,9 @@ def build_tl_signal_index(case_workspace: Path) -> Dict[str, Any]:
         module_counts[module] = module_counts.get(module, 0) + 1
 
     return {
-        "schema_version": "tl_signal_index.v1",
+        "schema_version": "tl_signal_index.v2",
         "case_root": "workspace/case",
+        "roots": _normalized_roots(case_workspace, roots),
         "files_scanned": files_scanned,
         "candidate_count": len(candidates),
         "channels": sorted(channels),
@@ -340,14 +345,16 @@ def build_tl_signal_index(case_workspace: Path) -> Dict[str, Any]:
     }
 
 
-def build_observer_index(case_workspace: Path) -> Dict[str, Any]:
+def build_observer_index(
+    case_workspace: Path, *, roots: Optional[List[str]] = None
+) -> Dict[str, Any]:
     """Index high-value CoupledL2 modules that can host or explain TL properties."""
     candidates: List[Dict[str, Any]] = []
     module_counts: Dict[str, int] = {}
     files_scanned = 0
 
     module_pattern = re.compile(r"\b(" + "|".join(sorted(OBSERVER_MODULES, key=len, reverse=True)) + r")\b")
-    for path in _discoverable_scala_sources(case_workspace):
+    for path in _discoverable_scala_sources(case_workspace, roots=roots):
         files_scanned += 1
         text = path.read_text(encoding="utf-8", errors="ignore")
         current_scope = path.stem
@@ -373,8 +380,9 @@ def build_observer_index(case_workspace: Path) -> Dict[str, Any]:
 
     candidates = _assign_candidate_ids(candidates, prefix="obs")
     return {
-        "schema_version": "observer_index.v1",
+        "schema_version": "observer_index.v2",
         "case_root": "workspace/case",
+        "roots": _normalized_roots(case_workspace, roots),
         "files_scanned": files_scanned,
         "candidate_count": len(candidates),
         "module_counts": dict(sorted(module_counts.items())),
@@ -409,15 +417,34 @@ def _discoverable_files(root: Path, *, policy_root: Optional[Path] = None) -> Li
     return sorted(files)
 
 
-def _discoverable_scala_sources(case_workspace: Path) -> List[Path]:
-    chisel_dir = case_workspace / "Chisel"
-    if not chisel_dir.is_dir():
-        return []
-    return [
-        path
-        for path in _discoverable_files(chisel_dir, policy_root=case_workspace)
-        if path.suffix == ".scala"
-    ]
+def _discoverable_scala_sources(
+    case_workspace: Path, *, roots: Optional[List[str]] = None
+) -> List[Path]:
+    paths = []
+    for root in _normalized_roots(case_workspace, roots):
+        root_path = case_workspace / root
+        if not root_path.is_dir():
+            continue
+        paths.extend(
+            path
+            for path in _discoverable_files(root_path, policy_root=case_workspace)
+            if path.suffix == ".scala"
+        )
+    return sorted(set(paths))
+
+
+def _normalized_roots(case_workspace: Path, roots: Optional[List[str]]) -> List[str]:
+    default = ["Chisel/src/main/scala/coupledL2", "Chisel/src/test/scala"]
+    selected = roots if roots is not None else default
+    if not selected or not all(isinstance(root, str) and root for root in selected):
+        raise ValueError("index roots must be a non-empty string list")
+    normalized = []
+    for root in selected:
+        path = Path(root)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("index root must be workspace-relative")
+        normalized.append(path.as_posix())
+    return sorted(set(normalized))
 
 
 def _candidate(
@@ -431,10 +458,18 @@ def _candidate(
     module: str,
     description: str,
 ) -> Dict[str, Any]:
+    channel = next((role[len("channel_"):] for role in roles if role.startswith("channel_")), None)
+    phase = next((role[len("handshake_"):] for role in roles if role.startswith("handshake_")), None)
     return {
         "type": candidate_type,
         "roles": sorted(set(roles)),
         "description": description,
+        "chisel_type": "unknown",
+        "width_source": "not_inferred",
+        "clock_domain": "implicit_module_clock",
+        "channel": channel,
+        "handshake_phase": phase or "observation",
+        "observable": True,
         "provenance": {
             "path": _rel(path, case_workspace),
             "line": line_no,
@@ -449,7 +484,6 @@ def _assign_candidate_ids(candidates: List[Dict[str, Any]], *, prefix: str) -> L
         candidates,
         key=lambda item: (
             item["provenance"]["path"],
-            item["provenance"]["line"],
             item["type"],
             item["provenance"]["expression"],
             ",".join(item["roles"]),
@@ -462,14 +496,24 @@ def _assign_candidate_ids(candidates: List[Dict[str, Any]], *, prefix: str) -> L
             item["type"],
             tuple(item["roles"]),
             item["provenance"]["path"],
-            item["provenance"]["line"],
             item["provenance"]["expression"],
         )
         if dedupe_key in seen:
             continue
         seen.add(dedupe_key)
         numbered = dict(item)
-        numbered["candidate_id"] = f"{prefix}_{len(result) + 1:04d}"
+        identity = {
+            "path": item["provenance"]["path"],
+            "enclosing_symbol": item["provenance"]["module"],
+            "expression": item["provenance"]["expression"],
+            "roles": item["roles"],
+            "type": item["type"],
+        }
+        digest = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        numbered["source_identity"] = identity
+        numbered["candidate_id"] = f"{prefix}_{digest[:16]}"
         result.append(numbered)
     return result
 

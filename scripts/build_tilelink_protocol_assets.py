@@ -86,23 +86,62 @@ def build_coverage(
     rules: Dict[str, Any],
 ) -> Dict[str, Any]:
     source_sha = sha256_text(source_path.read_text(encoding="utf-8"))
+    executable = _approved_executable_protocol_schemas()
+    candidate_progress = [
+        {
+            "rule_id": rule["rule_id"],
+            "locator": rule["locator"],
+            "chunk_ids": _chunks_for_locator(rule["locator"], chunks),
+            "candidate_schema_ids": rule["candidate_schema_ids"],
+        }
+        for rule in rules["rules"]
+    ]
+    approved_coverage = [
+        {
+            "rule_id": rule["rule_id"],
+            "locator": rule["locator"],
+            "schema_id": schema_id,
+            "source_kind": "protocol_requirement",
+            "review_id": review_id,
+        }
+        for rule in rules["rules"]
+        for schema_id, review_id in executable.items()
+        if schema_id in rule["candidate_schema_ids"]
+    ]
     return {
-        "schema_version": "tilelink_protocol_coverage.v1",
+        "schema_version": "tilelink_protocol_coverage.v2",
         "document_id": DOCUMENT_ID,
         "source_path": SOURCE_PATH,
         "source_sha256": source_sha,
         "chunk_count": len(chunks),
         "rule_count": len(rules["rules"]),
-        "rules": [
-            {
-                "rule_id": rule["rule_id"],
-                "locator": rule["locator"],
-                "chunk_ids": _chunks_for_locator(rule["locator"], chunks),
-                "candidate_schema_ids": rule["candidate_schema_ids"],
-            }
-            for rule in rules["rules"]
-        ],
+        "candidate_schema_progress": candidate_progress,
+        "approved_executable_coverage": approved_coverage,
     }
+
+
+def _approved_executable_protocol_schemas() -> Dict[str, str]:
+    """Return protocol schemas only when Codex approved the complete package."""
+    asset_root = ROOT / "src" / "coupledl2" / "property_assets"
+    result: Dict[str, str] = {}
+    for review_path in sorted((asset_root / "reviews").glob("*.json")):
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+        if review.get("reviewer") != "codex" or review.get("review_status") != "approved":
+            continue
+        assets = review.get("assets", [])
+        kinds = {item.get("kind") for item in assets if isinstance(item, dict)}
+        if not {"profile", "schema", "template", "formal_contract"} <= kinds:
+            continue
+        for item in assets:
+            if not isinstance(item, dict) or item.get("kind") != "schema":
+                continue
+            schema_path = asset_root / item["path"]
+            if not schema_path.is_file():
+                continue
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            if schema.get("source", {}).get("kind") == "protocol_requirement":
+                result[schema["property_schema_id"]] = review["review_id"]
+    return result
 
 
 def load_rules(output_dir: Path, source_path: Path) -> Dict[str, Any]:

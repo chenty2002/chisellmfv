@@ -477,9 +477,19 @@ class BindingStage:
             "base_label": instance["base_label"],
             "binding_manifest_path": "binding_manifest.json",
             "source": schema["source"],
-            "review_status": "not_reviewed",
+            "review_status": self.catalog.review["review_status"] if self.catalog.review else "not_reviewed",
             "rtl_properties": records,
         }
+        if self.catalog.review:
+            trace_record["review"] = {
+                "review_id": self.catalog.review["review_id"],
+                "reviewer": self.catalog.review["reviewer"],
+                "reviewed_at": self.catalog.review["reviewed_at"],
+                "asset_hashes": {
+                    item["path"]: item["sha256"]
+                    for item in self.catalog.review["assets"]
+                },
+            }
         if protocol_rule is not None:
             trace_record["protocol_rule"] = protocol_rule
         traceability = {

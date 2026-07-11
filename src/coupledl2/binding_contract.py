@@ -51,7 +51,11 @@ def binding_manifest_tool(catalog: PropertyCatalog) -> Dict[str, Any]:
     target = profile["target"]
     return {
         "name": "submit_binding_manifest",
-        "description": "Submit one property binding using repository candidate IDs.",
+        "description": (
+            "Submit one property binding using repository candidate IDs. Slots with "
+            "one compatible candidate are deterministic; only slots listed by "
+            "model_selectable_slots represent a model choice."
+        ),
         "strict": True,
         "parameters": {
             "type": "object",
@@ -137,6 +141,21 @@ def binding_manifest_tool(catalog: PropertyCatalog) -> Dict[str, Any]:
             },
         },
     }
+
+
+def model_selectable_slots(catalog: PropertyCatalog) -> Dict[str, list[str]]:
+    """Expose only slots that have two or more approved profile candidates."""
+    slots: Dict[str, list[str]] = {}
+    for template in catalog.templates.values():
+        for role, definition in template["slots"].items():
+            compatible = sorted(
+                candidate["candidate_id"]
+                for candidate in catalog.candidates.values()
+                if role in candidate["roles"] and candidate["type"] == definition["type"]
+            )
+            if len(compatible) >= 2:
+                slots[role] = compatible
+    return dict(sorted(slots.items()))
 
 
 def binding_patch_tool(catalog: PropertyCatalog, instance_id: str) -> Dict[str, Any]:

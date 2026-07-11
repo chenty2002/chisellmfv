@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .property_review import (
+    PropertyReviewError,
+    load_property_review,
+    verify_review_assets,
+)
+
 
 ASSET_ROOT = Path(__file__).with_name("property_assets")
 SOURCE_KINDS = {
@@ -29,9 +35,10 @@ class PropertyCatalog:
     templates: Dict[str, Dict[str, Any]]
     candidates: Dict[str, Dict[str, Any]]
     formal_contract_id: str = ""
+    review: Dict[str, Any] | None = None
 
 
-def load_property_profile(profile_id: str) -> PropertyCatalog:
+def load_property_profile(profile_id: str, *, require_approved: bool = True) -> PropertyCatalog:
     """Load one profile and all referenced assets, rejecting loose contracts."""
     if not re.fullmatch(r"[a-z0-9_]+", profile_id):
         raise PropertyCatalogError("invalid property profile id")
@@ -39,17 +46,21 @@ def load_property_profile(profile_id: str) -> PropertyCatalog:
     _validate_profile(profile, profile_id)
 
     schemas: Dict[str, Dict[str, Any]] = {}
+    schema_paths: Dict[str, Path] = {}
     for path in sorted((ASSET_ROOT / "schemas").glob("*.json")):
         payload = _read_json(path)
         if payload.get("property_schema_id") in profile["property_schema_ids"]:
             _validate_schema(payload)
             schemas[payload["property_schema_id"]] = payload
+            schema_paths[payload["property_schema_id"]] = path
     templates: Dict[str, Dict[str, Any]] = {}
+    template_paths: Dict[str, Path] = {}
     for path in sorted((ASSET_ROOT / "templates").glob("*.json")):
         payload = _read_json(path)
         if payload.get("template_id") in profile["template_ids"]:
             _validate_template(payload)
             templates[payload["template_id"]] = payload
+            template_paths[payload["template_id"]] = path
 
     if set(schemas) != set(profile["property_schema_ids"]):
         raise PropertyCatalogError("profile references missing property schemas")
@@ -64,6 +75,29 @@ def load_property_profile(profile_id: str) -> PropertyCatalog:
     if len(candidates) != len(profile["binding_candidates"]):
         raise PropertyCatalogError("duplicate binding candidate id")
     _validate_cross_references(profile, schemas, templates, candidates)
+    assets = {
+        f"profiles/{profile_id}.json": ASSET_ROOT / "profiles" / f"{profile_id}.json",
+        **{
+            f"schemas/{schema_paths[schema_id].name}": schema_paths[schema_id]
+            for schema_id in schemas
+        },
+        **{
+            f"templates/{template_paths[template_id].name}": template_paths[template_id]
+            for template_id in templates
+        },
+        f"formal_contracts/{profile.get('formal_contract_id', profile_id)}.json": (
+            ASSET_ROOT / "formal_contracts" / f"{profile.get('formal_contract_id', profile_id)}.json"
+        ),
+    }
+    try:
+        review = load_property_review(profile_id)
+        verify_review_assets(review, assets)
+    except PropertyReviewError as exc:
+        if require_approved:
+            raise PropertyCatalogError(str(exc)) from exc
+        review = None
+    if require_approved and review["review_status"] != "approved":
+        raise PropertyCatalogError("property profile is not Codex-approved")
     return PropertyCatalog(
         profile=profile,
         schemas=schemas,
@@ -72,6 +106,7 @@ def load_property_profile(profile_id: str) -> PropertyCatalog:
         formal_contract_id=profile.get(
             "formal_contract_id", profile["property_profile_id"]
         ),
+        review=review,
     )
 
 
@@ -95,6 +130,7 @@ def public_catalog(catalog: PropertyCatalog) -> Dict[str, Any]:
             }
             for candidate in catalog.candidates.values()
         ],
+        "binding_policy": _binding_policy(catalog),
         "target": {
             key: catalog.profile["target"][key]
             for key in ("file_id", "marker_id")
@@ -104,6 +140,22 @@ def public_catalog(catalog: PropertyCatalog) -> Dict[str, Any]:
             for item in catalog.profile.get("source_targets", [])
         ],
     }
+
+
+def _binding_policy(catalog: PropertyCatalog) -> Dict[str, Dict[str, Any]]:
+    policy = {}
+    for template in catalog.templates.values():
+        for role, slot in template["slots"].items():
+            candidates = sorted(
+                candidate["candidate_id"]
+                for candidate in catalog.candidates.values()
+                if role in candidate["roles"] and candidate["type"] == slot["type"]
+            )
+            policy[role] = {
+                "mode": "model_select" if len(candidates) >= 2 else "deterministic",
+                "candidate_ids": candidates,
+            }
+    return dict(sorted(policy.items()))
 
 
 def _public_template(template: Dict[str, Any]) -> Dict[str, Any]:
@@ -142,16 +194,16 @@ def _exact_fields(value: Dict[str, Any], allowed: set[str], required: set[str], 
         raise PropertyCatalogError(f"{path} missing fields: {sorted(missing)}")
 
 
-def _validate_schema(value: Dict[str, Any]) -> None:
+def validate_property_schema(value: Dict[str, Any]) -> None:
     fields = {
         "schema_version", "property_schema_id", "category", "layer", "title",
-        "source", "scope", "trigger", "expectation", "preconditions",
-        "matching_fields", "time_bound", "observation_points",
-        "binding_requirements", "environment_assumptions", "required_slots",
-        "template_ids", "review_required",
+        "source", "rule_id", "channel_scope", "trigger_event", "response_event",
+        "matching_key", "temporal_shape", "bound", "preconditions",
+        "optional_behavior_policy", "environment_assumptions",
+        "required_observations", "template_ids", "review_required",
     }
     _exact_fields(value, fields, fields, "property_schema")
-    if value["schema_version"] != "property_schema.v1":
+    if value["schema_version"] != "property_schema.v2":
         raise PropertyCatalogError("unsupported property schema version")
     _exact_fields(
         value["source"],
@@ -161,14 +213,48 @@ def _validate_schema(value: Dict[str, Any]) -> None:
     )
     if value["source"]["kind"] not in SOURCE_KINDS:
         raise PropertyCatalogError("invalid property source kind")
-    _exact_fields(
-        value["time_bound"],
-        {"required", "minimum", "maximum"},
-        {"required", "minimum", "maximum"},
-        "property_schema.time_bound",
-    )
-    if not value["required_slots"]:
-        raise PropertyCatalogError("property schema requires at least one slot")
+    is_protocol = value["source"]["kind"] == "protocol_requirement"
+    if is_protocol != isinstance(value["rule_id"], str):
+        raise PropertyCatalogError("protocol schema must have rule_id and non-protocol schema must not")
+    _exact_fields(value["channel_scope"], {"channels", "message_classes", "scope"}, {"channels", "message_classes", "scope"}, "property_schema.channel_scope")
+    if not isinstance(value["channel_scope"]["channels"], list) or not all(
+        channel in {"A", "B", "C", "D", "E"} for channel in value["channel_scope"]["channels"]
+    ):
+        raise PropertyCatalogError("property schema channel scope is invalid")
+    for field in ("trigger_event", "response_event"):
+        event = value[field]
+        if event is None:
+            continue
+        _exact_fields(event, {"kind", "description", "channel", "message_classes"}, {"kind", "description", "channel", "message_classes"}, f"property_schema.{field}")
+        if event["channel"] is not None and event["channel"] not in {"A", "B", "C", "D", "E"}:
+            raise PropertyCatalogError("property schema event channel is invalid")
+    _exact_fields(value["matching_key"], {"fields", "semantics"}, {"fields", "semantics"}, "property_schema.matching_key")
+    _exact_fields(value["bound"], {"kind", "minimum", "maximum"}, {"kind", "minimum", "maximum"}, "property_schema.bound")
+    if value["bound"]["kind"] not in {"none", "cycles"}:
+        raise PropertyCatalogError("property schema bound kind is invalid")
+    if value["temporal_shape"] not in {"invariant", "stable_while_stalled", "forbid_while_pending", "response_eventually", "bounded_liveness"}:
+        raise PropertyCatalogError("property schema temporal shape is invalid")
+    if value["optional_behavior_policy"] not in {"required", "implementation_defined", "environment_constrained"}:
+        raise PropertyCatalogError("property schema optional behavior policy is invalid")
+    observations = value["required_observations"]
+    if not isinstance(observations, list) or not observations:
+        raise PropertyCatalogError("property schema requires observations")
+    roles = set()
+    for observation in observations:
+        _exact_fields(observation, {"id", "role", "type", "description"}, {"id", "role", "type", "description"}, "property_schema.required_observations[]")
+        if observation["role"] in roles:
+            raise PropertyCatalogError("property schema observation roles must be unique")
+        roles.add(observation["role"])
+
+
+_validate_schema = validate_property_schema
+
+
+def _schema_slots(schema: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        observation["role"]: observation["type"]
+        for observation in schema["required_observations"]
+    }
 
 
 def _validate_template(value: Dict[str, Any]) -> None:
@@ -238,7 +324,7 @@ def _validate_profile(value: Dict[str, Any], requested_id: str) -> None:
     fields = {
         "schema_version", "property_profile_id", "case_name", "chisel_family",
         "property_schema_ids", "template_ids", "build", "target",
-        "source_targets", "binding_candidates", "formal_contract_id",
+        "source_targets", "binding_candidates", "formal_contract_id", "index_roots",
     }
     required = fields - {"source_targets", "formal_contract_id"}
     _exact_fields(value, fields, required, "property_profile")
@@ -250,6 +336,17 @@ def _validate_profile(value: Dict[str, Any], requested_id: str) -> None:
         r"[a-z0-9_]+", value["formal_contract_id"]
     ):
         raise PropertyCatalogError("invalid formal contract id")
+    if (
+        not isinstance(value["index_roots"], list)
+        or not value["index_roots"]
+        or not all(
+            isinstance(root, str)
+            and root.startswith("Chisel/")
+            and ".." not in Path(root).parts
+            for root in value["index_roots"]
+        )
+    ):
+        raise PropertyCatalogError("property profile requires workspace-relative index roots")
     _exact_fields(
         value["build"],
         {"recommended_make_target"},
@@ -348,7 +445,7 @@ def _validate_cross_references(
                 and profile["property_profile_id"] not in allowed_profile_ids
             ):
                 raise PropertyCatalogError("template is not allowed for this profile")
-            expected = schema["required_slots"]
+            expected = _schema_slots(schema)
             actual = {
                 name: definition["type"]
                 for name, definition in template["slots"].items()
@@ -358,13 +455,13 @@ def _validate_cross_references(
     required_roles = {
         role
         for schema in schemas.values()
-        for role in schema["required_slots"]
+        for role in _schema_slots(schema)
     }
     for role in required_roles:
         if not any(
             role in candidate["roles"]
             and any(
-                schema["required_slots"].get(role) == candidate["type"]
+                _schema_slots(schema).get(role) == candidate["type"]
                 for schema in schemas.values()
             )
             for candidate in candidates.values()
