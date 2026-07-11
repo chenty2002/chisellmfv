@@ -1,28 +1,25 @@
 {
-  "schema_version": "property_schema.v2",
-  "property_schema_id": "CL2_TL_STALL_STABLE",
-  "category": "flow_control_safety",
-  "layer": "interface",
-  "title": "CoupledL2 keeps a continuously valid stalled beat stable",
-  "source": {
-    "kind": "implementation_requirement",
-    "document": "XiangShan CoupledL2 Decoupled channel implementation",
-    "locator": "CoupledL2 Slice inner A/C/D channels",
-    "statement": "When CoupledL2 keeps valid asserted across a stalled cycle, it keeps the selected channel beat unchanged until acceptance."
-  },
-  "rule_id": null,
+  "schema_version": "property_schema.v3", "property_schema_id": "CL2_TL_STALL_STABLE", "category": "flow_control_safety", "layer": "interface", "title": "CoupledL2 keeps a continuously valid stalled beat stable",
+  "source": {"kind": "implementation_requirement", "document": "XiangShan CoupledL2 Decoupled channel implementation", "locator": "CoupledL2 Slice inner A/C/D channels", "statement": "When valid remains asserted across a stalled cycle, the selected beat remains unchanged until acceptance."},
+  "rule_id": null, "obligation_kind": "safety",
   "channel_scope": {"channels": ["A", "C", "D"], "message_classes": ["continuously_valid_beat"], "scope": "CoupledL2 implementation"},
-  "trigger_event": {"kind": "stall", "description": "valid is asserted while ready is deasserted", "channel": null, "message_classes": ["continuously_valid_beat"]},
-  "response_event": {"kind": "next_cycle", "description": "valid remains asserted on the following cycle", "channel": null, "message_classes": ["continuously_valid_beat"]},
-  "matching_key": {"fields": ["full_bundle_bits"], "semantics": "same continuously offered beat"},
-  "temporal_shape": "stable_while_stalled",
-  "bound": {"kind": "cycles", "minimum": 1, "maximum": 1},
-  "preconditions": ["valid remains asserted across the stalled cycle"],
-  "optional_behavior_policy": "implementation_defined",
-  "environment_assumptions": [],
-  "required_observations": [
-    {"id": "stall_violation", "role": "stall_violation", "type": "Bool", "description": "selected CoupledL2 channel changed a continuously valid stalled beat"}
-  ],
-  "template_ids": ["chisel3_cl2_tl_stall_stable"],
-  "review_required": true
+  "event_automaton": {"initial_state": "idle", "states": ["idle", "stalled", "complete", "violation"], "terminal_states": ["complete", "violation"], "events": [
+    {"event_id": "stall_start", "kind": "trigger", "channel": null, "direction": "internal", "message_classes": ["continuously_valid_beat"]},
+    {"event_id": "stable_cycle", "kind": "progress", "channel": null, "direction": "internal", "message_classes": ["continuously_valid_beat"]},
+    {"event_id": "beat_accept", "kind": "response", "channel": null, "direction": "internal", "message_classes": ["continuously_valid_beat"]},
+    {"event_id": "beat_change", "kind": "violation", "channel": null, "direction": "internal", "message_classes": ["continuously_valid_beat"]}
+  ], "transitions": [
+    {"from": "idle", "event": "stall_start", "to": "stalled", "condition": "valid and not ready"},
+    {"from": "stalled", "event": "stable_cycle", "to": "stalled", "condition": "valid remains asserted and bits stable"},
+    {"from": "stalled", "event": "beat_accept", "to": "complete", "condition": "ready"},
+    {"from": "stalled", "event": "beat_change", "to": "violation", "condition": "valid remains asserted and bits differ"}
+  ]},
+  "correlation": {"keys": ["full_bundle_bits"], "created_by": "stall_start", "consumed_by": "beat_accept", "lifetime": "continuous valid stall", "reuse_policy": "stable_until_consumed"},
+  "cardinality": {"subject": "continuously offered beat", "minimum": 0, "maximum": 1, "scope": "channel"}, "permission_relation": null,
+  "optional_paths": [{"path_id": "valid_withdrawal", "description": "This implementation-scoped property only applies while valid remains asserted.", "events": ["stall_start"], "required": false}],
+  "environment_boundary": {"protocol_premises": [], "fairness": [], "harness_restrictions": ["valid remains asserted across the observed stalled cycle"], "proof_simplifications": [], "proof_bound": {"kind": "cycles", "minimum": 1, "maximum": 1}},
+  "observable_contract": {"observations": [{"id": "stall_violation", "role": "stall_violation", "type": "Bool", "description": "selected channel changed a continuously valid stalled beat", "reachability": "toggle"}], "ghost_state": ["previous beat bits"], "clock_domain": "tilelink", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "stable_stall", "steps": ["stall_start", "stable_cycle", "beat_accept"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "changed_stalled_beat", "steps": ["stall_start", "beat_change"], "expected": "violate"}], "mutation_classes": ["field_stability"], "non_vacuity": {"required": true, "trigger_event_ids": ["stall_start"], "observer_requirements": ["stall_violation"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["Decoupled valid/ready/bits"], "implementation_anchors": ["Slice inner A/C/D interface"], "fail_closed_conditions": ["valid continuity unavailable", "bundle identity unavailable", "clock-domain conflict"]},
+  "lowering_family": "stability", "template_ids": ["chisel3_cl2_tl_stall_stable"], "review_required": true
 }

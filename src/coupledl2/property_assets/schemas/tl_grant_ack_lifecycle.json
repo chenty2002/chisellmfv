@@ -1,0 +1,24 @@
+{
+  "schema_version": "property_schema.v3", "property_schema_id": "TL_GRANT_ACK_LIFECYCLE", "category": "identifier_lifecycle", "layer": "transaction", "title": "Grant sink remains allocated through matching GrantAck",
+  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:612-615", "statement": "Grant and GrantData responses require a GrantAck carrying the allocated sink identifier."},
+  "rule_id": "TL_6_3_GRANT_ACK_LIFECYCLE", "obligation_kind": "response",
+  "channel_scope": {"channels": ["D", "E"], "message_classes": ["Grant", "GrantData", "GrantAck"], "scope": "outstanding sink identifier"},
+  "event_automaton": {"initial_state": "idle", "states": ["idle", "grant_pending", "complete", "violation"], "terminal_states": ["complete", "violation"], "events": [
+    {"event_id": "grant_first_beat", "kind": "trigger", "channel": "D", "direction": "manager_to_client", "message_classes": ["Grant", "GrantData"]},
+    {"event_id": "grant_ack", "kind": "response", "channel": "E", "direction": "client_to_manager", "message_classes": ["GrantAck"]},
+    {"event_id": "sink_reuse", "kind": "violation", "channel": "D", "direction": "manager_to_client", "message_classes": ["Grant", "GrantData"]},
+    {"event_id": "unknown_grant_ack", "kind": "violation", "channel": "E", "direction": "client_to_manager", "message_classes": ["GrantAck"]}
+  ], "transitions": [
+    {"from": "idle", "event": "grant_first_beat", "to": "grant_pending", "condition": "allocate sink"},
+    {"from": "grant_pending", "event": "grant_ack", "to": "complete", "condition": "matching sink"},
+    {"from": "grant_pending", "event": "sink_reuse", "to": "violation", "condition": "sink reused before ack"},
+    {"from": "idle", "event": "unknown_grant_ack", "to": "violation", "condition": "ack has no pending sink"}
+  ]},
+  "correlation": {"keys": ["sink"], "created_by": "grant_first_beat", "consumed_by": "grant_ack", "lifetime": "first Grant beat through GrantAck", "reuse_policy": "forbid_until_consumed"},
+  "cardinality": {"subject": "outstanding Grant per sink", "minimum": 0, "maximum": 1, "scope": "sink"}, "permission_relation": null, "optional_paths": [],
+  "environment_boundary": {"protocol_premises": [], "fairness": [], "harness_restrictions": [], "proof_simplifications": [], "proof_bound": {"kind": "none", "minimum": 0, "maximum": 0}},
+  "observable_contract": {"observations": [{"id": "grant_ack_lifecycle_violation", "role": "grant_ack_lifecycle_violation", "type": "Bool", "description": "sink is reused or acknowledged outside its lifetime", "reachability": "toggle"}], "ghost_state": ["grantPending[sink]"], "clock_domain": "tilelink", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "grant_ack_lifecycle", "steps": ["grant_first_beat", "grant_ack"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "sink_reused", "steps": ["grant_first_beat", "sink_reuse"], "expected": "violate"}], "mutation_classes": ["identifier_correlation", "message_ordering"], "non_vacuity": {"required": true, "trigger_event_ids": ["grant_first_beat"], "observer_requirements": ["grant_ack_lifecycle_violation"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["D first-beat sink", "E GrantAck sink"], "implementation_anchors": ["sink lifetime scoreboard"], "fail_closed_conditions": ["sink identity absent", "first-beat identity absent", "clock-domain conflict"]},
+  "lowering_family": "response_scoreboard", "template_ids": ["chisel3_tl_grant_ack_lifecycle"], "review_required": true
+}

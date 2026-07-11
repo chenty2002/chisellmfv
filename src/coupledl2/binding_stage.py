@@ -23,6 +23,11 @@ from .property_catalog import load_property_profile, public_catalog
 from .rtl_property_labeler import RTLProperty, label_rtl_properties
 from .workspace import build_protocol_evidence
 from .campaign import write_campaign
+from .property_compiler import (
+    build_witness_plan,
+    compile_manifest,
+    initial_semantic_evidence,
+)
 
 
 class BindingStageError(RuntimeError):
@@ -134,6 +139,9 @@ class BindingStage:
                 "binding_manifest_path": "binding_manifest.json",
                 "assertion_traceability_path": "assertion_traceability.json",
                 "assertion_delta_path": "assertion_delta.json",
+                "compilation_certificate_path": "compilation_certificate.json",
+                "witness_plan_path": "witness_plan.json",
+                "semantic_evidence_path": "semantic_evidence.json",
                 "rtl_property_count": len(rtl_properties),
             }
             _write_json(self.stage_dir / "stage_result.json", result)
@@ -148,6 +156,9 @@ class BindingStage:
                         "assertion_traceability": "assertion_traceability.json",
                         "rtl_label_result": "rtl_label_result.json",
                         "assertion_delta": "assertion_delta.json",
+                        "compilation_certificate": "compilation_certificate.json",
+                        "witness_plan": "witness_plan.json",
+                        "semantic_evidence": "semantic_evidence.json",
                     },
                 },
             )
@@ -199,11 +210,17 @@ class BindingStage:
         trace_path = self.stage_dir / "assertion_traceability.json"
         labels_path = self.stage_dir / "rtl_label_result.json"
         delta_path = self.stage_dir / "assertion_delta.json"
+        certificate_path = self.stage_dir / "compilation_certificate.json"
+        witness_path = self.stage_dir / "witness_plan.json"
+        semantic_path = self.stage_dir / "semantic_evidence.json"
         if (
             manifest is None
             or not trace_path.is_file()
             or not labels_path.is_file()
             or not delta_path.is_file()
+            or not certificate_path.is_file()
+            or not witness_path.is_file()
+            or not semantic_path.is_file()
         ):
             return None
         try:
@@ -247,6 +264,9 @@ class BindingStage:
             "binding_manifest_path": "binding_manifest.json",
             "assertion_traceability_path": "assertion_traceability.json",
             "assertion_delta_path": "assertion_delta.json",
+            "compilation_certificate_path": "compilation_certificate.json",
+            "witness_plan_path": "witness_plan.json",
+            "semantic_evidence_path": "semantic_evidence.json",
             "rtl_property_count": len(labels),
         }
         _write_json(self.stage_dir / "stage_result.json", result)
@@ -261,6 +281,9 @@ class BindingStage:
                     "assertion_traceability": "assertion_traceability.json",
                     "rtl_label_result": "rtl_label_result.json",
                     "assertion_delta": "assertion_delta.json",
+                    "compilation_certificate": "compilation_certificate.json",
+                    "witness_plan": "witness_plan.json",
+                    "semantic_evidence": "semantic_evidence.json",
                 },
             },
         )
@@ -545,6 +568,14 @@ class BindingStage:
                 "baseline_label_overlap": [],
             },
         )
+        certificate = compile_manifest(manifest, self.catalog, rtl_properties=records)
+        witness_plan = build_witness_plan(manifest, self.catalog)
+        semantic_evidence = initial_semantic_evidence(
+            manifest, self.catalog, certificate
+        )
+        _write_json(self.stage_dir / "compilation_certificate.json", certificate)
+        _write_json(self.stage_dir / "witness_plan.json", witness_plan)
+        _write_json(self.stage_dir / "semantic_evidence.json", semantic_evidence)
         self._snapshot_source(target, "after")
 
     def _write_campaign(self, manifest: Dict[str, Any]) -> None:

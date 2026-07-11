@@ -1,23 +1,25 @@
 {
-  "schema_version": "property_schema.v2",
+  "schema_version": "property_schema.v3",
   "property_schema_id": "TL_PROBE_ACK_RESPONSE",
-  "category": "response_obligation",
-  "layer": "transaction",
-  "title": "Issued Probe remains tracked until ProbeAck response",
-  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:1155-1183", "statement": "A Probe is tracked until a ProbeAck or ProbeAckData completes the operation, and conflicting same-block Probes are held until then."},
-  "rule_id": "TL_9_2_PROBE_ACK_RESPONSE",
-  "channel_scope": {"channels": ["B", "C"], "message_classes": ["Probe", "ProbeAck", "ProbeAckData"], "scope": "same_block"},
-  "trigger_event": {"kind": "probe_issue", "description": "a Probe is issued", "channel": "B", "message_classes": ["Probe"]},
-  "response_event": {"kind": "probe_ack", "description": "the matching ProbeAck or ProbeAckData is accepted", "channel": "C", "message_classes": ["ProbeAck", "ProbeAckData"]},
-  "matching_key": {"fields": ["address", "source"], "semantics": "same probed block and requester"},
-  "temporal_shape": "invariant",
-  "bound": {"kind": "none", "minimum": 0, "maximum": 0},
-  "preconditions": ["the implementation exposes a Probe outstanding record"],
-  "optional_behavior_policy": "required",
-  "environment_assumptions": [],
-  "required_observations": [
-    {"id": "probe_ack_violation", "role": "probe_ack_violation", "type": "Bool", "description": "ProbeAck lacks a matching outstanding Probe"}
-  ],
-  "template_ids": ["chisel3_tl_probe_ack_response"],
-  "review_required": true
+  "category": "response_obligation", "layer": "transaction", "title": "Issued Probe remains tracked until ProbeAck response",
+  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:1155-1183", "statement": "A Probe is tracked until ProbeAck or ProbeAckData completes the operation."},
+  "rule_id": "TL_9_2_PROBE_ACK_RESPONSE", "obligation_kind": "response",
+  "channel_scope": {"channels": ["B", "C"], "message_classes": ["Probe", "ProbeAck", "ProbeAckData"], "scope": "same block and source"},
+  "event_automaton": {"initial_state": "idle", "states": ["idle", "probe_pending", "complete", "violation"], "terminal_states": ["complete", "violation"], "events": [
+    {"event_id": "probe_issue", "kind": "trigger", "channel": "B", "direction": "manager_to_client", "message_classes": ["Probe"]},
+    {"event_id": "probe_ack", "kind": "response", "channel": "C", "direction": "client_to_manager", "message_classes": ["ProbeAck", "ProbeAckData"]},
+    {"event_id": "ack_without_probe", "kind": "violation", "channel": "C", "direction": "client_to_manager", "message_classes": ["ProbeAck", "ProbeAckData"]}
+  ], "transitions": [
+    {"from": "idle", "event": "probe_issue", "to": "probe_pending", "condition": "record source and address"},
+    {"from": "probe_pending", "event": "probe_ack", "to": "complete", "condition": "same source and address"},
+    {"from": "idle", "event": "ack_without_probe", "to": "violation", "condition": "no matching outstanding Probe"}
+  ]},
+  "correlation": {"keys": ["address", "source"], "created_by": "probe_issue", "consumed_by": "probe_ack", "lifetime": "Probe issue through ProbeAck completion", "reuse_policy": "forbid_conflicting_reuse"},
+  "cardinality": {"subject": "outstanding Probe per source", "minimum": 0, "maximum": 1, "scope": "source and block"}, "permission_relation": null,
+  "optional_paths": [{"path_id": "ack_payload", "description": "Probe completion may return ProbeAck or ProbeAckData.", "events": ["probe_ack"], "required": false}],
+  "environment_boundary": {"protocol_premises": [], "fairness": [], "harness_restrictions": ["implementation exposes a Probe outstanding record"], "proof_simplifications": [], "proof_bound": {"kind": "none", "minimum": 0, "maximum": 0}},
+  "observable_contract": {"observations": [{"id": "probe_ack_violation", "role": "probe_ack_violation", "type": "Bool", "description": "ProbeAck lacks a matching outstanding Probe", "reachability": "toggle"}], "ghost_state": ["probePending[source]", "probeAddress[source]"], "clock_domain": "tilelink", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "probe_then_ack", "steps": ["probe_issue", "probe_ack"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "ack_without_probe", "steps": ["ack_without_probe"], "expected": "violate"}], "mutation_classes": ["message_ordering", "identifier_correlation"], "non_vacuity": {"required": true, "trigger_event_ids": ["probe_issue"], "observer_requirements": ["probe_ack_violation"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["B.Probe source/address", "C.ProbeAck source/address"], "implementation_anchors": ["Probe pending scoreboard"], "fail_closed_conditions": ["address projection missing", "source width mismatch", "clock-domain conflict"]},
+  "lowering_family": "response_scoreboard", "template_ids": ["chisel3_tl_probe_ack_response"], "review_required": true
 }

@@ -1,0 +1,25 @@
+{
+  "schema_version": "property_schema.v3", "property_schema_id": "TL_GRANT_DATA_RELATION", "category": "data_consistency", "layer": "transaction", "title": "GrantData returns the tracked latest data for its block",
+  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:1185", "statement": "A Grant responding to an Acquire permission upgrade includes an up-to-date copy unless the manager can establish that the requester has not been probed since the Acquire."},
+  "rule_id": "TL_6_GRANT_DATA_RELATION", "obligation_kind": "data",
+  "channel_scope": {"channels": ["A", "C", "D"], "message_classes": ["AcquireBlock", "ProbeAckData", "ReleaseData", "GrantData"], "scope": "same block and outstanding transaction"},
+  "event_automaton": {"initial_state": "idle", "states": ["idle", "data_known", "acquire_pending", "complete", "violation"], "terminal_states": ["complete", "violation"], "events": [
+    {"event_id": "data_update", "kind": "trigger", "channel": "C", "direction": "client_to_manager", "message_classes": ["ProbeAckData", "ReleaseData"]},
+    {"event_id": "acquire_block", "kind": "trigger", "channel": "A", "direction": "client_to_manager", "message_classes": ["AcquireBlock"]},
+    {"event_id": "grant_data", "kind": "response", "channel": "D", "direction": "manager_to_client", "message_classes": ["GrantData"]},
+    {"event_id": "stale_grant_data", "kind": "violation", "channel": "D", "direction": "manager_to_client", "message_classes": ["GrantData"]}
+  ], "transitions": [
+    {"from": "idle", "event": "data_update", "to": "data_known", "condition": "capture latest complete data beat set"},
+    {"from": "data_known", "event": "acquire_block", "to": "acquire_pending", "condition": "same block"},
+    {"from": "acquire_pending", "event": "grant_data", "to": "complete", "condition": "returned data equals tracked latest data"},
+    {"from": "acquire_pending", "event": "stale_grant_data", "to": "violation", "condition": "returned data differs"}
+  ]},
+  "correlation": {"keys": ["address", "source", "beat"], "created_by": "acquire_block", "consumed_by": "grant_data", "lifetime": "AcquireBlock through final GrantData beat", "reuse_policy": "forbid_source_reuse_and_preserve_beat_order"},
+  "cardinality": {"subject": "tracked latest value", "minimum": 0, "maximum": 1, "scope": "block and beat"}, "permission_relation": null,
+  "optional_paths": [{"path_id": "clean_data_source", "description": "Data may come from memory or a clean cache copy when it equals the tracked latest value.", "events": ["grant_data"], "required": false}],
+  "environment_boundary": {"protocol_premises": ["the tracked update is complete before the matching response is checked"], "fairness": [], "harness_restrictions": ["a bounded set of blocks is tracked by ghost state"], "proof_simplifications": ["one selected block at a time"], "proof_bound": {"kind": "none", "minimum": 0, "maximum": 0}},
+  "observable_contract": {"observations": [{"id": "grant_data_violation", "role": "grant_data_violation", "type": "Bool", "description": "GrantData differs from the tracked latest data for the same block and beat", "reachability": "toggle"}], "ghost_state": ["latestData[block,beat]", "latestDataValid[block,beat]", "pendingAcquire[source]"], "clock_domain": "tilelink", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "updated_data_returned", "steps": ["data_update", "acquire_block", "grant_data"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "old_data_returned", "steps": ["data_update", "acquire_block", "stale_grant_data"], "expected": "violate"}], "mutation_classes": ["data_consistency", "old_data_return", "beat_reordering"], "non_vacuity": {"required": true, "trigger_event_ids": ["data_update", "acquire_block"], "observer_requirements": ["grant_data_violation"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["block address", "transaction source", "data beat"], "implementation_anchors": ["latest-data ghost observer", "elaborated data width"], "fail_closed_conditions": ["data width mismatch", "beat identity missing", "latest-data source ambiguous"]},
+  "lowering_family": "data_relation", "template_ids": ["chisel3_tl_grant_data_relation"], "review_required": true
+}

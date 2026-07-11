@@ -1,23 +1,24 @@
 {
-  "schema_version": "property_schema.v2",
-  "property_schema_id": "TL_BURST_CONTROL_STABLE",
-  "category": "multibeat_integrity",
-  "layer": "interface",
-  "title": "Multibeat control remains stable after the first accepted beat",
-  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:256-262", "statement": "Control signals for a burst that is in progress must remain constant and identify the same message as the first beat."},
-  "rule_id": "TL_4_1_BURST_CONTROL_STABLE",
-  "channel_scope": {"channels": ["A", "B", "C", "D"], "message_classes": ["multibeat"], "scope": "accepted_burst"},
-  "trigger_event": {"kind": "first_beat", "description": "the first beat of a multibeat message is accepted", "channel": null, "message_classes": ["multibeat"]},
-  "response_event": {"kind": "later_beat", "description": "a later beat of the same burst is presented", "channel": null, "message_classes": ["multibeat"]},
-  "matching_key": {"fields": ["opcode", "param", "size", "source", "address", "mask"], "semantics": "same multibeat message control"},
-  "temporal_shape": "invariant",
-  "bound": {"kind": "none", "minimum": 0, "maximum": 0},
-  "preconditions": ["the channel carries a multibeat message"],
-  "optional_behavior_policy": "required",
-  "environment_assumptions": [],
-  "required_observations": [
-    {"id": "burst_control_violation", "role": "burst_control_violation", "type": "Bool", "description": "selected A/C/D channel changed control during an active burst"}
-  ],
-  "template_ids": ["chisel3_tl_burst_control_stable"],
-  "review_required": true
+  "schema_version": "property_schema.v3", "property_schema_id": "TL_BURST_CONTROL_STABLE", "category": "multibeat_integrity", "layer": "interface", "title": "Multibeat control remains stable after the first accepted beat",
+  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:256-262", "statement": "Control signals for a burst in progress remain constant and identify the same message as the first beat."},
+  "rule_id": "TL_4_1_BURST_CONTROL_STABLE", "obligation_kind": "safety",
+  "channel_scope": {"channels": ["A", "B", "C", "D"], "message_classes": ["multibeat"], "scope": "accepted burst"},
+  "event_automaton": {"initial_state": "idle", "states": ["idle", "burst_active", "complete", "violation"], "terminal_states": ["complete", "violation"], "events": [
+    {"event_id": "first_beat", "kind": "trigger", "channel": null, "direction": "internal", "message_classes": ["multibeat"]},
+    {"event_id": "middle_beat", "kind": "progress", "channel": null, "direction": "internal", "message_classes": ["multibeat"]},
+    {"event_id": "last_beat", "kind": "response", "channel": null, "direction": "internal", "message_classes": ["multibeat"]},
+    {"event_id": "control_change", "kind": "violation", "channel": null, "direction": "internal", "message_classes": ["multibeat"]}
+  ], "transitions": [
+    {"from": "idle", "event": "first_beat", "to": "burst_active", "condition": "first and not last"},
+    {"from": "burst_active", "event": "middle_beat", "to": "burst_active", "condition": "control equals first beat"},
+    {"from": "burst_active", "event": "last_beat", "to": "complete", "condition": "control equals first beat"},
+    {"from": "burst_active", "event": "control_change", "to": "violation", "condition": "opcode/param/size/source/address/mask mismatch"}
+  ]},
+  "correlation": {"keys": ["opcode", "param", "size", "source", "address", "mask"], "created_by": "first_beat", "consumed_by": "last_beat", "lifetime": "first through final accepted beat", "reuse_policy": "stable_until_consumed"},
+  "cardinality": {"subject": "active burst per channel", "minimum": 0, "maximum": 1, "scope": "channel"}, "permission_relation": null, "optional_paths": [],
+  "environment_boundary": {"protocol_premises": ["the selected message is multibeat"], "fairness": [], "harness_restrictions": [], "proof_simplifications": [], "proof_bound": {"kind": "none", "minimum": 0, "maximum": 0}},
+  "observable_contract": {"observations": [{"id": "burst_control_violation", "role": "burst_control_violation", "type": "Bool", "description": "selected channel changed control during an active burst", "reachability": "toggle"}], "ghost_state": ["active[channel]", "firstControl[channel]"], "clock_domain": "tilelink", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "stable_multibeat", "steps": ["first_beat", "middle_beat", "last_beat"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "changed_control", "steps": ["first_beat", "control_change"], "expected": "violate"}], "mutation_classes": ["multibeat_lifecycle", "field_stability"], "non_vacuity": {"required": true, "trigger_event_ids": ["first_beat"], "observer_requirements": ["burst_control_violation"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["TileLink beat counter", "message control bundle"], "implementation_anchors": ["edge count first/last", "control concatenation"], "fail_closed_conditions": ["beat identity missing", "field-width mismatch", "clock-domain conflict"]},
+  "lowering_family": "multibeat", "template_ids": ["chisel3_tl_burst_control_stable"], "review_required": true
 }

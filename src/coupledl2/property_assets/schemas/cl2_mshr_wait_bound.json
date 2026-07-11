@@ -1,23 +1,22 @@
 {
-  "schema_version": "property_schema.v2",
-  "property_schema_id": "CL2_MSHR_WAIT_BOUND",
-  "category": "bounded_liveness",
-  "layer": "cache_state",
-  "title": "MSHR wait timer remains within a finite bound",
-  "source": {"kind": "implementation_requirement", "document": "XiangShan CoupledL2 MSHRCtl", "locator": "MSHRCtl per-entry allocation/status timer", "statement": "an allocated MSHR must not remain in the selected wait state beyond the configured bound"},
-  "rule_id": null,
+  "schema_version": "property_schema.v3", "property_schema_id": "CL2_MSHR_WAIT_BOUND", "category": "bounded_liveness", "layer": "cache_state", "title": "MSHR wait state leaves within a finite proof bound",
+  "source": {"kind": "implementation_requirement", "document": "XiangShan CoupledL2 MSHRCtl", "locator": "MSHRCtl per-entry allocation/status timer", "statement": "An allocated MSHR does not remain in the selected wait state beyond the configured implementation proof bound."},
+  "rule_id": null, "obligation_kind": "bounded_liveness",
   "channel_scope": {"channels": [], "message_classes": [], "scope": "MSHRCtl entry"},
-  "trigger_event": {"kind": "mshr_wait", "description": "an MSHR enters the selected wait state", "channel": null, "message_classes": []},
-  "response_event": {"kind": "mshr_progress", "description": "the selected wait state is left", "channel": null, "message_classes": []},
-  "matching_key": {"fields": ["mshr_index"], "semantics": "same MSHR entry"},
-  "temporal_shape": "bounded_liveness",
-  "bound": {"kind": "cycles", "minimum": 64, "maximum": 4096},
-  "preconditions": ["the MSHR status entry is valid"],
-  "optional_behavior_policy": "implementation_defined",
-  "environment_assumptions": [],
-  "required_observations": [
-    {"id": "timer", "role": "timer", "type": "UInt", "description": "per-entry MSHR wait timer"}
-  ],
-  "template_ids": ["chisel3_mshr_wait_bound"],
-  "review_required": true
+  "event_automaton": {"initial_state": "idle", "states": ["idle", "waiting", "progress", "violation"], "terminal_states": ["progress", "violation"], "events": [
+    {"event_id": "mshr_wait", "kind": "trigger", "channel": null, "direction": "internal", "message_classes": []},
+    {"event_id": "mshr_progress", "kind": "response", "channel": null, "direction": "internal", "message_classes": []},
+    {"event_id": "bound_expired", "kind": "violation", "channel": null, "direction": "internal", "message_classes": []}
+  ], "transitions": [
+    {"from": "idle", "event": "mshr_wait", "to": "waiting", "condition": "status valid and selected wait predicate"},
+    {"from": "waiting", "event": "mshr_progress", "to": "progress", "condition": "wait predicate clears"},
+    {"from": "waiting", "event": "bound_expired", "to": "violation", "condition": "timer exceeds proof bound"}
+  ]},
+  "correlation": {"keys": ["mshr_index"], "created_by": "mshr_wait", "consumed_by": "mshr_progress", "lifetime": "selected MSHR wait interval", "reuse_policy": "reset_on_deallocation"},
+  "cardinality": {"subject": "wait counter per MSHR", "minimum": 0, "maximum": 1, "scope": "mshr_index"}, "permission_relation": null, "optional_paths": [],
+  "environment_boundary": {"protocol_premises": [], "fairness": ["accepted downstream transactions eventually receive arbitration opportunities"], "harness_restrictions": ["the MSHR status entry is valid", "selected wait state matches the observer"], "proof_simplifications": ["one implementation-specific wait timer is checked"], "proof_bound": {"kind": "cycles", "minimum": 64, "maximum": 4096}},
+  "observable_contract": {"observations": [{"id": "timer", "role": "timer", "type": "UInt", "description": "per-entry MSHR wait timer", "reachability": "toggle"}], "ghost_state": ["wait counter"], "clock_domain": "coupledl2", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "wait_then_progress", "steps": ["mshr_wait", "mshr_progress"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "expired_wait", "steps": ["mshr_wait", "bound_expired"], "expected": "violate"}], "mutation_classes": ["liveness_resource", "wait_chain"], "non_vacuity": {"required": true, "trigger_event_ids": ["mshr_wait"], "observer_requirements": ["timer"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["MSHR allocation identity", "wait-state exit"], "implementation_anchors": ["per-entry timer", "status channel"], "fail_closed_conditions": ["wait predicate absent", "fairness unstated", "timer not observable"]},
+  "lowering_family": "bounded_liveness", "template_ids": ["chisel3_mshr_wait_bound"], "review_required": true
 }

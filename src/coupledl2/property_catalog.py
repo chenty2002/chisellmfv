@@ -13,14 +13,14 @@ from .property_review import (
     load_property_review,
     verify_review_assets,
 )
+from .property_ir import (
+    PropertyIRError,
+    observation_slots,
+    validate_property_schema_v3,
+)
 
 
 ASSET_ROOT = Path(__file__).with_name("property_assets")
-SOURCE_KINDS = {
-    "protocol_requirement",
-    "implementation_requirement",
-    "historical_counterexample",
-}
 PLACEHOLDER_RE = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 
 
@@ -136,6 +136,61 @@ def list_property_profiles() -> List[str]:
     return sorted(path.stem for path in (ASSET_ROOT / "profiles").glob("*.json"))
 
 
+def load_all_property_schemas() -> Dict[str, Dict[str, Any]]:
+    """Load the complete V3 obligation corpus, including not-yet-profiled assets."""
+    schemas: Dict[str, Dict[str, Any]] = {}
+    for path in sorted((ASSET_ROOT / "schemas").glob("*.json")):
+        payload = _read_json(path)
+        validate_property_schema(payload)
+        schema_id = payload["property_schema_id"]
+        if schema_id in schemas:
+            raise PropertyCatalogError("duplicate property schema id")
+        schemas[schema_id] = payload
+    return schemas
+
+
+def load_all_assertion_templates() -> Dict[str, Dict[str, Any]]:
+    """Load all repository-owned lowering variants and validate their contracts."""
+    templates: Dict[str, Dict[str, Any]] = {}
+    for path in sorted((ASSET_ROOT / "templates").glob("*.json")):
+        payload = _read_json(path)
+        _validate_template(payload)
+        template_id = payload["template_id"]
+        if template_id in templates:
+            raise PropertyCatalogError("duplicate assertion template id")
+        templates[template_id] = payload
+    return templates
+
+
+def validate_obligation_corpus() -> Dict[str, Any]:
+    """Validate every V3 obligation against its repository lowering variants."""
+    schemas = load_all_property_schemas()
+    templates = load_all_assertion_templates()
+    for schema in schemas.values():
+        expected_slots = _schema_slots(schema)
+        for template_id in schema["template_ids"]:
+            template = templates.get(template_id)
+            if template is None:
+                raise PropertyCatalogError("schema references a missing lowering template")
+            if schema["property_schema_id"] not in template["property_schema_ids"]:
+                raise PropertyCatalogError("schema/template cross reference mismatch")
+            actual_slots = {
+                name: definition["type"]
+                for name, definition in template["slots"].items()
+            }
+            if actual_slots != expected_slots:
+                raise PropertyCatalogError("schema/template slot contract mismatch")
+    return {
+        "schema_version": "obligation_corpus_validation.v1",
+        "obligation_count": len(schemas),
+        "template_count": len(templates),
+        "lowering_families": sorted(
+            {schema["lowering_family"] for schema in schemas.values()}
+        ),
+        "status": "passed",
+    }
+
+
 def public_catalog(catalog: PropertyCatalog) -> Dict[str, Any]:
     """Return the model-visible catalog without template bodies or expressions."""
     return {
@@ -216,66 +271,17 @@ def _exact_fields(value: Dict[str, Any], allowed: set[str], required: set[str], 
 
 
 def validate_property_schema(value: Dict[str, Any]) -> None:
-    fields = {
-        "schema_version", "property_schema_id", "category", "layer", "title",
-        "source", "rule_id", "channel_scope", "trigger_event", "response_event",
-        "matching_key", "temporal_shape", "bound", "preconditions",
-        "optional_behavior_policy", "environment_assumptions",
-        "required_observations", "template_ids", "review_required",
-    }
-    _exact_fields(value, fields, fields, "property_schema")
-    if value["schema_version"] != "property_schema.v2":
-        raise PropertyCatalogError("unsupported property schema version")
-    _exact_fields(
-        value["source"],
-        {"kind", "document", "locator", "statement"},
-        {"kind", "document", "locator", "statement"},
-        "property_schema.source",
-    )
-    if value["source"]["kind"] not in SOURCE_KINDS:
-        raise PropertyCatalogError("invalid property source kind")
-    is_protocol = value["source"]["kind"] == "protocol_requirement"
-    if is_protocol != isinstance(value["rule_id"], str):
-        raise PropertyCatalogError("protocol schema must have rule_id and non-protocol schema must not")
-    _exact_fields(value["channel_scope"], {"channels", "message_classes", "scope"}, {"channels", "message_classes", "scope"}, "property_schema.channel_scope")
-    if not isinstance(value["channel_scope"]["channels"], list) or not all(
-        channel in {"A", "B", "C", "D", "E"} for channel in value["channel_scope"]["channels"]
-    ):
-        raise PropertyCatalogError("property schema channel scope is invalid")
-    for field in ("trigger_event", "response_event"):
-        event = value[field]
-        if event is None:
-            continue
-        _exact_fields(event, {"kind", "description", "channel", "message_classes"}, {"kind", "description", "channel", "message_classes"}, f"property_schema.{field}")
-        if event["channel"] is not None and event["channel"] not in {"A", "B", "C", "D", "E"}:
-            raise PropertyCatalogError("property schema event channel is invalid")
-    _exact_fields(value["matching_key"], {"fields", "semantics"}, {"fields", "semantics"}, "property_schema.matching_key")
-    _exact_fields(value["bound"], {"kind", "minimum", "maximum"}, {"kind", "minimum", "maximum"}, "property_schema.bound")
-    if value["bound"]["kind"] not in {"none", "cycles"}:
-        raise PropertyCatalogError("property schema bound kind is invalid")
-    if value["temporal_shape"] not in {"invariant", "stable_while_stalled", "forbid_while_pending", "response_eventually", "bounded_liveness"}:
-        raise PropertyCatalogError("property schema temporal shape is invalid")
-    if value["optional_behavior_policy"] not in {"required", "implementation_defined", "environment_constrained"}:
-        raise PropertyCatalogError("property schema optional behavior policy is invalid")
-    observations = value["required_observations"]
-    if not isinstance(observations, list) or not observations:
-        raise PropertyCatalogError("property schema requires observations")
-    roles = set()
-    for observation in observations:
-        _exact_fields(observation, {"id", "role", "type", "description"}, {"id", "role", "type", "description"}, "property_schema.required_observations[]")
-        if observation["role"] in roles:
-            raise PropertyCatalogError("property schema observation roles must be unique")
-        roles.add(observation["role"])
+    try:
+        validate_property_schema_v3(value)
+    except PropertyIRError as exc:
+        raise PropertyCatalogError(str(exc)) from exc
 
 
 _validate_schema = validate_property_schema
 
 
 def _schema_slots(schema: Dict[str, Any]) -> Dict[str, str]:
-    return {
-        observation["role"]: observation["type"]
-        for observation in schema["required_observations"]
-    }
+    return observation_slots(schema)
 
 
 def _validate_template(value: Dict[str, Any]) -> None:
@@ -558,11 +564,11 @@ def _validate_gold_bindings(
             trial,
             {
                 "slot", "ranked_candidate_ids", "gold_candidate_id",
-                "manual_corrected", "model", "evidence_ref", "reason",
+                "review_intervened", "model", "evidence_ref", "reason",
             },
             {
                 "slot", "ranked_candidate_ids", "gold_candidate_id",
-                "manual_corrected", "model", "evidence_ref", "reason",
+                "review_intervened", "model", "evidence_ref", "reason",
             },
             "gold_binding_list.selection_trials[]",
         )
@@ -572,7 +578,7 @@ def _validate_gold_bindings(
             or len(ranked) < 2
             or len(set(ranked)) != len(ranked)
             or trial["gold_candidate_id"] not in ranked
-            or not isinstance(trial["manual_corrected"], bool)
+            or not isinstance(trial["review_intervened"], bool)
             or not all(
                 isinstance(trial[field], str) and trial[field]
                 for field in ("model", "evidence_ref", "reason")

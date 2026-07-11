@@ -1,23 +1,24 @@
 {
-  "schema_version": "property_schema.v2",
-  "property_schema_id": "TL_IDENTIFIER_PAIRING",
-  "category": "routing_integrity",
-  "layer": "transaction",
-  "title": "Request and response identifiers retain pairing information",
-  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:653-665", "statement": "Each outstanding request identifier must be duplicated on the response channels needed to associate the response with its request."},
-  "rule_id": "TL_6_4_IDENTIFIER_PAIRING",
-  "channel_scope": {"channels": ["A", "B", "C", "D", "E"], "message_classes": ["request_response"], "scope": "outstanding_transaction"},
-  "trigger_event": {"kind": "request_accept", "description": "a request with a routing identifier is accepted", "channel": null, "message_classes": ["request"]},
-  "response_event": {"kind": "response_accept", "description": "a response for the request is accepted", "channel": null, "message_classes": ["response"]},
-  "matching_key": {"fields": ["source", "sink"], "semantics": "implementation-defined request/response routing pair"},
-  "temporal_shape": "invariant",
-  "bound": {"kind": "none", "minimum": 0, "maximum": 0},
-  "preconditions": ["the selected request/response message class has a defined identifier pair"],
-  "optional_behavior_policy": "implementation_defined",
-  "environment_assumptions": [],
-  "required_observations": [
-    {"id": "identifier_pair_violation", "role": "identifier_pair_violation", "type": "Bool", "description": "GrantAck sink lacks a matching outstanding Grant sink"}
-  ],
-  "template_ids": ["chisel3_tl_identifier_pairing"],
-  "review_required": true
+  "schema_version": "property_schema.v3", "property_schema_id": "TL_IDENTIFIER_PAIRING", "category": "routing_integrity", "layer": "transaction", "title": "Grant sink identity remains live until GrantAck",
+  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:653-665", "statement": "Outstanding request and response identifiers preserve the information needed to associate GrantAck with Grant."},
+  "rule_id": "TL_6_4_IDENTIFIER_PAIRING", "obligation_kind": "serialization",
+  "channel_scope": {"channels": ["D", "E"], "message_classes": ["Grant", "GrantData", "GrantAck"], "scope": "outstanding sink identifier"},
+  "event_automaton": {"initial_state": "idle", "states": ["idle", "sink_pending", "complete", "violation"], "terminal_states": ["complete", "violation"], "events": [
+    {"event_id": "grant_first_beat", "kind": "trigger", "channel": "D", "direction": "manager_to_client", "message_classes": ["Grant", "GrantData"]},
+    {"event_id": "grant_ack", "kind": "response", "channel": "E", "direction": "client_to_manager", "message_classes": ["GrantAck"]},
+    {"event_id": "duplicate_sink", "kind": "violation", "channel": "D", "direction": "manager_to_client", "message_classes": ["Grant", "GrantData"]},
+    {"event_id": "unknown_sink_ack", "kind": "violation", "channel": "E", "direction": "client_to_manager", "message_classes": ["GrantAck"]}
+  ], "transitions": [
+    {"from": "idle", "event": "grant_first_beat", "to": "sink_pending", "condition": "allocate sink only on first beat"},
+    {"from": "sink_pending", "event": "grant_ack", "to": "complete", "condition": "same sink"},
+    {"from": "sink_pending", "event": "duplicate_sink", "to": "violation", "condition": "sink already pending"},
+    {"from": "idle", "event": "unknown_sink_ack", "to": "violation", "condition": "sink not pending"}
+  ]},
+  "correlation": {"keys": ["sink"], "created_by": "grant_first_beat", "consumed_by": "grant_ack", "lifetime": "first Grant beat through GrantAck", "reuse_policy": "forbid_until_consumed"},
+  "cardinality": {"subject": "pending Grant per sink", "minimum": 0, "maximum": 1, "scope": "sink"}, "permission_relation": null, "optional_paths": [],
+  "environment_boundary": {"protocol_premises": ["the selected message class carries a defined sink pair"], "fairness": [], "harness_restrictions": [], "proof_simplifications": [], "proof_bound": {"kind": "none", "minimum": 0, "maximum": 0}},
+  "observable_contract": {"observations": [{"id": "identifier_pair_violation", "role": "identifier_pair_violation", "type": "Bool", "description": "GrantAck sink lacks a matching outstanding Grant or sink is reused", "reachability": "toggle"}], "ghost_state": ["grantPending[sink]"], "clock_domain": "tilelink", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "grant_then_ack", "steps": ["grant_first_beat", "grant_ack"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "unknown_ack", "steps": ["unknown_sink_ack"], "expected": "violate"}], "mutation_classes": ["identifier_correlation", "multibeat_lifecycle"], "non_vacuity": {"required": true, "trigger_event_ids": ["grant_first_beat"], "observer_requirements": ["identifier_pair_violation"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["D first-beat sink", "E GrantAck sink"], "implementation_anchors": ["pending sink scoreboard"], "fail_closed_conditions": ["sink width mismatch", "first-beat identity absent", "clock-domain conflict"]},
+  "lowering_family": "serialization", "template_ids": ["chisel3_tl_identifier_pairing"], "review_required": true
 }

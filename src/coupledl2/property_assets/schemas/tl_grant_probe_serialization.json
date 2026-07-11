@@ -1,29 +1,27 @@
 {
-  "schema_version": "property_schema.v2",
-  "property_schema_id": "TL_GRANT_PROBE_SERIALIZATION",
-  "category": "serialization_safety",
-  "layer": "transaction",
-  "title": "Grant and same-block Probe are serialized until GrantAck",
-  "source": {
-    "kind": "protocol_requirement",
-    "document": "tilelink_spec_1.8.1",
-    "locator": "tilelink_spec_1.8.1.md:1173-1175",
-    "statement": "After a slave issues a Grant for a block, it should not issue Probes on that block until the corresponding GrantAck is received."
-  },
-  "rule_id": "TL_9_2_GRANT_PROBE_SERIALIZATION",
-  "channel_scope": {"channels": ["B", "D", "E"], "message_classes": ["Grant", "GrantAck", "Probe"], "scope": "same_block"},
-  "trigger_event": {"kind": "grant_pending", "description": "a Grant for a block remains outstanding", "channel": "D", "message_classes": ["Grant"]},
-  "response_event": {"kind": "grant_ack", "description": "the matching GrantAck is accepted", "channel": "E", "message_classes": ["GrantAck"]},
-  "matching_key": {"fields": ["set", "tag"], "semantics": "same cache block"},
-  "temporal_shape": "forbid_while_pending",
-  "bound": {"kind": "none", "minimum": 0, "maximum": 0},
-  "preconditions": ["reset has completed", "GrantBuffer grantStatus entries identify Grants awaiting GrantAck"],
-  "optional_behavior_policy": "required",
-  "environment_assumptions": [],
-  "required_observations": [
-    {"id": "grant_pending", "role": "grant_pending", "type": "Bool", "description": "same-block Grant remains pending"},
-    {"id": "probe_fire", "role": "probe_fire", "type": "Bool", "description": "same-block Probe is issued"}
-  ],
-  "template_ids": ["chisel3_tl_grant_probe_serialization", "chisel3_tl_grant_probe_serialization_formal_assert"],
-  "review_required": true
+  "schema_version": "property_schema.v3", "property_schema_id": "TL_GRANT_PROBE_SERIALIZATION", "category": "serialization_safety", "layer": "transaction", "title": "Grant and same-block Probe are serialized until GrantAck",
+  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:1173-1175", "statement": "After a slave issues a Grant for a block, it should not issue Probes on that block until the corresponding GrantAck is received."},
+  "rule_id": "TL_9_2_GRANT_PROBE_SERIALIZATION", "obligation_kind": "serialization",
+  "channel_scope": {"channels": ["B", "D", "E"], "message_classes": ["Probe", "Grant", "GrantData", "GrantAck"], "scope": "same block"},
+  "event_automaton": {"initial_state": "idle", "states": ["idle", "grant_pending", "complete", "violation"], "terminal_states": ["complete", "violation"], "events": [
+    {"event_id": "grant_issue", "kind": "trigger", "channel": "D", "direction": "manager_to_client", "message_classes": ["Grant", "GrantData"]},
+    {"event_id": "grant_ack", "kind": "response", "channel": "E", "direction": "client_to_manager", "message_classes": ["GrantAck"]},
+    {"event_id": "probe_after_ack", "kind": "allowed", "channel": "B", "direction": "manager_to_client", "message_classes": ["Probe"]},
+    {"event_id": "same_block_probe", "kind": "violation", "channel": "B", "direction": "manager_to_client", "message_classes": ["Probe"]}
+  ], "transitions": [
+    {"from": "idle", "event": "grant_issue", "to": "grant_pending", "condition": "allocate block and sink"},
+    {"from": "grant_pending", "event": "grant_ack", "to": "complete", "condition": "same sink"},
+    {"from": "complete", "event": "probe_after_ack", "to": "complete", "condition": "Grant lifetime has ended"},
+    {"from": "grant_pending", "event": "same_block_probe", "to": "violation", "condition": "same set/tag before GrantAck"}
+  ]},
+  "correlation": {"keys": ["set", "tag", "sink"], "created_by": "grant_issue", "consumed_by": "grant_ack", "lifetime": "Grant issue through GrantAck", "reuse_policy": "forbid_same_block_probe"},
+  "cardinality": {"subject": "pending Grant owner", "minimum": 0, "maximum": 1, "scope": "block and sink"}, "permission_relation": null, "optional_paths": [],
+  "environment_boundary": {"protocol_premises": ["Grant status identifies Grants awaiting GrantAck"], "fairness": [], "harness_restrictions": ["reset has completed"], "proof_simplifications": [], "proof_bound": {"kind": "none", "minimum": 0, "maximum": 0}},
+  "observable_contract": {"observations": [
+    {"id": "grant_pending", "role": "grant_pending", "type": "Bool", "description": "same-block Grant remains pending", "reachability": "toggle"},
+    {"id": "probe_fire", "role": "probe_fire", "type": "Bool", "description": "same-block Probe is issued", "reachability": "trigger"}
+  ], "ghost_state": ["pending grant block and sink"], "clock_domain": "tilelink", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "grant_ack_then_probe", "steps": ["grant_issue", "grant_ack", "probe_after_ack"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "probe_before_ack", "steps": ["grant_issue", "same_block_probe"], "expected": "violate"}], "mutation_classes": ["message_ordering", "serialization"], "non_vacuity": {"required": true, "trigger_event_ids": ["grant_issue"], "observer_requirements": ["grant_pending", "probe_fire"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["D.Grant block/sink", "E.GrantAck sink", "B.Probe block"], "implementation_anchors": ["GrantBuffer pending status", "SourceB issue fire"], "fail_closed_conditions": ["block projection absent", "sink identity absent", "observer multi-source conflict"]},
+  "lowering_family": "serialization", "template_ids": ["chisel3_tl_grant_probe_serialization", "chisel3_tl_grant_probe_serialization_formal_assert"], "review_required": true
 }

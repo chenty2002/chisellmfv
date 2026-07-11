@@ -14,21 +14,19 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from .property_ir import semantic_review_completeness, structural_completeness
+
 
 ASSET_ROOT = Path(__file__).with_name("property_assets")
 SCHEMA_ROOT = ASSET_ROOT / "schemas"
-PRIMARY_STATUSES = {"proven", "cex", "inconclusive", "not_run", "tool_error"}
+PRIMARY_STATUSES = {
+    "proven", "cex", "inconclusive", "timeout", "not_run", "tool_error",
+    "vacuous", "environment_excluded", "not_applicable", "invalid",
+}
 REQUIRED_EXPERIMENT_CASES = (
     "XiangShan-CoupledL2-deadlock-v0",
     "XiangShan-CoupledL2-write_read",
 )
-SEMANTIC_FIELDS = (
-    "rule_id", "layer", "channel_scope", "trigger_event", "response_event",
-    "matching_key", "temporal_shape", "bound", "preconditions",
-    "optional_behavior_policy", "environment_assumptions", "required_observations",
-)
-
-
 class ResearchReportError(ValueError):
     """Raised when a requested report scope is not well formed."""
 
@@ -97,6 +95,7 @@ def _load_runs(run_dirs: Iterable[Path | str]) -> List[Dict[str, Any]]:
             "result_map": _read_artifact(results / "by_stage/03_invoke_verification/property_result_map.json"),
             "diagnosis": _read_artifact(results / "by_stage/04_waveform_explanation/diagnosis.json"),
             "diagnosis_evidence": _read_artifact(results / "by_stage/04_waveform_explanation/diagnosis_evidence.json"),
+            "semantic_evidence": _read_artifact(results / "by_stage/02_bind_properties/semantic_evidence.json"),
         }
         revision_files = sorted(results.rglob("revision_outcome.json")) if results.is_dir() else []
         campaign_value = artifacts["campaign"]["value"]
@@ -152,6 +151,18 @@ def _property_coverage(runs: List[Dict[str, Any]], schemas: Mapping[str, Dict[st
         if not isinstance(properties, list):
             artifact_states["invalid_payload"] += 1
             continue
+        semantic_artifact = run["artifacts"]["semantic_evidence"]
+        semantic_by_instance = {}
+        independent_gold = {"status": "not_adjudicated"}
+        if semantic_artifact["state"] == "present" and isinstance(semantic_artifact["value"], dict):
+            semantic_by_instance = {
+                entry.get("instance_id"): entry
+                for entry in semantic_artifact["value"].get("instances", [])
+                if isinstance(entry, dict)
+            }
+            independent_gold = semantic_artifact["value"].get(
+                "independent_gold_label", independent_gold
+            )
         for item in properties:
             if not isinstance(item, dict):
                 artifact_states["invalid_property"] += 1
@@ -162,23 +173,36 @@ def _property_coverage(runs: List[Dict[str, Any]], schemas: Mapping[str, Dict[st
             source = item.get("source") if isinstance(item.get("source"), dict) else {}
             protocol_rule = item.get("protocol_rule") if isinstance(item.get("protocol_rule"), dict) else {}
             channels = semantic.get("channel_scope", {}).get("channels", []) if isinstance(semantic.get("channel_scope"), dict) else []
-            complete = bool(semantic) and all(_semantic_value_present(semantic.get(field)) for field in SEMANTIC_FIELDS)
+            review_status = str(item.get("review_status", "not_reviewed"))
+            structural_complete = bool(semantic) and structural_completeness(semantic)
+            reviewed_complete = bool(semantic) and semantic_review_completeness(
+                semantic, review_status
+            )
+            events = semantic.get("event_automaton", {}).get("events", []) if isinstance(semantic.get("event_automaton"), dict) else []
+            trigger_events = [event for event in events if event.get("kind") == "trigger"]
+            response_events = [event for event in events if event.get("kind") == "response"]
+            instance_evidence = semantic_by_instance.get(item.get("instance_id"), {})
             rows.append(
                 {
                     "run_id": run["run_id"],
                     "instance_id": item.get("instance_id"),
                     "property_schema_id": schema_id,
                     "template_id": item.get("template_id"),
-                    "review_status": item.get("review_status", "not_reviewed"),
+                    "approved_by_codex": review_status == "approved",
+                    "review_status": review_status,
+                    "experiment_eligible": bool(instance_evidence.get("experiment_eligible")),
+                    "independent_gold_status": independent_gold.get("status", "not_adjudicated"),
                     "layer": semantic.get("layer"),
                     "channels": channels if isinstance(channels, list) else [],
-                    "trigger_event": semantic.get("trigger_event"),
-                    "response_event": semantic.get("response_event"),
-                    "temporal_shape": semantic.get("temporal_shape"),
+                    "trigger_events": trigger_events,
+                    "response_events": response_events,
+                    "obligation_kind": semantic.get("obligation_kind"),
+                    "lowering_family": semantic.get("lowering_family"),
                     "rule_id": protocol_rule.get("rule_id", semantic.get("rule_id")),
                     "rule_locator": protocol_rule.get("locator", source.get("locator")),
                     "source_kind": source.get("kind", semantic.get("source", {}).get("kind") if isinstance(semantic.get("source"), dict) else None),
-                    "field_complete": complete,
+                    "structural_complete": structural_complete,
+                    "semantic_review_complete": reviewed_complete,
                     "schema_resolution": "resolved" if semantic else "missing_from_repository",
                     "schema_path": schema.get("path"),
                     "schema_current_sha256": schema.get("sha256"),
@@ -204,8 +228,12 @@ def _property_coverage(runs: List[Dict[str, Any]], schemas: Mapping[str, Dict[st
             "by_channel": dict(sorted(channel_counts.items())),
             "by_source_kind": dict(sorted(source_counts.items())),
             "by_review_status": dict(sorted(review_counts.items())),
-            "field_complete": sum(row["field_complete"] for row in rows),
-            "field_incomplete_or_unresolved": sum(not row["field_complete"] for row in rows),
+            "structural_complete": sum(row["structural_complete"] for row in rows),
+            "structural_incomplete_or_unresolved": sum(not row["structural_complete"] for row in rows),
+            "semantic_review_complete": sum(row["semantic_review_complete"] for row in rows),
+            "experiment_eligible": sum(row["experiment_eligible"] for row in rows),
+            "approved_by_codex": sum(row["approved_by_codex"] for row in rows),
+            "independently_adjudicated": sum(row["independent_gold_status"] == "adjudicated" for row in rows),
         },
         "properties": rows,
         "artifact_states": dict(sorted(artifact_states.items())),
@@ -254,7 +282,7 @@ def _binding_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "counts": {
             "approved_campaign_bindings": approved,
             "not_approved_or_unresolved_campaign_bindings": len(packages) - approved,
-            "manual_correction_count": ranking["manual_correction_count"],
+            "review_intervention_count": ranking["review_intervention_count"],
         },
         "top_k_recall": {
             "top_1": ranking["top_1_recall"],
@@ -299,7 +327,7 @@ def _gold_binding_ranking(profile_ids: Iterable[str]) -> Dict[str, Any]:
         "evaluated_slot_count": count,
         "top_1_recall": sum(rank <= 1 for rank in ranks) / count if count else None,
         "top_3_recall": sum(rank <= 3 for rank in ranks) / count if count else None,
-        "manual_correction_count": sum(bool(trial.get("manual_corrected")) for trial in trials),
+        "review_intervention_count": sum(bool(trial.get("review_intervened")) for trial in trials),
         "profiles": profiles,
     }
 
@@ -340,7 +368,8 @@ def _generation_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
             "baseline_entry_count": len(baseline["value"].get("entries", [])) if baseline["state"] == "present" and isinstance(baseline["value"], dict) else None,
         })
     return {
-        "schema_version": "generation_metrics.v1",
+        "schema_version": "generation_metrics.v2",
+        "metric_role": "engineering_gates_only",
         "denominators": {
             "runs_requested": len(runs),
             "campaign_instances": totals["campaign_instances"],
@@ -492,6 +521,9 @@ def _revision_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
                         "parent_status": item.get("parent_status"),
                         "rerun_status": item.get("rerun_status"),
                         "outcome": item.get("outcome", "missing"),
+                        "status_transition": f"{item.get('parent_status', 'missing')}->{item.get('rerun_status', 'missing')}",
+                        "cex_disappeared": item.get("parent_status") == "cex" and item.get("rerun_status") != "cex",
+                        "semantic_correctness_claim": False,
                         "artifact": artifact["path"],
                     })
     return {
@@ -504,6 +536,8 @@ def _revision_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "counts": {
             "by_revision_target": dict(sorted(Counter(str(row["revision_target"] or "missing") for row in records).items())),
             "by_outcome": dict(sorted(Counter(str(row["outcome"]) for row in records).items())),
+            "by_status_transition": dict(sorted(Counter(row["status_transition"] for row in records).items())),
+            "cex_disappeared": sum(row["cex_disappeared"] for row in records),
         },
         "records": records,
         "artifact_states": dict(sorted(states.items())),
@@ -543,7 +577,8 @@ def _experiment_matrix(
         "experiments": {
             "expression": {
                 "property_coverage": "property_coverage.json",
-                "field_complete": coverage["counts"]["field_complete"],
+                "structural_complete": coverage["counts"]["structural_complete"],
+                "semantic_review_complete": coverage["counts"]["semantic_review_complete"],
             },
             "binding_generation": {
                 "binding_metrics": "binding_metrics.json",
@@ -579,10 +614,6 @@ def _delta_labels(payload: Any) -> List[str]:
     return [item["rtl_label"] for item in payload.get("rtl_properties", []) if isinstance(item, dict) and isinstance(item.get("rtl_label"), str)]
 
 
-def _semantic_value_present(value: Any) -> bool:
-    return value is not None and value != "" and value != [] and value != {}
-
-
 def _diagnosis_category(value: Any) -> str:
     text = str(value or "missing").lower()
     for token, category in (("design", "design"), ("schema", "schema"), ("template", "template"), ("binding", "binding"), ("environment", "environment"), ("assumption", "assumption"), ("inconclusive", "inconclusive")):
@@ -600,14 +631,22 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def _write_coverage_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
-    fields = ("run_id", "instance_id", "property_schema_id", "template_id", "review_status", "layer", "channels", "trigger_event", "response_event", "temporal_shape", "rule_id", "rule_locator", "source_kind", "field_complete", "schema_resolution", "schema_path", "schema_current_sha256", "rtl_property_count", "traceability_artifact")
+    fields = (
+        "run_id", "instance_id", "property_schema_id", "template_id",
+        "approved_by_codex", "review_status", "experiment_eligible",
+        "independent_gold_status", "layer", "channels", "trigger_events",
+        "response_events", "obligation_kind", "lowering_family", "rule_id",
+        "rule_locator", "source_kind", "structural_complete",
+        "semantic_review_complete", "schema_resolution", "schema_path",
+        "schema_current_sha256", "rtl_property_count", "traceability_artifact",
+    )
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for row in rows:
             item = dict(row)
             item["channels"] = "|".join(item["channels"])
-            for key in ("trigger_event", "response_event"):
+            for key in ("trigger_events", "response_events"):
                 item[key] = json.dumps(item[key], ensure_ascii=False, sort_keys=True) if isinstance(item[key], (dict, list)) else item[key]
             writer.writerow(item)
 

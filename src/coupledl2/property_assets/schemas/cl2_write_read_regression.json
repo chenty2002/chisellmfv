@@ -1,28 +1,31 @@
 {
-  "schema_version": "property_schema.v2",
-  "property_schema_id": "CL2_WRITE_READ_REGRESSION",
-  "category": "data_consistency",
-  "layer": "cache_state",
-  "title": "Case-specific write/read data consistency regression",
-  "source": {"kind": "historical_counterexample", "document": "XiangShan-CoupledL2-write_read", "locator": "CaseStudy_1/XiangShan-CoupledL2-write_read", "statement": "the two tracked release values are returned in the expected order for the fixed-address test environment"},
-  "rule_id": null,
-  "channel_scope": {"channels": ["C", "D"], "message_classes": ["Release", "GrantData"], "scope": "fixed_address"},
-  "trigger_event": {"kind": "grant_data", "description": "a GrantData response is observed at the tracked address", "channel": "D", "message_classes": ["GrantData"]},
-  "response_event": null,
-  "matching_key": {"fields": ["address", "return_order"], "semantics": "fixed tracked address and alternating order"},
-  "temporal_shape": "invariant",
-  "bound": {"kind": "none", "minimum": 0, "maximum": 0},
-  "preconditions": ["tracking has observed release data"],
-  "optional_behavior_policy": "environment_constrained",
-  "environment_assumptions": ["the tracked address is fixed to zero", "exactly two tracked values alternate in return order", "the case input environment supplies valid requests at the fixed address"],
-  "required_observations": [
-    {"id": "trigger", "role": "trigger", "type": "Bool", "description": "tracked GrantData event"},
-    {"id": "selector", "role": "selector", "type": "Bool", "description": "tracked return-order selector"},
-    {"id": "observed_data", "role": "observed_data", "type": "UInt", "description": "GrantData value"},
-    {"id": "expected_data_true", "role": "expected_data_true", "type": "UInt", "description": "expected first value"},
-    {"id": "expected_data_false", "role": "expected_data_false", "type": "UInt", "description": "expected second value"},
-    {"id": "tracking_valid", "role": "tracking_valid", "type": "Bool", "description": "tracking state is valid"}
-  ],
-  "template_ids": ["chisel6_write_read_regression"],
-  "review_required": true
+  "schema_version": "property_schema.v3", "property_schema_id": "CL2_WRITE_READ_REGRESSION", "category": "data_consistency", "layer": "cache_state", "title": "Case-specific write/read data consistency regression",
+  "source": {"kind": "historical_counterexample", "document": "XiangShan-CoupledL2-write_read", "locator": "CaseStudy_1/XiangShan-CoupledL2-write_read", "statement": "The tracked release values are returned in the expected order for the fixed-address historical environment."},
+  "rule_id": null, "obligation_kind": "data",
+  "channel_scope": {"channels": ["C", "D"], "message_classes": ["ReleaseData", "ProbeAckData", "GrantData"], "scope": "fixed address"},
+  "event_automaton": {"initial_state": "empty", "states": ["empty", "one_value", "two_values", "checked", "violation"], "terminal_states": ["checked", "violation"], "events": [
+    {"event_id": "release_data", "kind": "trigger", "channel": "C", "direction": "client_to_manager", "message_classes": ["ReleaseData", "ProbeAckData"]},
+    {"event_id": "grant_data", "kind": "response", "channel": "D", "direction": "manager_to_client", "message_classes": ["GrantData"]},
+    {"event_id": "stale_grant_data", "kind": "violation", "channel": "D", "direction": "manager_to_client", "message_classes": ["GrantData"]}
+  ], "transitions": [
+    {"from": "empty", "event": "release_data", "to": "one_value", "condition": "capture first fixed-address value"},
+    {"from": "one_value", "event": "release_data", "to": "two_values", "condition": "capture second value"},
+    {"from": "two_values", "event": "grant_data", "to": "checked", "condition": "returned value matches selected expected value"},
+    {"from": "two_values", "event": "stale_grant_data", "to": "violation", "condition": "returned value differs from selected expected value"}
+  ]},
+  "correlation": {"keys": ["address", "return_order"], "created_by": "release_data", "consumed_by": "grant_data", "lifetime": "two tracked writes through matching return", "reuse_policy": "alternate_after_consumed"},
+  "cardinality": {"subject": "tracked release values", "minimum": 0, "maximum": 2, "scope": "fixed address"}, "permission_relation": null,
+  "optional_paths": [{"path_id": "probe_ack_data_write", "description": "The tracked write may arrive as ProbeAckData or ReleaseData.", "events": ["release_data"], "required": false}],
+  "environment_boundary": {"protocol_premises": [], "fairness": [], "harness_restrictions": ["tracked address is fixed to zero", "exactly two tracked values alternate", "case environment supplies valid requests"], "proof_simplifications": ["single tracked address"], "proof_bound": {"kind": "none", "minimum": 0, "maximum": 0}},
+  "observable_contract": {"observations": [
+    {"id": "trigger", "role": "trigger", "type": "Bool", "description": "tracked GrantData event", "reachability": "trigger"},
+    {"id": "selector", "role": "selector", "type": "Bool", "description": "tracked return-order selector", "reachability": "toggle"},
+    {"id": "observed_data", "role": "observed_data", "type": "UInt", "description": "GrantData value", "reachability": "toggle"},
+    {"id": "expected_data_true", "role": "expected_data_true", "type": "UInt", "description": "expected first value", "reachability": "toggle"},
+    {"id": "expected_data_false", "role": "expected_data_false", "type": "UInt", "description": "expected second value", "reachability": "toggle"},
+    {"id": "tracking_valid", "role": "tracking_valid", "type": "Bool", "description": "tracking state is valid", "reachability": "toggle"}
+  ], "ghost_state": ["two tracked values", "return-order selector"], "clock_domain": "coupledl2", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "write_write_read", "steps": ["release_data", "release_data", "grant_data"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "stale_read", "steps": ["release_data", "release_data", "stale_grant_data"], "expected": "violate"}], "mutation_classes": ["data_consistency", "old_data_return"], "non_vacuity": {"required": true, "trigger_event_ids": ["release_data", "grant_data"], "observer_requirements": ["trigger", "selector", "observed_data", "tracking_valid"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["C data write", "D GrantData return", "address equality"], "implementation_anchors": ["historical two-value tracker"], "fail_closed_conditions": ["data width mismatch", "address observer missing", "tracking state constant"]},
+  "lowering_family": "data_relation", "template_ids": ["chisel6_write_read_regression"], "review_required": true
 }

@@ -1,23 +1,25 @@
 {
-  "schema_version": "property_schema.v2",
-  "property_schema_id": "TL_RELEASE_ACK_PAIRING",
-  "category": "response_obligation",
-  "layer": "transaction",
-  "title": "Release remains outstanding until matching ReleaseAck",
-  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:1150-1179", "statement": "A Release or ReleaseData request remains outstanding until the slave returns ReleaseAck and conflicting same-block operations wait for acknowledgement."},
-  "rule_id": "TL_9_2_RELEASE_ACK_PAIRING",
-  "channel_scope": {"channels": ["C", "D"], "message_classes": ["Release", "ReleaseData", "ReleaseAck"], "scope": "same_block"},
-  "trigger_event": {"kind": "release_issue", "description": "a Release or ReleaseData request is accepted", "channel": "C", "message_classes": ["Release", "ReleaseData"]},
-  "response_event": {"kind": "release_ack", "description": "the matching ReleaseAck is accepted", "channel": "D", "message_classes": ["ReleaseAck"]},
-  "matching_key": {"fields": ["address", "source"], "semantics": "same released block and source"},
-  "temporal_shape": "invariant",
-  "bound": {"kind": "none", "minimum": 0, "maximum": 0},
-  "preconditions": ["the implementation exposes a Release outstanding record"],
-  "optional_behavior_policy": "required",
-  "environment_assumptions": [],
-  "required_observations": [
-    {"id": "release_ack_violation", "role": "release_ack_violation", "type": "Bool", "description": "ReleaseAck lacks a matching outstanding Release"}
-  ],
-  "template_ids": ["chisel3_tl_release_ack_pairing"],
-  "review_required": true
+  "schema_version": "property_schema.v3", "property_schema_id": "TL_RELEASE_ACK_PAIRING", "category": "response_obligation", "layer": "transaction", "title": "Release remains outstanding until matching ReleaseAck",
+  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:1150-1179", "statement": "Release or ReleaseData remains outstanding until the manager returns ReleaseAck."},
+  "rule_id": "TL_9_2_RELEASE_ACK_PAIRING", "obligation_kind": "response",
+  "channel_scope": {"channels": ["C", "D"], "message_classes": ["Release", "ReleaseData", "ReleaseAck"], "scope": "same block and source"},
+  "event_automaton": {"initial_state": "idle", "states": ["idle", "release_pending", "complete", "violation"], "terminal_states": ["complete", "violation"], "events": [
+    {"event_id": "release_issue", "kind": "trigger", "channel": "C", "direction": "client_to_manager", "message_classes": ["Release", "ReleaseData"]},
+    {"event_id": "release_ack", "kind": "response", "channel": "D", "direction": "manager_to_client", "message_classes": ["ReleaseAck"]},
+    {"event_id": "ack_without_release", "kind": "violation", "channel": "D", "direction": "manager_to_client", "message_classes": ["ReleaseAck"]},
+    {"event_id": "release_source_reuse", "kind": "violation", "channel": "C", "direction": "client_to_manager", "message_classes": ["Release", "ReleaseData"]}
+  ], "transitions": [
+    {"from": "idle", "event": "release_issue", "to": "release_pending", "condition": "allocate source and block"},
+    {"from": "release_pending", "event": "release_ack", "to": "complete", "condition": "same source"},
+    {"from": "idle", "event": "ack_without_release", "to": "violation", "condition": "no pending Release"},
+    {"from": "release_pending", "event": "release_source_reuse", "to": "violation", "condition": "source already pending"}
+  ]},
+  "correlation": {"keys": ["address", "source"], "created_by": "release_issue", "consumed_by": "release_ack", "lifetime": "Release acceptance through ReleaseAck", "reuse_policy": "forbid_until_consumed"},
+  "cardinality": {"subject": "outstanding Release per source", "minimum": 0, "maximum": 1, "scope": "source and block"}, "permission_relation": null,
+  "optional_paths": [{"path_id": "release_payload", "description": "The client may use Release or ReleaseData as permitted by its dirty state.", "events": ["release_issue"], "required": false}],
+  "environment_boundary": {"protocol_premises": [], "fairness": [], "harness_restrictions": ["implementation exposes a Release outstanding record"], "proof_simplifications": [], "proof_bound": {"kind": "none", "minimum": 0, "maximum": 0}},
+  "observable_contract": {"observations": [{"id": "release_ack_violation", "role": "release_ack_violation", "type": "Bool", "description": "ReleaseAck lacks a matching outstanding Release", "reachability": "toggle"}], "ghost_state": ["releasePending[source]"], "clock_domain": "tilelink", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "release_then_ack", "steps": ["release_issue", "release_ack"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "ack_without_release", "steps": ["ack_without_release"], "expected": "violate"}], "mutation_classes": ["message_ordering", "identifier_correlation"], "non_vacuity": {"required": true, "trigger_event_ids": ["release_issue"], "observer_requirements": ["release_ack_violation"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["C.Release source/address", "D.ReleaseAck source"], "implementation_anchors": ["Release pending scoreboard"], "fail_closed_conditions": ["source width mismatch", "missing block identity", "clock-domain conflict"]},
+  "lowering_family": "response_scoreboard", "template_ids": ["chisel3_tl_release_ack_pairing"], "review_required": true
 }

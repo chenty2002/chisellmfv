@@ -109,7 +109,7 @@ def evaluate_gold_binding_recall(
             "evaluated_slot_count": 0,
             "top_1_recall": 0.0,
             "top_3_recall": 0.0,
-            "manual_correction_count": 0,
+            "review_intervention_count": 0,
         }
     ranks = [
         trial["ranked_candidate_ids"].index(trial["gold_candidate_id"]) + 1
@@ -119,8 +119,8 @@ def evaluate_gold_binding_recall(
         "evaluated_slot_count": count,
         "top_1_recall": sum(rank <= 1 for rank in ranks) / count,
         "top_3_recall": sum(rank <= 3 for rank in ranks) / count,
-        "manual_correction_count": sum(
-            trial["manual_corrected"] for trial in evaluated
+        "review_intervention_count": sum(
+            trial["review_intervened"] for trial in evaluated
         ),
     }
 

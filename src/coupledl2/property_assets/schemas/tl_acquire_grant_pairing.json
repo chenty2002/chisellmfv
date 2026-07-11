@@ -1,23 +1,37 @@
 {
-  "schema_version": "property_schema.v2",
+  "schema_version": "property_schema.v3",
   "property_schema_id": "TL_ACQUIRE_GRANT_PAIRING",
   "category": "response_obligation",
   "layer": "transaction",
   "title": "Grant or GrantData is paired with an outstanding Acquire",
-  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:612-615", "statement": "AcquireBlock and AcquirePerm requests receive Grant or GrantData responses, which in turn require GrantAck."},
+  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:612-615", "statement": "AcquireBlock and AcquirePerm receive Grant or GrantData and the granted sink remains live through GrantAck."},
   "rule_id": "TL_6_3_ACQUIRE_GRANT_PAIRING",
+  "obligation_kind": "response",
   "channel_scope": {"channels": ["A", "D"], "message_classes": ["AcquireBlock", "AcquirePerm", "Grant", "GrantData"], "scope": "outstanding source identifier"},
-  "trigger_event": {"kind": "acquire_accept", "description": "an AcquireBlock or AcquirePerm is accepted", "channel": "A", "message_classes": ["AcquireBlock", "AcquirePerm"]},
-  "response_event": {"kind": "grant_accept", "description": "a matching Grant or GrantData response is accepted", "channel": "D", "message_classes": ["Grant", "GrantData"]},
-  "matching_key": {"fields": ["source"], "semantics": "same outstanding Acquire source identifier"},
-  "temporal_shape": "invariant",
-  "bound": {"kind": "none", "minimum": 0, "maximum": 0},
-  "preconditions": ["source identifiers are not reused while an Acquire remains outstanding"],
-  "optional_behavior_policy": "required",
-  "environment_assumptions": [],
-  "required_observations": [
-    {"id": "acquire_grant_violation", "role": "acquire_grant_violation", "type": "Bool", "description": "Grant lacks an outstanding Acquire or an Acquire source is reused"}
-  ],
+  "event_automaton": {
+    "initial_state": "idle", "states": ["idle", "acquire_pending", "complete", "violation"], "terminal_states": ["complete", "violation"],
+    "events": [
+      {"event_id": "acquire_accept", "kind": "trigger", "channel": "A", "direction": "client_to_manager", "message_classes": ["AcquireBlock", "AcquirePerm"]},
+      {"event_id": "grant_accept", "kind": "response", "channel": "D", "direction": "manager_to_client", "message_classes": ["Grant", "GrantData"]},
+      {"event_id": "source_reuse", "kind": "violation", "channel": "A", "direction": "client_to_manager", "message_classes": ["AcquireBlock", "AcquirePerm"]},
+      {"event_id": "grant_without_acquire", "kind": "violation", "channel": "D", "direction": "manager_to_client", "message_classes": ["Grant", "GrantData"]}
+    ],
+    "transitions": [
+      {"from": "idle", "event": "acquire_accept", "to": "acquire_pending", "condition": "allocate source"},
+      {"from": "acquire_pending", "event": "grant_accept", "to": "complete", "condition": "final D beat for same source"},
+      {"from": "acquire_pending", "event": "source_reuse", "to": "violation", "condition": "source already pending"},
+      {"from": "idle", "event": "grant_without_acquire", "to": "violation", "condition": "no pending source"}
+    ]
+  },
+  "correlation": {"keys": ["source"], "created_by": "acquire_accept", "consumed_by": "grant_accept", "lifetime": "accepted Acquire through final Grant beat", "reuse_policy": "forbid_until_consumed"},
+  "cardinality": {"subject": "outstanding acquire per source", "minimum": 0, "maximum": 1, "scope": "source"},
+  "permission_relation": null,
+  "optional_paths": [{"path_id": "grant_payload", "description": "The response may be Grant or GrantData according to request and manager behavior.", "events": ["grant_accept"], "required": false}],
+  "environment_boundary": {"protocol_premises": ["source identifiers are not reused while an Acquire remains outstanding"], "fairness": [], "harness_restrictions": [], "proof_simplifications": [], "proof_bound": {"kind": "none", "minimum": 0, "maximum": 0}},
+  "observable_contract": {"observations": [{"id": "acquire_grant_violation", "role": "acquire_grant_violation", "type": "Bool", "description": "Grant lacks an outstanding Acquire or an Acquire source is reused", "reachability": "toggle"}], "ghost_state": ["acquirePending[source]"], "clock_domain": "tilelink", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "acquire_then_grant", "steps": ["acquire_accept", "grant_accept"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "grant_without_request", "steps": ["grant_without_acquire"], "expected": "violate"}], "mutation_classes": ["identifier_correlation", "message_ordering"], "non_vacuity": {"required": true, "trigger_event_ids": ["acquire_accept"], "observer_requirements": ["acquire_grant_violation"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["A.Acquire source", "D.Grant source", "D final beat"], "implementation_anchors": ["Acquire outstanding scoreboard observer"], "fail_closed_conditions": ["source width mismatch", "missing final-beat identity", "clock-domain conflict"]},
+  "lowering_family": "response_scoreboard",
   "template_ids": ["chisel3_tl_acquire_grant_pairing"],
   "review_required": true
 }

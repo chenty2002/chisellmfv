@@ -1,0 +1,26 @@
+{
+  "schema_version": "property_schema.v3", "property_schema_id": "TL_PERMISSION_OWNER_CARDINALITY", "category": "permission_state", "layer": "cache_state", "title": "A coherence tree has at most one Tip for a block",
+  "source": {"kind": "protocol_requirement", "document": "tilelink_spec_1.8.1", "locator": "tilelink_spec_1.8.1.md:1002-1050", "statement": "For each address the cached copies form one coherence tree with a single memory-access serialization Tip; Branch and Trunk describe other positions on that tree."},
+  "rule_id": "TL_9_PERMISSION_OWNER_CARDINALITY", "obligation_kind": "permission",
+  "channel_scope": {"channels": ["A", "B", "C", "D", "E"], "message_classes": ["AcquireBlock", "AcquirePerm", "Probe", "ProbeAck", "ProbeAckData", "Release", "ReleaseData", "Grant", "GrantData", "GrantAck"], "scope": "same block across peers"},
+  "event_automaton": {"initial_state": "shared_or_empty", "states": ["shared_or_empty", "exclusive_pending", "exclusive", "downgrade_pending", "violation"], "terminal_states": ["exclusive", "shared_or_empty", "violation"], "events": [
+    {"event_id": "acquire_permission", "kind": "trigger", "channel": "A", "direction": "client_to_manager", "message_classes": ["AcquireBlock", "AcquirePerm"]},
+    {"event_id": "grant_permission", "kind": "response", "channel": "D", "direction": "manager_to_client", "message_classes": ["Grant", "GrantData"]},
+    {"event_id": "release_or_probe_ack", "kind": "progress", "channel": "C", "direction": "client_to_manager", "message_classes": ["ProbeAck", "ProbeAckData", "Release", "ReleaseData"]},
+    {"event_id": "second_owner", "kind": "violation", "channel": "D", "direction": "manager_to_client", "message_classes": ["Grant", "GrantData"]}
+  ], "transitions": [
+    {"from": "shared_or_empty", "event": "acquire_permission", "to": "exclusive_pending", "condition": "exclusive permission requested"},
+    {"from": "exclusive_pending", "event": "grant_permission", "to": "exclusive", "condition": "all conflicting owners removed"},
+    {"from": "exclusive", "event": "release_or_probe_ack", "to": "shared_or_empty", "condition": "owner downgrades or releases"},
+    {"from": "exclusive", "event": "second_owner", "to": "violation", "condition": "another peer projects Trunk or Tip"}
+  ]},
+  "correlation": {"keys": ["address"], "created_by": "acquire_permission", "consumed_by": "grant_permission", "lifetime": "permission transition for one block", "reuse_policy": "serialize_conflicting_transition"},
+  "cardinality": {"subject": "Tip serialization point", "minimum": 0, "maximum": 1, "scope": "block across the coherence tree"},
+  "permission_relation": {"states": ["Nothing", "Branch", "Trunk", "Tip"], "transitions": [{"from": "Nothing", "to": "Trunk", "event": "grant_permission"}, {"from": "Branch", "to": "Trunk", "event": "grant_permission"}, {"from": "Trunk", "to": "Branch", "event": "release_or_probe_ack"}, {"from": "Tip", "to": "Nothing", "event": "release_or_probe_ack"}], "invariants": ["at most one Tip serialization point per block", "dirty data is associated with the Tip or an explicitly in-flight transfer"]},
+  "optional_paths": [{"path_id": "grant_to_shared", "description": "An implementation may grant shared Branch permission instead of exclusive ownership where protocol-legal.", "events": ["grant_permission"], "required": false}],
+  "environment_boundary": {"protocol_premises": [], "fairness": [], "harness_restrictions": ["peer permission projections refer to the same block"], "proof_simplifications": [], "proof_bound": {"kind": "none", "minimum": 0, "maximum": 0}},
+  "observable_contract": {"observations": [{"id": "owner_cardinality_violation", "role": "owner_cardinality_violation", "type": "Bool", "description": "more than one peer projects the Tip serialization point for the same block", "reachability": "toggle"}], "ghost_state": ["permission[peer,block]", "ownerCount[block]"], "clock_domain": "tilelink", "reset": "synchronous_clear"},
+  "oracle_plan": {"positive_traces": [{"trace_id": "single_owner", "steps": ["acquire_permission", "grant_permission", "release_or_probe_ack"], "expected": "satisfy"}], "negative_traces": [{"trace_id": "dual_owner", "steps": ["acquire_permission", "grant_permission", "second_owner"], "expected": "violate"}], "mutation_classes": ["permission_transition", "dual_owner"], "non_vacuity": {"required": true, "trigger_event_ids": ["acquire_permission"], "observer_requirements": ["owner_cardinality_violation"], "assumption_satisfiable": true}},
+  "transfer_policy": {"stable_anchors": ["block address", "TileLink permission projection", "peer identity"], "implementation_anchors": ["directory owner/sharer state"], "fail_closed_conditions": ["permission projection ambiguous", "peer cardinality unknown", "block identity unavailable"]},
+  "lowering_family": "permission_state", "template_ids": ["chisel3_tl_permission_owner_cardinality"], "review_required": true
+}
