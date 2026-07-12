@@ -2610,20 +2610,6 @@ class FormalWorkflow:
         )
         self._write_run_cost_summary()
 
-        if stage == "invoke_verification":
-            formal = stage_result.get("jaspergold_result") or stage_result.get("formal_result")
-            if isinstance(formal, dict):
-                self._write_json(stage_dir / "formal_result.json", formal)
-                self._write_json(
-                    stage_dir / "property_status.json",
-                    {
-                        "schema_version": "property_status.v2",
-                        "expected_count": formal.get("expected_count", 0),
-                        "accounted_count": formal.get("accounted_count", 0),
-                        "primary_results": formal.get("primary_results", []),
-                    },
-                )
-
         if stage == "propose_bugfix":
             repair = stage_result.get("repair_loop") or stage_result
             if isinstance(repair, dict):
@@ -2676,14 +2662,12 @@ class FormalWorkflow:
         if stage == "invoke_verification":
             handoff["verification"] = {
                 "verification_passed": stage_result.get("verification_passed"),
-                "counterexample_path": stage_result.get("counterexample_path"),
+                "trace_path": stage_result.get("trace_path"),
                 "cex_count": stage_result.get("cex_count"),
                 "execution_status": stage_result.get("execution_status"),
                 "verification_outcome": stage_result.get("verification_outcome"),
                 "accounted_count": stage_result.get("accounted_count"),
                 "expected_count": stage_result.get("expected_count"),
-                "formal_result": "formal_result.json",
-                "property_status": "property_status.json",
                 "property_result_map": "property_result_map.json",
             }
         elif stage == "waveform_explanation":

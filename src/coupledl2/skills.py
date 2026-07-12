@@ -7,15 +7,11 @@ from typing import Any, Dict, List, Optional
 
 
 STAGE_SKILLS: Dict[str, List[str]] = {
-    "invoke_verification": ["jaspergold.md"],
     "waveform_explanation": ["waveform_diagnosis.md"],
-    "propose_bugfix": ["repair_regression.md"],
 }
 
 STAGE_RULES: Dict[str, List[str]] = {
-    "invoke_verification": ["agent_rules.md"],
     "waveform_explanation": ["agent_rules.md"],
-    "propose_bugfix": ["agent_rules.md"],
 }
 
 

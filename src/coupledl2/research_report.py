@@ -85,21 +85,24 @@ def _load_runs(run_dirs: Iterable[Path | str]) -> List[Dict[str, Any]]:
         if not run_dir.is_dir():
             raise ResearchReportError(f"run directory not found: {run_dir}")
         results = run_dir / "results"
+        package = _read_artifact(
+            results / "by_stage/02_bind_properties/property_package.json"
+        )
         artifacts = {
-            "campaign": _read_artifact(results / "by_stage/02_bind_properties/verification_campaign.json"),
-            "traceability": _read_artifact(results / "by_stage/02_bind_properties/assertion_traceability.json"),
+            "property_package": package,
+            "traceability": _embedded_artifact(package, "traceability"),
             "delta": _read_artifact(results / "by_stage/02_bind_properties/assertion_delta.json"),
             "binding_build": _read_artifact(results / "by_stage/02_bind_properties/build_result.json"),
             "baseline": _read_artifact(results / "preflight/baseline_assertion_inventory.json"),
-            "formal": _read_artifact(results / "by_stage/03_invoke_verification/formal_result.json"),
             "result_map": _read_artifact(results / "by_stage/03_invoke_verification/property_result_map.json"),
             "diagnosis": _read_artifact(results / "by_stage/04_waveform_explanation/diagnosis.json"),
             "diagnosis_evidence": _read_artifact(results / "by_stage/04_waveform_explanation/diagnosis_evidence.json"),
             "semantic_evidence": _read_artifact(results / "by_stage/02_bind_properties/semantic_evidence.json"),
         }
         revision_files = sorted(results.rglob("revision_outcome.json")) if results.is_dir() else []
-        campaign_value = artifacts["campaign"]["value"]
-        case_name = campaign_value.get("case_name") if isinstance(campaign_value, dict) else None
+        manifest_artifact = _read_artifact(run_dir / "manifest.json")
+        manifest_value = manifest_artifact["value"]
+        case_name = manifest_value.get("case_name") if isinstance(manifest_value, dict) else None
         runs.append(
             {
                 "run_id": run_dir.name,
@@ -120,6 +123,16 @@ def _read_artifact(path: Path) -> Dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         return {"state": "invalid", "path": str(path), "value": None, "error": str(exc)}
     return {"state": "present", "path": str(path), "value": value}
+
+
+def _embedded_artifact(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
+    value = parent.get("value")
+    if parent.get("state") != "present" or not isinstance(value, dict):
+        return {"state": parent.get("state", "missing"), "path": parent.get("path"), "value": None}
+    embedded = value.get(key)
+    if not isinstance(embedded, dict):
+        return {"state": "invalid", "path": parent.get("path"), "value": None}
+    return {"state": "present", "path": parent.get("path") + f"#{key}", "value": embedded}
 
 
 def _load_schema_catalog() -> Dict[str, Dict[str, Any]]:
@@ -242,16 +255,14 @@ def _property_coverage(runs: List[Dict[str, Any]], schemas: Mapping[str, Dict[st
 
 def _binding_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
     packages, traceability = [], {}
-    campaign_states = Counter()
+    package_states = Counter()
     for run in runs:
-        campaign = run["artifacts"]["campaign"]
-        campaign_states[campaign["state"]] += 1
-        if campaign["state"] == "present" and isinstance(campaign["value"], dict):
-            for group in campaign["value"].get("groups", []):
-                if isinstance(group, dict):
-                    for package in group.get("property_packages", []):
-                        if isinstance(package, dict):
-                            packages.append({"run_id": run["run_id"], **package})
+        package = run["artifacts"]["property_package"]
+        package_states[package["state"]] += 1
+        if package["state"] == "present" and isinstance(package["value"], dict):
+            for item in package["value"].get("traceability", {}).get("properties", []):
+                if isinstance(item, dict):
+                    packages.append({"run_id": run["run_id"], **item})
         trace = run["artifacts"]["traceability"]
         if trace["state"] == "present" and isinstance(trace["value"], dict):
             for item in trace["value"].get("properties", []):
@@ -259,11 +270,11 @@ def _binding_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
                     traceability[(run["run_id"], item["instance_id"])] = item
 
     profile_ids = sorted({
-        run["artifacts"]["campaign"]["value"].get("property_profile_id")
+        run["artifacts"]["property_package"]["value"].get("property_profile_id")
         for run in runs
-        if run["artifacts"]["campaign"]["state"] == "present"
-        and isinstance(run["artifacts"]["campaign"]["value"], dict)
-        and isinstance(run["artifacts"]["campaign"]["value"].get("property_profile_id"), str)
+        if run["artifacts"]["property_package"]["state"] == "present"
+        and isinstance(run["artifacts"]["property_package"]["value"], dict)
+        and isinstance(run["artifacts"]["property_package"]["value"].get("property_profile_id"), str)
     })
     ranking = _gold_binding_ranking(profile_ids)
     approved = sum(
@@ -274,14 +285,14 @@ def _binding_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "schema_version": "binding_metrics.v1",
         "denominators": {
             "runs_requested": len(runs),
-            "campaign_runs": campaign_states["present"],
-            "campaign_runs_missing_or_invalid": len(runs) - campaign_states["present"],
-            "campaign_property_packages": len(packages),
+            "property_package_runs": package_states["present"],
+            "property_package_runs_missing_or_invalid": len(runs) - package_states["present"],
+            "property_instances": len(packages),
             "ranking_trials": ranking["evaluated_slot_count"],
         },
         "counts": {
-            "approved_campaign_bindings": approved,
-            "not_approved_or_unresolved_campaign_bindings": len(packages) - approved,
+            "approved_property_bindings": approved,
+            "not_approved_or_unresolved_property_bindings": len(packages) - approved,
             "review_intervention_count": ranking["review_intervention_count"],
         },
         "top_k_recall": {
@@ -289,7 +300,7 @@ def _binding_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
             "top_3": ranking["top_3_recall"],
         },
         "profiles": ranking["profiles"],
-        "artifact_states": dict(sorted(campaign_states.items())),
+        "artifact_states": dict(sorted(package_states.items())),
     }
 
 
@@ -337,15 +348,15 @@ def _generation_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
     run_rows = []
     for run in runs:
         artifacts = run["artifacts"]
-        campaign = artifacts["campaign"]
+        package = artifacts["property_package"]
         trace = artifacts["traceability"]
         delta = artifacts["delta"]
         baseline = artifacts["baseline"]
         build = artifacts["binding_build"]
-        packages = _campaign_packages(campaign["value"]) if campaign["state"] == "present" else []
+        packages = _property_instances(package["value"]) if package["state"] == "present" else []
         trace_labels = _trace_labels(trace["value"]) if trace["state"] == "present" else []
         delta_labels = _delta_labels(delta["value"]) if delta["state"] == "present" else []
-        totals["campaign_instances"] += len(packages)
+        totals["property_instances"] += len(packages)
         totals["traceability_labels"] += len(trace_labels)
         totals["delta_labels"] += len(delta_labels)
         totals[f"build_{build['state']}"] += 1
@@ -358,7 +369,7 @@ def _generation_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
             totals["baseline_disabled"] += int(baseline["value"].get("disabled_count", 0))
         run_rows.append({
             "run_id": run["run_id"],
-            "campaign_instance_count": len(packages),
+            "property_instance_count": len(packages),
             "traceability_rtl_label_count": len(trace_labels),
             "assertion_delta_rtl_label_count": len(delta_labels),
             "rtl_label_survival": _ratio(len(delta_labels), len(trace_labels)) if trace["state"] == "present" else None,
@@ -372,7 +383,7 @@ def _generation_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "metric_role": "engineering_gates_only",
         "denominators": {
             "runs_requested": len(runs),
-            "campaign_instances": totals["campaign_instances"],
+            "property_instances": totals["property_instances"],
             "traceability_rtl_labels": totals["traceability_labels"],
             "compile_attempts": totals["build_present"],
             "baseline_inventories": totals["baseline_present"],
@@ -391,11 +402,9 @@ def _formal_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
     for run in runs:
         artifacts = run["artifacts"]
         result_map = artifacts["result_map"]
-        formal = artifacts["formal"]
         expected = _trace_labels(artifacts["traceability"]["value"]) if artifacts["traceability"]["state"] == "present" else _delta_labels(artifacts["delta"]["value"]) if artifacts["delta"]["state"] == "present" else []
-        result_payload = result_map["value"] if result_map["state"] == "present" else formal["value"] if formal["state"] == "present" else {}
+        result_payload = result_map["value"] if result_map["state"] == "present" else {}
         states[f"result_map_{result_map['state']}"] += 1
-        states[f"formal_{formal['state']}"] += 1
         by_label = {}
         if isinstance(result_payload, dict):
             for item in result_payload.get("primary_results", []):
@@ -406,9 +415,9 @@ def _formal_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
             status = item.get("status") if isinstance(item, dict) else "missing"
             if status not in PRIMARY_STATUSES:
                 status = "missing"
-            records.append(_formal_record(run["run_id"], label, status, item, result_map, formal))
+            records.append(_formal_record(run["run_id"], label, status, item, result_map))
         for label, item in sorted(by_label.items()):
-            records.append(_formal_record(run["run_id"], label, "unexpected", item, result_map, formal))
+            records.append(_formal_record(run["run_id"], label, "unexpected", item, result_map))
     counts = Counter(record["status"] for record in records)
     runtime = sum(record["runtime_s"] for record in records if isinstance(record["runtime_s"], (int, float)))
     cex_records = [record for record in records if record["status"] == "cex"]
@@ -418,7 +427,6 @@ def _formal_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
             "runs_requested": len(runs),
             "expected_primary_properties": sum(record["status"] != "unexpected" for record in records),
             "result_map_runs": states["result_map_present"],
-            "formal_result_runs": states["formal_present"],
             "counterexamples": len(cex_records),
         },
         "counts": dict(sorted(counts.items())),
@@ -433,7 +441,7 @@ def _formal_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _formal_record(run_id: str, label: str, status: str, item: Optional[Dict[str, Any]], result_map: Dict[str, Any], formal: Dict[str, Any]) -> Dict[str, Any]:
+def _formal_record(run_id: str, label: str, status: str, item: Optional[Dict[str, Any]], result_map: Dict[str, Any]) -> Dict[str, Any]:
     item = item or {}
     return {
         "run_id": run_id,
@@ -445,7 +453,6 @@ def _formal_record(run_id: str, label: str, status: str, item: Optional[Dict[str
         "trace_path": item.get("trace_path"),
         "trace_available": bool(item.get("trace_path")),
         "result_map_artifact": result_map["path"],
-        "formal_result_artifact": formal["path"],
     }
 
 
@@ -582,7 +589,7 @@ def _experiment_matrix(
             },
             "binding_generation": {
                 "binding_metrics": "binding_metrics.json",
-                "campaign_instances": binding["denominators"]["campaign_property_packages"],
+                "property_instances": binding["denominators"]["property_instances"],
             },
             "formal_counterexample": {
                 "formal_metrics": "formal_metrics.json",
@@ -596,10 +603,14 @@ def _experiment_matrix(
     }
 
 
-def _campaign_packages(payload: Any) -> List[Dict[str, Any]]:
+def _property_instances(payload: Any) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
-    return [item for group in payload.get("groups", []) if isinstance(group, dict) for item in group.get("property_packages", []) if isinstance(item, dict)]
+    traceability = payload.get("traceability", {})
+    return [
+        item for item in traceability.get("properties", [])
+        if isinstance(item, dict)
+    ]
 
 
 def _trace_labels(payload: Any) -> List[str]:

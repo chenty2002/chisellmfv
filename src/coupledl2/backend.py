@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .property_catalog import load_property_profile
-from .formal_contract import load_formal_contract
 from .rtl_property_labeler import label_rtl_properties
-from .workspace import CoupledL2Workspace, build_protocol_evidence
+from .workspace import CoupledL2Workspace
+from .artifacts import file_sha256
 
 
 INCONCLUSIVE_STATUSES = {"undetermined", "unknown", "error"}
@@ -80,19 +80,22 @@ class CoupledL2BuildOperations:
         """Run build, prepare run-local JasperGold inputs, and launch JasperGold."""
         stage2_dir = self._stage_dir("bind_properties")
         manifest_path = stage2_dir / "binding_manifest.json"
-        traceability_path = stage2_dir / "assertion_traceability.json"
-        if not manifest_path.is_file() or not traceability_path.is_file():
+        package_path = stage2_dir / "property_package.json"
+        delta_path = stage2_dir / "assertion_delta.json"
+        if not all(path.is_file() for path in (manifest_path, package_path, delta_path)):
             return {
                 "success": False,
-                "summary": "Stage 2 traceability artifacts are missing",
+                "summary": "Stage 2 canonical property artifacts are missing",
                 "verification_passed": False,
                 "execution_status": "tool_error",
                 "verification_outcome": "not_run",
             }
         manifest = self._load_json(manifest_path)
-        traceability = self._load_json(traceability_path)
+        package = self._load_json(package_path)
+        traceability = package.get("traceability")
+        if not isinstance(traceability, dict):
+            raise ValueError("property package has no traceability ledger")
         catalog = load_property_profile(self.workspace.config.property_profile)
-        traceability = _enrich_traceability(traceability, catalog)
         build = self._run_build(self._stage_dir("invoke_verification"))
         if not build.get("success"):
             return self._finalize_stage3_without_tool(
@@ -154,8 +157,17 @@ class CoupledL2BuildOperations:
                 "verification_passed": False,
                 "build_result": build,
                 "prepare_result": prepared,
-                "formal_result": formal,
+                "backend_result": formal,
             }
+        property_map["property_package_sha256"] = file_sha256(package_path)
+        property_map["assertion_delta_sha256"] = file_sha256(delta_path)
+        property_map["formal"] = {
+            key: jaspergold_result.get(key)
+            for key in (
+                "tool", "formal_contract_path", "formal_contract_sha256",
+                "timed_out", "summary",
+            )
+        }
         self._write_json(
             self._stage_dir("invoke_verification") / "property_result_map.json",
             property_map,
@@ -167,12 +179,11 @@ class CoupledL2BuildOperations:
             "output": formal.get("output", ""),
             "build_result": build,
             "prepare_result": prepared,
-            "formal_result": formal,
-            "jaspergold_result": formal.get("jaspergold_result"),
+            "backend_result": jaspergold_result,
             "cex_count": formal.get("cex_count", 0),
             "proven_count": formal.get("proven_count", 0),
-            "fst_files": formal.get("fst_files", []),
-            "counterexample_path": formal.get("counterexample_path"),
+            "trace_paths": formal.get("trace_paths", []),
+            "trace_path": formal.get("trace_path"),
             "property_result_map": property_map,
             "execution_status": formal.get("execution_status"),
             "verification_outcome": formal.get("verification_outcome"),
@@ -230,16 +241,23 @@ class CoupledL2BuildOperations:
         formal["formal_contract_path"] = "../../preflight/formal_contract.json"
         formal["formal_contract_sha256"] = contract["sha256"]
         property_map = join_property_results(traceability, formal)
+        stage2_dir = self._stage_dir("bind_properties")
+        property_map["property_package_sha256"] = file_sha256(
+            stage2_dir / "property_package.json"
+        )
+        property_map["assertion_delta_sha256"] = file_sha256(
+            stage2_dir / "assertion_delta.json"
+        )
+        property_map["formal"] = {
+            "tool": None,
+            "formal_contract_path": formal["formal_contract_path"],
+            "formal_contract_sha256": formal["formal_contract_sha256"],
+            "timed_out": False,
+            "summary": formal["summary"],
+        }
         stage_dir = self._stage_dir("invoke_verification")
-        self._write_json(stage_dir / "formal_result.json", formal)
-        self._write_json(
-            stage_dir / "property_status.json",
-            {
-                "schema_version": "property_status.v2",
-                "expected_count": len(expected),
-                "accounted_count": len(primary),
-                "primary_results": primary,
-            },
+        (stage_dir / "jaspergold.log").write_text(
+            f"JasperGold was not launched: {reason}\n", encoding="utf-8"
         )
         self._write_json(stage_dir / "property_result_map.json", property_map)
         events_path = stage_dir / "proof_events.jsonl"
@@ -267,12 +285,11 @@ class CoupledL2BuildOperations:
             "output": build_result.get("output", ""),
             "build_result": build_result,
             "prepare_result": prepare_result,
-            "formal_result": formal,
-            "jaspergold_result": formal,
+            "backend_result": formal,
             "cex_count": 0,
             "proven_count": 0,
-            "fst_files": [],
-            "counterexample_path": None,
+            "trace_paths": [],
+            "trace_path": None,
             "property_result_map": property_map,
             "execution_status": "tool_error",
             "verification_outcome": "inconclusive",
@@ -313,7 +330,9 @@ class CoupledL2BuildOperations:
         result_filename: str = "build_result.json",
     ) -> Dict[str, Any]:
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        target = target or self.build_contract.get("recommended_make_target") or "auto"
+        target = target or self.build_contract.get("recommended_make_target")
+        if not isinstance(target, str) or not target:
+            raise ValueError("build contract has no recommended_make_target")
         command = ["make", str(target)]
         env = os.environ.copy()
         env.update({str(k): str(v) for k, v in self.build_contract.get("env", {}).items()})
@@ -416,11 +435,10 @@ class CoupledL2BuildOperations:
             materialize_jaspergold_input(source, destination)
             verilog_files.append(destination)
 
-        top_module = top_module or self.infer_top_module(verilog_files)
         if not top_module:
             result = {
                 "success": False,
-                "error": "could not infer top module from generated Verilog",
+                "error": "build result did not declare a top module",
                 "verilog_files": [str(path) for path in verilog_files],
                 "top_module": None,
             }
@@ -577,13 +595,7 @@ class CoupledL2BuildOperations:
     def _load_formal_contract_artifact(self) -> Dict[str, Any]:
         path = self.workspace.results_dir / "preflight" / "formal_contract.json"
         if not path.is_file():
-            catalog = load_property_profile(self.workspace.config.property_profile)
-            resolved = load_formal_contract(
-                catalog.formal_contract_id,
-                profile_id=catalog.profile["property_profile_id"],
-                case_name=catalog.profile["case_name"],
-            )
-            return resolved.artifact()
+            raise ValueError("preflight formal contract artifact is missing")
         artifact = self._load_json(path)
         asset_sha = artifact.get("sha256")
         if not isinstance(asset_sha, str) or len(asset_sha) != 64:
@@ -626,20 +638,11 @@ class CoupledL2BuildOperations:
             with events_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
                 handle.flush()
-            self._write_json_atomic(
-                stage_dir / "property_status.json",
-                {
-                    "schema_version": "property_status.v2",
-                    "expected_count": len(expected),
-                    "accounted_count": len(streamed),
-                    "primary_results": streamed,
-                },
-            )
 
         output, returncode, outer_timed_out = self._run_jaspergold_process(
             command,
             timeout_s=timeout_s,
-            log_path=stage_dir / "jg.log",
+            log_path=stage_dir / "jaspergold.log",
             on_property_complete=record_completed_property,
         )
         self._convert_vcd_trace_artifacts()
@@ -671,7 +674,6 @@ class CoupledL2BuildOperations:
                 else formal_contract["tool"]["version"]
             ),
         }
-        self._write_json(stage_dir / "formal_result.json", parsed)
         for index, primary in enumerate(parsed["primary_results"]):
             event = {
                 "schema_version": "proof_event.v1",
@@ -681,15 +683,6 @@ class CoupledL2BuildOperations:
             }
             with events_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
-        self._write_json_atomic(
-            stage_dir / "property_status.json",
-            {
-                "schema_version": "property_status.v2",
-                "expected_count": len(expected),
-                "accounted_count": len(parsed["primary_results"]),
-                "primary_results": parsed["primary_results"],
-            },
-        )
 
         cex_count = parsed.get("primary_cex_count", 0)
         proven_count = parsed.get("primary_proven_count", 0)
@@ -708,15 +701,21 @@ class CoupledL2BuildOperations:
             if item.get("status") == "cex" and item.get("trace_path")
         ]
         result = {
-            "success": parsed["execution_status"] != "tool_error" and not invalid_environment,
+            "success": (
+                parsed["execution_status"] == "completed"
+                and not parsed.get("timed_out")
+                and parsed.get("primary_not_run_count", 0) == 0
+                and parsed.get("primary_tool_error_count", 0) == 0
+                and not invalid_environment
+            ),
             "summary": summary,
             "verification_passed": verification_passed,
             "output": output,
             "jaspergold_result": parsed,
             "cex_count": cex_count,
             "proven_count": proven_count,
-            "fst_files": cex_traces,
-            "counterexample_path": cex_traces[0] if cex_traces else None,
+            "trace_paths": cex_traces,
+            "trace_path": cex_traces[0] if cex_traces else None,
             "execution_status": parsed["execution_status"],
             "verification_outcome": parsed["verification_outcome"],
             "accounted_count": parsed["accounted_count"],
@@ -727,7 +726,7 @@ class CoupledL2BuildOperations:
             result["invalid_environment"] = True
             result["environment_failure_kind"] = parsed.get("environment_failure_kind")
             result["environment_cex_properties"] = parsed.get("environment_cex_properties", [])
-            result["counterexample_path"] = None
+            result["trace_path"] = None
         return result
 
     def _run_jaspergold_process(
@@ -821,9 +820,7 @@ class CoupledL2BuildOperations:
         top = delta.get("top_module")
         for item in delta.get("rtl_properties", []):
             label = item.get("rtl_label")
-            property_id = item.get("expected_property_id") or (
-                f"{top}.{label}" if top and label else None
-            )
+            property_id = item.get("expected_property_id")
             if not isinstance(label, str) or not isinstance(property_id, str):
                 raise ValueError("assertion delta contains an incomplete property")
             expected.append({
@@ -877,28 +874,6 @@ class CoupledL2BuildOperations:
                     timeout=300,
                     check=False,
                 )
-
-    def _expected_trace_property_ids(self, top_module: str) -> List[str]:
-        traceability_path = (
-            self._stage_dir("bind_properties") / "assertion_traceability.json"
-        )
-        if not traceability_path.is_file():
-            return []
-        try:
-            traceability = self._load_json(traceability_path)
-        except (OSError, json.JSONDecodeError):
-            return []
-        labels = [
-            item.get("rtl_label")
-            for prop in traceability.get("properties", [])
-            for item in prop.get("rtl_properties", [])
-        ]
-        property_ids = []
-        for label in labels:
-            if not isinstance(label, str) or not label:
-                continue
-            property_ids.append(f"{top_module}.{label}")
-        return sorted(set(property_ids))
 
     def infer_top_module(self, verilog_files: List[Path]) -> Optional[str]:
         """Infer a top module, preferring VerifyTop variants."""
@@ -1117,7 +1092,7 @@ def account_expected_properties(
                 "engine": raw.get("engine"),
                 "bound": raw.get("bound"),
                 "runtime_s": _runtime_seconds(raw.get("time")),
-                "trace_path": raw.get("fst_file") or raw.get("counterexample_path"),
+                "trace_path": raw.get("fst_file"),
             })
 
     per_property_timeout = bool(re.search(
@@ -1130,17 +1105,6 @@ def account_expected_properties(
         expected_id = item["expected_property_id"]
         observed_id = expected_id if expected_id in statuses else None
         raw = statuses.get(expected_id)
-        if raw is None:
-            candidates = [
-                (property_id, status)
-                for property_id, status in statuses.items()
-                if re.search(
-                    rf"(?<![A-Za-z0-9_]){re.escape(label)}$",
-                    property_id,
-                )
-            ]
-            if len(candidates) == 1:
-                observed_id, raw = candidates[0]
         status: str
         reason: str
         if raw is not None:
@@ -1148,7 +1112,7 @@ def account_expected_properties(
             if raw_status in {"proven", "bounded_proven", "unreachable"}:
                 status, reason = "proven", "tool_reported_proven"
             elif raw_status == "cex":
-                if raw.get("fst_file") or raw.get("counterexample_path"):
+                if raw.get("fst_file"):
                     status, reason = "cex", "tool_reported_cex"
                 else:
                     status, reason = "inconclusive", "counterexample_trace_missing"
@@ -1181,7 +1145,7 @@ def account_expected_properties(
             "bound": raw.get("bound") if raw else None,
             "runtime_s": _runtime_seconds(raw.get("time")) if raw else None,
             "trace_path": (
-                raw.get("fst_file") or raw.get("counterexample_path")
+                raw.get("fst_file")
                 if raw and status == "cex"
                 else None
             ),
@@ -1314,28 +1278,6 @@ def join_property_results(
         "auxiliary_results": auxiliary,
         "properties": properties,
     }
-
-
-def _enrich_traceability(traceability: Dict[str, Any], catalog: Any) -> Dict[str, Any]:
-    """Attach repository schema and protocol-rule provenance before Stage 3 join."""
-    enriched = dict(traceability)
-    evidence_by_locator = {
-        item.get("locator"): item
-        for item in build_protocol_evidence(catalog).get("rules", [])
-    }
-    properties = []
-    for original in traceability.get("properties", []):
-        prop = dict(original)
-        schema = catalog.schemas.get(prop.get("property_schema_id"))
-        if schema is not None:
-            source = schema["source"]
-            prop.setdefault("source", source)
-            protocol_rule = evidence_by_locator.get(source.get("locator"))
-            if protocol_rule is not None:
-                prop.setdefault("protocol_rule", protocol_rule)
-        properties.append(prop)
-    enriched["properties"] = properties
-    return enriched
 
 
 def _phase_failed(text: str, phase: str) -> bool:

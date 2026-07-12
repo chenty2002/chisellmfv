@@ -51,7 +51,7 @@ def load_property_profile(profile_id: str, *, require_approved: bool = True) -> 
     for path in sorted((ASSET_ROOT / "schemas").glob("*.json")):
         payload = _read_json(path)
         if payload.get("property_schema_id") in profile["property_schema_ids"]:
-            _validate_schema(payload)
+            validate_property_schema(payload)
             schemas[payload["property_schema_id"]] = payload
             schema_paths[payload["property_schema_id"]] = path
     templates: Dict[str, Dict[str, Any]] = {}
@@ -200,10 +200,7 @@ def public_catalog(catalog: PropertyCatalog) -> Dict[str, Any]:
         "schemas": list(catalog.schemas.values()),
         "templates": [_public_template(template) for template in catalog.templates.values()],
         "candidates": [
-            {
-                key: candidate[key]
-                for key in ("candidate_id", "type", "roles", "description")
-            }
+            _public_candidate(candidate)
             for candidate in catalog.candidates.values()
         ],
         "binding_policy": _binding_policy(catalog),
@@ -220,18 +217,38 @@ def public_catalog(catalog: PropertyCatalog) -> Dict[str, Any]:
 
 def _binding_policy(catalog: PropertyCatalog) -> Dict[str, Dict[str, Any]]:
     policy = {}
-    for template in catalog.templates.values():
+    for template_id, template in catalog.templates.items():
         for role, slot in template["slots"].items():
             candidates = sorted(
                 candidate["candidate_id"]
                 for candidate in catalog.candidates.values()
                 if role in candidate["roles"] and candidate["type"] == slot["type"]
             )
-            policy[role] = {
+            policy[f"{template_id}:{role}"] = {
+                "template_id": template_id,
+                "slot": role,
                 "mode": "model_select" if len(candidates) >= 2 else "deterministic",
                 "candidate_ids": candidates,
             }
     return dict(sorted(policy.items()))
+
+
+def _public_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    value = {
+        key: candidate[key]
+        for key in (
+            "candidate_id", "type", "roles", "description", "width",
+            "width_source", "clock_domain", "reset_domain", "scope",
+        )
+        if key in candidate
+    }
+    provenance = candidate.get("provenance") or {}
+    value["source_location"] = {
+        key: provenance[key]
+        for key in ("path", "line", "enclosing_symbol", "scope_anchor", "template_id")
+        if key in provenance
+    }
+    return value
 
 
 def _public_template(template: Dict[str, Any]) -> Dict[str, Any]:
@@ -275,9 +292,6 @@ def validate_property_schema(value: Dict[str, Any]) -> None:
         validate_property_schema_v3(value)
     except PropertyIRError as exc:
         raise PropertyCatalogError(str(exc)) from exc
-
-
-_validate_schema = validate_property_schema
 
 
 def _schema_slots(schema: Dict[str, Any]) -> Dict[str, str]:

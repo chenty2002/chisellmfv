@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import copy
+import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-from .property_catalog import PropertyCatalog
+from ..property_catalog import PropertyCatalog
 
 
 def build_gold_binding_manifest(

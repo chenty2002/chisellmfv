@@ -12,7 +12,6 @@ from .indexer import generate_indexes
 from .formal_contract import load_formal_contract
 from .preprocess import (
     build_baseline_assertion_inventory,
-    patch_autoverify_outputs,
     prepare_profile_surface,
     scan_formal_surface,
 )
@@ -50,12 +49,10 @@ class CoupledL2Preflight:
             self.results_dir / "baseline_assertion_inventory_before.json",
             baseline_inventory_before,
         )
-        patched_autoverify = patch_autoverify_outputs(self.workspace.case_workspace)
         prepared = prepare_profile_surface(self.workspace.case_workspace, catalog)
         preprocess = {
             "schema_version": "coupledl2_preprocess.v3",
             "success": True,
-            "patched_autoverify": patched_autoverify,
             "property_profile": self.workspace.config.property_profile,
             "prepared_surface": {
                 "target_path": "workspace/case/"

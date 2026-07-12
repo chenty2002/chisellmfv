@@ -77,7 +77,7 @@ def build_witness_plan(manifest: Dict[str, Any], catalog: PropertyCatalog) -> Di
 
 
 def initial_semantic_evidence(
-    manifest: Dict[str, Any], catalog: PropertyCatalog, certificate: Dict[str, Any]
+    catalog: PropertyCatalog, certificate: Dict[str, Any]
 ) -> Dict[str, Any]:
     return {
         "schema_version": "semantic_evidence.v1",

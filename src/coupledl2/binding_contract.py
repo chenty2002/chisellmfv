@@ -7,6 +7,7 @@ import re
 from typing import Any, Dict
 
 from .property_catalog import PropertyCatalog
+from .binding_candidates import compatible_candidates, fill_singleton_bindings
 
 
 BASE_LABEL_RE = re.compile(r"^(?:CL2|TL)_[A-Z0-9_]{1,80}$")
@@ -148,13 +149,14 @@ def model_selectable_slots(catalog: PropertyCatalog) -> Dict[str, list[str]]:
     slots: Dict[str, list[str]] = {}
     for template in catalog.templates.values():
         for role, definition in template["slots"].items():
-            compatible = sorted(
+            compatible = [
                 candidate["candidate_id"]
-                for candidate in catalog.candidates.values()
-                if role in candidate["roles"] and candidate["type"] == definition["type"]
-            )
+                for candidate in compatible_candidates(
+                    catalog, role, definition["type"]
+                )
+            ]
             if len(compatible) >= 2:
-                slots[role] = compatible
+                slots[f"{template['template_id']}:{role}"] = compatible
     return dict(sorted(slots.items()))
 
 
@@ -210,9 +212,14 @@ def validate_binding_manifest(
         raise BindingContractError("$.instances", "duplicate_value", "instance ids must be globally unique")
     if len(set(base_labels)) != len(instances):
         raise BindingContractError("$.instances", "duplicate_value", "base labels must be globally unique")
-    for index, instance in enumerate(instances):
+    normalized = copy.deepcopy(payload)
+    normalized["instances"] = [
+        fill_singleton_bindings(instance, catalog)
+        for instance in normalized["instances"]
+    ]
+    for index, instance in enumerate(normalized["instances"]):
         _validate_instance(instance, catalog, index)
-    return copy.deepcopy(payload)
+    return normalized
 
 
 def _validate_instance(instance: Dict[str, Any], catalog: PropertyCatalog, index: int) -> None:
@@ -271,11 +278,10 @@ def _validate_instance(instance: Dict[str, Any], catalog: PropertyCatalog, index
             or role not in candidate["roles"]
             or candidate["type"] != expected_type
         ):
-            allowed = sorted(
+            allowed = [
                 item["candidate_id"]
-                for item in catalog.candidates.values()
-                if role in item["roles"] and item["type"] == expected_type
-            )
+                for item in compatible_candidates(catalog, role, expected_type)
+            ]
             raise BindingContractError(
                 f"{path}.bindings.{role}",
                 "candidate_incompatible",

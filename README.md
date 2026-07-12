@@ -12,19 +12,20 @@ JasperGold quality evaluator, and the Verilog-to-Chisel converter. Treat
 
 ## What This Version Provides
 
-- Preflight-gated four-stage CoupledL2 workflow:
-  `bind_properties -> invoke_verification -> waveform_explanation -> propose_bugfix`.
+- Preflight-gated CoupledL2 workflow:
+  `bind_properties -> invoke_verification -> waveform_explanation`, with
+  `propose_bugfix` as an explicit run-local proposal stage.
 - CoupledL2 run isolation under `runs/<timestamp>-<case>-<id>/`.
 - Stage-local context files, skills, rules, source snapshots, tool operation
   ledgers, stage results, handoff files, and run cost summaries.
 - Repository-owned property assets for CoupledL2: the model selects a strict
   `property_schema`, template, binding candidates, and bounded parameters; Python
-  renders source edits, labels elaborated RTL properties, and records
-  traceability.
-- Workspace-scoped model tools for later agent stages: source reads, bounded
-  `rg`, focused edits, waveform queries, causal-analysis queries, and explicit
-  `complete_stage` completion. CoupledL2 Stage 2 does not expose the old source
-  editing tool loop.
+  resolves indexed IDs, renders repository-owned templates, labels elaborated
+  RTL properties, and records one immutable property package.
+- Stage 3 is dispatched directly to the deterministic build/formal backend and
+  makes no model call. Stage 4 can explain deterministic CEX evidence. Stage 5
+  can only emit an unapplied `repair_proposal.json` plus unified diff inside the
+  run directory; it cannot edit copied design source.
 - Dual-model routing through `CHISELLMFV_LLM_MODEL_PRO` and
   `CHISELLMFV_LLM_MODEL_FLASH`, with `CHISELLMFV_LLM_MODEL` as a fallback.
 
@@ -252,9 +253,10 @@ Important files:
 
 ```text
 manifest.json
-indexes/project_tree.json
 indexes/build_contract.json
 indexes/formal_surface.json
+indexes/tl_signal_index.json
+indexes/observer_index.json
 logs/events.jsonl
 results/preflight/preflight_result.json
 results/preflight/baseline_build_result.json
@@ -270,13 +272,13 @@ Each stage directory may contain:
 
 ```text
 stage_inputs.json              # stable input contract for the stage
-operations.jsonl               # model tool operations and edit evidence
+operations.jsonl               # model tool operations for agent stages
 tool_results/                  # complete raw JSON results referenced by bounded views
 context_compactions.jsonl      # FLASH compaction attempts and budget decisions
 stage_events.jsonl             # machine-readable stage events
 stage_result.json              # normalized stage result
 handoff.json                   # compact downstream-stage contract
-source_snapshot/               # lazy source snapshots for edit stages
+source_snapshot/               # source snapshots used by deterministic render/audit
 snapshot_manifest_before.json
 snapshot_manifest_after.json
 ```
@@ -285,14 +287,16 @@ Stage-specific artifacts include:
 
 | Stage | Typical artifacts |
 |---|---|
-| `bind_properties` | `binding_manifest.json`, `assertion_traceability.json`, `rtl_label_result.json`, source snapshots |
-| `invoke_verification` | `verify.tcl`, `formal_result.json`, `property_status.json`, `property_result_map.json`, traces |
-| `waveform_explanation` | causal/waveform evidence, `diagnosis.json`, `counterexample_analysis.md` |
-| `propose_bugfix` | repair result, repair history, final result |
+| `bind_properties` | `stage_inputs.json`, `binding_manifest.json`, `property_package.json`, `assertion_delta.json`, `semantic_evidence.json`, render/build audit files |
+| `invoke_verification` | `verify.tcl`, `property_result_map.json`, `proof_events.jsonl`, `jaspergold.log`, traces |
+| `waveform_explanation` | `transaction_trace.json`, `state_trace.json`, `wait_chain.json`, `diagnosis_evidence.json`, `diagnosis.json`, `counterexample_analysis.md` |
+| `propose_bugfix` | unapplied `repair_proposal.json`, `repair_proposal.patch` |
 
 Downstream stages read earlier `handoff.json` files through
-`stage_inputs.json`; successful edit stages refresh the indexes and bind the
-workspace/index hashes into their handoffs. `run_cost_summary.json` aggregates
+`stage_inputs.json`; successful Stage 2 rendering refreshes the indexes and
+binds workspace/index hashes into the handoff. Every successful stage is
+validated against the single `StageSpec.artifact_contract`, and handoffs store
+only artifact paths and hashes. `run_cost_summary.json` aggregates
 PRO, FLASH, context compaction, token budget, stage tool-budget use,
 raw/model-visible tool-result token reduction, and local-gate outcomes.
 

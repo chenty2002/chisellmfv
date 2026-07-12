@@ -136,7 +136,7 @@ READ_FILES_TOOL = {
             "file_paths": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Workspace-relative files to read, such as case/Chisel/src/test/scala/coupledl2/VerifyTop.scala or results/by_stage/03_invoke_verification/formal_result.json.",
+                "description": "Workspace-relative files to read, such as case/Chisel/src/test/scala/coupledl2/VerifyTop.scala or results/by_stage/03_invoke_verification/property_result_map.json.",
             },
             "slices": {
                 "type": "array",

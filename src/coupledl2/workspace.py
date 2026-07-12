@@ -14,6 +14,7 @@ from uuid import uuid4
 from .config import CoupledL2RunConfig
 from .file_policy import ignored_copy_entry
 from .property_catalog import PropertyCatalog, load_property_profile, public_catalog
+from .binding_candidates import build_binding_catalog
 from .prompt_context import build_prompt_bundle
 from .skills import install_context_assets, stage_rule_paths, stage_skill_paths
 from .stages import COUPLEDL2_STAGES, STAGE_SPECS, get_stage_spec
@@ -47,6 +48,7 @@ class StageContext:
     prompt_bundle: List[Dict[str, Any]]
     prompt_asset_total_chars: int
     stage_inputs: Dict[str, Any]
+    binding_catalog: PropertyCatalog | None = None
 
     def to_dict(self, tool_root: Path) -> Dict[str, Any]:
         payload = {
@@ -165,7 +167,13 @@ def initialize_stage_context(workspace: CoupledL2Workspace, stage: str) -> Stage
     snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     context_indexes = _load_stage_indexes(workspace.indexes_dir, stage)
+    binding_catalog = None
     if stage == "bind_properties":
+        binding_catalog = build_binding_catalog(
+            load_property_profile(workspace.config.property_profile),
+            context_indexes,
+        )
+    if get_stage_spec(stage).execution_kind != "agent":
         skills = []
         rules = []
         prompt_bundle = []
@@ -186,6 +194,7 @@ def initialize_stage_context(workspace: CoupledL2Workspace, stage: str) -> Stage
         rules=rules,
         context_indexes=context_indexes,
         prompt_bundle=prompt_bundle,
+        binding_catalog=binding_catalog,
     )
     ctx = StageContext(
         stage=stage,
@@ -197,6 +206,7 @@ def initialize_stage_context(workspace: CoupledL2Workspace, stage: str) -> Stage
         prompt_bundle=prompt_bundle,
         prompt_asset_total_chars=sum(asset["chars"] for asset in prompt_bundle),
         stage_inputs=stage_inputs,
+        binding_catalog=binding_catalog,
     )
     _write_stage_inputs(workspace, ctx)
     _append_jsonl(workspace.logs_dir / "events.jsonl", {
@@ -281,6 +291,7 @@ def _build_stage_inputs(
     rules: List[Path],
     context_indexes: Dict[str, Dict[str, Any]],
     prompt_bundle: List[Dict[str, Any]],
+    binding_catalog: PropertyCatalog | None,
 ) -> Dict[str, Any]:
     """Build the complete in-memory stage input contract."""
     payload = {
@@ -304,7 +315,9 @@ def _build_stage_inputs(
         "chisel_compatibility": context_indexes.get("build_contract", {}).get("chisel"),
     }
     if stage == "bind_properties":
-        catalog = load_property_profile(workspace.config.property_profile)
+        if binding_catalog is None:
+            raise ValueError("binding stage requires a run-local candidate catalog")
+        catalog = binding_catalog
         build_contract = context_indexes.get("build_contract", {})
         formal_surface = context_indexes.get("formal_surface", {})
         preflight_result = json.loads(
@@ -345,6 +358,19 @@ def _build_stage_inputs(
             "formal_contract": "results/preflight/formal_contract.json",
         }
         payload["property_catalog"] = public_catalog(catalog)
+        manifest = json.loads(workspace.manifest_path.read_text(encoding="utf-8"))
+        payload["source_state"] = {
+            "workspace_hash": manifest.get("workspace_hash"),
+            "index_hashes": {
+                name: manifest.get("index_hashes", {}).get(name)
+                for name in sorted(context_indexes)
+            },
+            "review_id": (catalog.review or {}).get("review_id"),
+            "reviewed_asset_hashes": {
+                item["path"]: item["sha256"]
+                for item in (catalog.review or {}).get("assets", [])
+            },
+        }
     elif stage == "waveform_explanation":
         stage2_dir = (
             workspace.results_dir
@@ -358,9 +384,11 @@ def _build_stage_inputs(
         )
         result_map_path = stage3_dir / "property_result_map.json"
         manifest_path = stage2_dir / "binding_manifest.json"
-        if result_map_path.is_file() and manifest_path.is_file():
+        package_path = stage2_dir / "property_package.json"
+        if result_map_path.is_file() and manifest_path.is_file() and package_path.is_file():
             result_map = json.loads(result_map_path.read_text(encoding="utf-8"))
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            package = json.loads(package_path.read_text(encoding="utf-8"))
             instances = {
                 item["instance_id"]: item for item in manifest["instances"]
             }
@@ -388,12 +416,15 @@ def _build_stage_inputs(
                                 "jaspergold_property_id": result.get(
                                     "observed_property_id"
                                 ),
-                                "counterexample_path": result.get(
+                                "trace_path": result.get(
                                     "trace_path"
                                 ),
                             }
                         )
             payload["failed_property_traces"] = failed
+            payload["source_snippets"] = build_binding_source_snippets(
+                workspace, package, {item["instance_id"] for item in failed}
+            )
             stage4_dir = workspace.results_dir / "by_stage" / get_stage_spec("waveform_explanation").directory_name
             payload["deterministic_trace_evidence"] = {
                 name: f"results/by_stage/{get_stage_spec('waveform_explanation').directory_name}/{name}.json"
@@ -401,6 +432,58 @@ def _build_stage_inputs(
                 if (stage4_dir / f"{name}.json").is_file()
             }
     return payload
+
+
+def build_binding_source_snippets(
+    workspace: CoupledL2Workspace,
+    property_package: Dict[str, Any],
+    instance_ids: set[str] | None = None,
+) -> List[Dict[str, Any]]:
+    """Return bounded, package-derived source context without model path guesses."""
+    snippets: List[Dict[str, Any]] = []
+    seen = set()
+    for selection in property_package.get("selected_candidates", []):
+        if instance_ids and selection.get("instance_id") not in instance_ids:
+            continue
+        for role, candidate in sorted(selection.get("bindings", {}).items()):
+            provenance = candidate.get("provenance") or {}
+            relative = provenance.get("path")
+            if not isinstance(relative, str) or relative in seen:
+                continue
+            path = workspace.case_workspace / relative
+            try:
+                resolved = path.resolve()
+                resolved.relative_to(workspace.case_workspace.resolve())
+            except (OSError, ValueError):
+                continue
+            if not path.is_file():
+                continue
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            line = provenance.get("line")
+            if not isinstance(line, int):
+                anchor = provenance.get("scope_anchor")
+                matches = [
+                    index for index, text in enumerate(lines, 1)
+                    if isinstance(anchor, str) and anchor in text
+                ]
+                line = matches[0] if len(matches) == 1 else 1
+            start = max(1, line - 3)
+            end = min(len(lines), line + 3)
+            snippets.append(
+                {
+                    "instance_id": selection.get("instance_id"),
+                    "role": role,
+                    "candidate_id": candidate.get("candidate_id"),
+                    "path": "workspace/case/" + relative,
+                    "line_start": start,
+                    "line_end": end,
+                    "text": "\n".join(lines[start - 1:end])[:1600],
+                }
+            )
+            seen.add(relative)
+            if len(snippets) >= 6:
+                return snippets
+    return snippets
 
 
 def build_protocol_evidence(catalog: PropertyCatalog) -> Dict[str, Any]:

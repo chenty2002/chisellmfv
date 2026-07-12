@@ -19,10 +19,14 @@ from .binding_contract import (
     binding_patch_tool,
     validate_binding_manifest,
 )
-from .property_catalog import load_property_profile, public_catalog
 from .rtl_property_labeler import RTLProperty, label_rtl_properties
-from .workspace import build_protocol_evidence
-from .campaign import write_campaign
+from .workspace import StageContext, build_protocol_evidence, initialize_stage_context
+from .stages import get_stage_spec
+from .artifacts import (
+    file_sha256,
+    validate_completed_stage,
+    write_stage_outcome,
+)
 from .property_compiler import (
     build_witness_plan,
     compile_manifest,
@@ -45,12 +49,18 @@ class BindingStage:
         backend: Any,
         llm_client: Any,
         logger: Optional[Any],
+        stage_context: Optional[StageContext] = None,
     ):
         self.workspace = workspace
         self.backend = backend
         self.llm_client = llm_client
         self.logger = logger
-        self.catalog = load_property_profile(workspace.config.property_profile)
+        self.stage_context = stage_context or initialize_stage_context(
+            workspace, "bind_properties"
+        )
+        if self.stage_context.binding_catalog is None:
+            raise BindingStageError("binding StageContext has no candidate catalog")
+        self.catalog = self.stage_context.binding_catalog
         self.stage_dir = workspace.results_dir / "by_stage" / "02_bind_properties"
         self.stage_dir.mkdir(parents=True, exist_ok=True)
         self.model_calls = 0
@@ -71,7 +81,6 @@ class BindingStage:
             for source_target in self.catalog.profile.get("source_targets", [])
         }
         generated_before = self._snapshot_generated()
-        self._write_inputs()
         self._snapshot_source(target, "before")
         manifest: Optional[Dict[str, Any]] = None
         try:
@@ -93,7 +102,7 @@ class BindingStage:
                         "submit_binding_patch",
                         binding_patch_tool(
                             self.catalog,
-                            raw_manifest.get("instances", [{}])[0].get("instance_id", ""),
+                            _repair_instance_id(raw_manifest, exc),
                         ),
                         self._patch_messages(raw_manifest, exc),
                         max_tokens=1024,
@@ -103,7 +112,6 @@ class BindingStage:
                 self._event("binding_manifest_reused", {})
 
             _write_json(self.stage_dir / "binding_manifest.json", manifest)
-            self._write_campaign(manifest)
             render = render_property_source(target, manifest, self.catalog)
             self._write_render_artifacts(render)
             build = self.backend.verify_compilation(require_assertions=False)
@@ -111,6 +119,10 @@ class BindingStage:
             if not build.get("success"):
                 raise CompilationGateError(
                     str(build.get("error") or "rendered property source did not compile")
+                )
+            if not isinstance(build.get("top_module"), str) or not build["top_module"]:
+                raise CompilationGateError(
+                    "successful build did not declare the exact top module"
                 )
             generated = [
                 Path(path)
@@ -128,7 +140,7 @@ class BindingStage:
                 manifest,
                 rtl_properties,
                 target,
-                top_module=str(build.get("top_module") or ""),
+                top_module=build["top_module"],
             )
             result = {
                 "schema_version": "stage_result.v2",
@@ -137,30 +149,13 @@ class BindingStage:
                 "termination_reason": "property_binding_completed",
                 "model_calls": self.model_calls,
                 "binding_manifest_path": "binding_manifest.json",
-                "assertion_traceability_path": "assertion_traceability.json",
+                "property_package_path": "property_package.json",
                 "assertion_delta_path": "assertion_delta.json",
-                "compilation_certificate_path": "compilation_certificate.json",
-                "witness_plan_path": "witness_plan.json",
                 "semantic_evidence_path": "semantic_evidence.json",
                 "rtl_property_count": len(rtl_properties),
             }
-            _write_json(self.stage_dir / "stage_result.json", result)
-            _write_json(
-                self.stage_dir / "handoff.json",
-                {
-                    "schema_version": "stage_handoff.v1",
-                    "stage": "bind_properties",
-                    "success": True,
-                    "artifacts": {
-                        "binding_manifest": "binding_manifest.json",
-                        "assertion_traceability": "assertion_traceability.json",
-                        "rtl_label_result": "rtl_label_result.json",
-                        "assertion_delta": "assertion_delta.json",
-                        "compilation_certificate": "compilation_certificate.json",
-                        "witness_plan": "witness_plan.json",
-                        "semantic_evidence": "semantic_evidence.json",
-                    },
-                },
+            result = write_stage_outcome(
+                self.stage_dir, get_stage_spec("bind_properties"), result
             )
             self._event("binding_stage_completed", {"rtl_property_count": len(rtl_properties)})
             return {"success": True, "stage_result": result}
@@ -180,15 +175,8 @@ class BindingStage:
             }
             if isinstance(exc, BindingContractError):
                 result["contract_error"] = exc.to_dict()
-            _write_json(self.stage_dir / "stage_result.json", result)
-            _write_json(
-                self.stage_dir / "handoff.json",
-                {
-                    "schema_version": "stage_handoff.v1",
-                    "stage": "bind_properties",
-                    "success": False,
-                    "error_kind": type(exc).__name__,
-                },
+            write_stage_outcome(
+                self.stage_dir, get_stage_spec("bind_properties"), result
             )
             self._event("binding_stage_failed", {"error_kind": type(exc).__name__})
             return {"success": False, "stage_result": result}
@@ -205,32 +193,27 @@ class BindingStage:
             return None
 
     def _load_completed_binding(self) -> Optional[Dict[str, Any]]:
-        """Treat intact Stage 2 artifacts as an idempotent completed stage."""
+        """Reuse only the same hashed StageSpec contract used by fresh completion."""
+        completed = validate_completed_stage(
+            self.stage_dir, get_stage_spec("bind_properties")
+        )
+        if completed is None:
+            return None
         manifest = self._load_reusable_manifest()
-        trace_path = self.stage_dir / "assertion_traceability.json"
-        labels_path = self.stage_dir / "rtl_label_result.json"
-        delta_path = self.stage_dir / "assertion_delta.json"
-        certificate_path = self.stage_dir / "compilation_certificate.json"
-        witness_path = self.stage_dir / "witness_plan.json"
-        semantic_path = self.stage_dir / "semantic_evidence.json"
-        if (
-            manifest is None
-            or not trace_path.is_file()
-            or not labels_path.is_file()
-            or not delta_path.is_file()
-            or not certificate_path.is_file()
-            or not witness_path.is_file()
-            or not semantic_path.is_file()
-        ):
+        if manifest is None:
             return None
         try:
-            traceability = json.loads(trace_path.read_text(encoding="utf-8"))
-            label_result = json.loads(labels_path.read_text(encoding="utf-8"))
+            package = json.loads(
+                (self.stage_dir / "property_package.json").read_text(encoding="utf-8")
+            )
+            delta = json.loads(
+                (self.stage_dir / "assertion_delta.json").read_text(encoding="utf-8")
+            )
         except (OSError, json.JSONDecodeError):
             return None
         labels = [
             item.get("rtl_label")
-            for item in label_result.get("properties", [])
+            for item in delta.get("rtl_properties", [])
             if isinstance(item.get("rtl_label"), str)
         ]
         if not labels or len(labels) != len(set(labels)):
@@ -248,46 +231,14 @@ class BindingStage:
             for label in labels
         ):
             return None
-        trace_labels = {
+        package_labels = {
             item.get("rtl_label")
-            for prop in traceability.get("properties", [])
+            for prop in package.get("traceability", {}).get("properties", [])
             for item in prop.get("rtl_properties", [])
         }
-        if trace_labels != set(labels):
+        if package_labels != set(labels):
             return None
-        result = {
-            "schema_version": "stage_result.v2",
-            "stage": "bind_properties",
-            "success": True,
-            "termination_reason": "property_binding_completed",
-            "model_calls": 0,
-            "binding_manifest_path": "binding_manifest.json",
-            "assertion_traceability_path": "assertion_traceability.json",
-            "assertion_delta_path": "assertion_delta.json",
-            "compilation_certificate_path": "compilation_certificate.json",
-            "witness_plan_path": "witness_plan.json",
-            "semantic_evidence_path": "semantic_evidence.json",
-            "rtl_property_count": len(labels),
-        }
-        _write_json(self.stage_dir / "stage_result.json", result)
-        _write_json(
-            self.stage_dir / "handoff.json",
-            {
-                "schema_version": "stage_handoff.v1",
-                "stage": "bind_properties",
-                "success": True,
-                "artifacts": {
-                    "binding_manifest": "binding_manifest.json",
-                    "assertion_traceability": "assertion_traceability.json",
-                    "rtl_label_result": "rtl_label_result.json",
-                    "assertion_delta": "assertion_delta.json",
-                    "compilation_certificate": "compilation_certificate.json",
-                    "witness_plan": "witness_plan.json",
-                    "semantic_evidence": "semantic_evidence.json",
-                },
-            },
-        )
-        return result
+        return completed
 
     def _request(
         self,
@@ -343,13 +294,12 @@ class BindingStage:
         raise AssertionError("unreachable binding request state")
 
     def _binding_messages(self) -> list[Dict[str, Any]]:
-        payload = public_catalog(self.catalog)
-        payload["protocol_evidence"] = build_protocol_evidence(self.catalog)
+        payload = self.stage_context.stage_inputs
         return [
             {
                 "role": "system",
                 "content": (
-                    "Select exactly one repository property binding. "
+                    "Select one to eight applicable repository property bindings. "
                     "Use only candidate IDs and bounded parameters. "
                     "For bounded-liveness parameters, choose a conservative "
                     "bound from the schema/template range and the exposed "
@@ -370,7 +320,14 @@ class BindingStage:
         manifest: Dict[str, Any],
         error: BindingContractError,
     ) -> list[Dict[str, Any]]:
-        instance = manifest.get("instances", [{}])[0]
+        instance_id = _repair_instance_id(manifest, error)
+        instance = next(
+            (
+                item for item in manifest.get("instances", [])
+                if isinstance(item, dict) and item.get("instance_id") == instance_id
+            ),
+            {},
+        )
         safe_manifest = {
             key: instance.get(key)
             for key in (
@@ -392,50 +349,13 @@ class BindingStage:
                     {
                         "manifest": safe_manifest,
                         "validation_error": error.to_dict(),
-                        "catalog": public_catalog(self.catalog),
+                        "catalog": self.stage_context.stage_inputs["property_catalog"],
                         "protocol_evidence": build_protocol_evidence(self.catalog),
                     },
                     ensure_ascii=False,
                 ),
             },
         ]
-
-    def _write_inputs(self) -> None:
-        public = public_catalog(self.catalog)
-        protocol_evidence = build_protocol_evidence(self.catalog)
-        _write_json(
-            self.stage_dir / "stage_inputs.json",
-            {
-                "schema_version": "stage_inputs.v1",
-                "stage": "bind_properties",
-                "property_profile": self.workspace.config.property_profile,
-                "model_contract": "one binding manifest and at most one patch",
-                "property_catalog": public,
-                "protocol_evidence": protocol_evidence,
-            },
-        )
-        _write_json(
-            self.stage_dir / "property_catalog.json",
-            {
-                "schema_version": "property_catalog_snapshot.v1",
-                "schemas": self.catalog.schemas,
-                "profile": self.catalog.profile,
-            },
-        )
-        _write_json(
-            self.stage_dir / "template_catalog.json",
-            {
-                "schema_version": "template_catalog_snapshot.v1",
-                "templates": self.catalog.templates,
-            },
-        )
-        _write_json(
-            self.stage_dir / "binding_candidates.json",
-            {
-                "schema_version": "binding_candidates.v1",
-                "candidates": public["candidates"],
-            },
-        )
 
     def _write_render_artifacts(self, result: RenderResult) -> None:
         _write_json(
@@ -469,21 +389,6 @@ class BindingStage:
             }
             for item in properties
         ]
-        _write_json(
-            self.stage_dir / "generated_assertion_scan.json",
-            {
-                "schema_version": "generated_assertion_scan.v2",
-                "assertion_count": len(records),
-                "properties": records,
-            },
-        )
-        _write_json(
-            self.stage_dir / "rtl_label_result.json",
-            {
-                "schema_version": "rtl_label_result.v1",
-                "properties": records,
-            },
-        )
         protocol_rules = build_protocol_evidence(self.catalog).get("rules", [])
         trace_records = []
         for instance in manifest["instances"]:
@@ -516,8 +421,6 @@ class BindingStage:
             "schema_version": "assertion_traceability.v1",
             "properties": trace_records,
         }
-        traceability_path = self.stage_dir / "assertion_traceability.json"
-        _write_json(traceability_path, traceability)
         baseline_path = (
             self.workspace.results_dir / "preflight" / "baseline_assertion_inventory.json"
         )
@@ -545,6 +448,40 @@ class BindingStage:
             raise BindingStageError(
                 "assertion delta overlaps inherited baseline property labels"
             )
+        certificate = compile_manifest(manifest, self.catalog, rtl_properties=records)
+        witness_plan = build_witness_plan(manifest, self.catalog)
+        property_package = {
+            "schema_version": "property_package.v1",
+            "property_profile_id": self.catalog.profile["property_profile_id"],
+            "binding_manifest": {
+                "path": "binding_manifest.json",
+                "sha256": file_sha256(self.stage_dir / "binding_manifest.json"),
+            },
+            "stage_inputs": {
+                "path": "stage_inputs.json",
+                "sha256": file_sha256(self.stage_dir / "stage_inputs.json"),
+            },
+            "review": self.catalog.review,
+            "selected_candidates": [
+                {
+                    "instance_id": instance["instance_id"],
+                    "bindings": {
+                        role: {
+                            "candidate_id": candidate_id,
+                            "type": self.catalog.candidates[candidate_id]["type"],
+                            "roles": self.catalog.candidates[candidate_id]["roles"],
+                            "provenance": self.catalog.candidates[candidate_id]["provenance"],
+                        }
+                        for role, candidate_id in sorted(instance["bindings"].items())
+                    },
+                }
+                for instance in manifest["instances"]
+            ],
+            "compilation_certificate": certificate,
+            "witness_plan": witness_plan,
+            "traceability": traceability,
+        }
+        _write_json(self.stage_dir / "property_package.json", property_package)
         _write_json(
             self.stage_dir / "assertion_delta.json",
             {
@@ -562,93 +499,19 @@ class BindingStage:
                     "path": "../../preflight/baseline_assertion_inventory.json",
                     "sha256": baseline_sha,
                 },
-                "traceability_sha256": _file_sha256(traceability_path),
+                "property_package_sha256": file_sha256(
+                    self.stage_dir / "property_package.json"
+                ),
                 "rtl_properties": delta_records,
                 "rtl_property_count": len(delta_records),
                 "baseline_label_overlap": [],
             },
         )
-        certificate = compile_manifest(manifest, self.catalog, rtl_properties=records)
-        witness_plan = build_witness_plan(manifest, self.catalog)
         semantic_evidence = initial_semantic_evidence(
-            manifest, self.catalog, certificate
+            self.catalog, certificate
         )
-        _write_json(self.stage_dir / "compilation_certificate.json", certificate)
-        _write_json(self.stage_dir / "witness_plan.json", witness_plan)
         _write_json(self.stage_dir / "semantic_evidence.json", semantic_evidence)
         self._snapshot_source(target, "after")
-
-    def _write_campaign(self, manifest: Dict[str, Any]) -> None:
-        formal_path = self.workspace.results_dir / "preflight" / "formal_contract.json"
-        formal_sha = _file_sha256(formal_path) if formal_path.is_file() else "0" * 64
-        formal = (
-            json.loads(formal_path.read_text(encoding="utf-8"))
-            if formal_path.is_file()
-            else {}
-        )
-        reviewed_hashes = {
-            item["path"]: item["sha256"]
-            for item in (self.catalog.review or {}).get("assets", [])
-        }
-        packages = []
-        for instance in manifest["instances"]:
-            package = {
-                key: instance[key]
-                for key in ("instance_id", "property_schema_id", "template_id", "base_label")
-            }
-            schema_name = next(
-                path for path in reviewed_hashes
-                if path.startswith("schemas/")
-                and Path(path).stem.lower() == instance["property_schema_id"].lower()
-            )
-            template_name = next(
-                path for path in reviewed_hashes
-                if path.startswith("templates/")
-                and Path(path).stem == instance["template_id"]
-            )
-            package_material = {
-                "instance": instance,
-                "review_id": (self.catalog.review or {}).get("review_id"),
-                "asset_hashes": {
-                    path: reviewed_hashes[path]
-                    for path in sorted(reviewed_hashes)
-                    if path in {
-                        schema_name,
-                        template_name,
-                        f"profiles/{self.catalog.profile['property_profile_id']}.json",
-                        f"formal_contracts/{self.catalog.formal_contract_id}.json",
-                        f"gold_bindings/{self.catalog.profile.get('gold_binding_id')}.json",
-                    }
-                },
-            }
-            package["package_sha256"] = hashlib.sha256(
-                json.dumps(package_material, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            ).hexdigest()
-            package["proof_budget_s"] = int(
-                formal.get("resources", {}).get("per_property_timeout_s", 300)
-            )
-            packages.append(package)
-        payload = {
-            "schema_version": "verification_campaign.v1",
-            "campaign_id": self.workspace.run_dir.name.lower().replace(".", "-")[:96],
-            "case_name": getattr(self.workspace.config, "case_name", self.workspace.run_dir.name),
-            "property_profile_id": self.catalog.profile["property_profile_id"],
-            "formal_contract": {
-                "path": "../../preflight/formal_contract.json",
-                "sha256": formal_sha,
-            },
-            "groups": [{
-                "group_id": "bounded_batch_0",
-                "selector": {"mode": "approved_manifest"},
-                "property_packages": packages,
-            }],
-            "run_config": {
-                "seed": 0,
-                "tool": formal.get("tool", {}).get("name", "jaspergold"),
-                "tool_version": formal.get("tool", {}).get("version", "unknown"),
-            },
-        }
-        write_campaign(self.stage_dir / "verification_campaign.json", payload)
 
     def _snapshot_source(self, target: Path, phase: str) -> None:
         destination = self.stage_dir / "source_snapshot" / phase / target.name
@@ -704,3 +567,15 @@ def _write_json(path: Path, value: Dict[str, Any]) -> None:
 
 def _file_sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _repair_instance_id(
+    manifest: Dict[str, Any], error: BindingContractError
+) -> str:
+    match = re.search(r"\$\.instances\[(\d+)\]", error.field_path)
+    index = int(match.group(1)) if match else 0
+    instances = manifest.get("instances")
+    if not isinstance(instances, list) or index >= len(instances):
+        return ""
+    item = instances[index]
+    return str(item.get("instance_id", "")) if isinstance(item, dict) else ""

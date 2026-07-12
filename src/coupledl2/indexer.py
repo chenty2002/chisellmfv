@@ -23,7 +23,6 @@ def generate_indexes(run_dir: Path, case_workspace: Path, config: CoupledL2RunCo
     profile = load_property_profile(config.property_profile).profile
     roots = profile["index_roots"]
     indexes = {
-        "project_tree": build_project_tree(case_workspace),
         "build_contract": build_build_contract(case_workspace, config),
         "formal_surface": build_formal_surface(case_workspace),
         "tl_signal_index": build_tl_signal_index(case_workspace, roots=roots),
@@ -96,43 +95,6 @@ def _sha256_json(value: Dict[str, Any]) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def build_project_tree(case_workspace: Path) -> Dict[str, Any]:
-    files: List[Dict[str, Any]] = []
-    filtered: List[Dict[str, Any]] = []
-    for directory, dir_names, file_names in os.walk(case_workspace, followlinks=False):
-        directory_path = Path(directory)
-        allowed_dirs = []
-        for name in sorted(dir_names):
-            path = directory_path / name
-            relative = path.relative_to(case_workspace)
-            decision = evaluate_workspace_path(relative, intent=PathIntent.DISCOVER)
-            if decision.allowed and not path.is_symlink():
-                allowed_dirs.append(name)
-            else:
-                filtered.append({
-                    "path": _rel(path, case_workspace),
-                    "rule": decision.rule,
-                    "reason": decision.reason,
-                    "explicit_access": True,
-                })
-        dir_names[:] = allowed_dirs
-        for name in sorted(file_names):
-            path = directory_path / name
-            relative = path.relative_to(case_workspace)
-            decision = evaluate_workspace_path(relative, intent=PathIntent.DISCOVER)
-            if decision.allowed:
-                files.append({
-                    "path": _rel(path, case_workspace),
-                    "size": path.stat().st_size,
-                })
-    return {
-        "case_root": "workspace/case",
-        "file_count": len(files),
-        "files": files,
-        "filtered_paths": filtered,
-    }
 
 
 def build_build_contract(case_workspace: Path, config: CoupledL2RunConfig) -> Dict[str, Any]:
@@ -232,7 +194,14 @@ _HANDSHAKE_RE = re.compile(
     r"\b((?:io\.(?:in|out)\.)?[a-e]|[A-Za-z_][A-Za-z0-9_]*(?:\.io)?\.[a-e]|io\.[A-Za-z_][A-Za-z0-9_]*)"
     r"\.(valid|ready)\b"
 )
+_FIRE_RE = re.compile(
+    r"\b((?:io\.(?:in|out)\.)?[a-e]|[A-Za-z_][A-Za-z0-9_]*(?:\.io)?\.[a-e]|io\.[A-Za-z_][A-Za-z0-9_]*)"
+    r"\.fire\b"
+)
 _SCALA_SCOPE_RE = re.compile(r"\b(?:class|object|trait)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+_VAL_ASSIGN_RE = re.compile(
+    r"\bval\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*(Bool|UInt))?\s*=\s*(.+)"
+)
 
 
 def build_tl_signal_index(
@@ -271,7 +240,6 @@ def build_tl_signal_index(
                         description="TileLink bundle declaration or construction.",
                     )
                 )
-
             for match in _IO_CHANNEL_RE.finditer(line):
                 direction, channel = match.groups()
                 channels.add(channel)
@@ -305,6 +273,26 @@ def build_tl_signal_index(
                         expression=match.group(0),
                         module=current_scope,
                         description=f"TileLink handshake {handshake} signal.",
+                    )
+                )
+
+            for match in _FIRE_RE.finditer(line):
+                signal = match.group(1)
+                channel = _infer_channel(signal)
+                roles = ["handshake_fire"]
+                if channel:
+                    roles.append(f"channel_{channel}")
+                    channels.add(channel)
+                candidates.append(
+                    _candidate(
+                        candidate_type="tl_fire",
+                        roles=roles,
+                        path=path,
+                        case_workspace=case_workspace,
+                        line_no=line_no,
+                        expression=match.group(0),
+                        module=current_scope,
+                        description="TileLink completed ready/valid transfer.",
                     )
                 )
 
@@ -377,6 +365,24 @@ def build_observer_index(
                         description=f"CoupledL2 observer or protocol component: {module_name}.",
                     )
                 )
+            if current_scope in OBSERVER_MODULES:
+                val_match = _VAL_ASSIGN_RE.search(line)
+                if val_match:
+                    name, annotation, rhs = val_match.groups()
+                    inferred = annotation or _infer_observer_value_type(rhs)
+                    if inferred in {"Bool", "UInt"}:
+                        candidates.append(
+                            _candidate(
+                                candidate_type=f"observer_{inferred.lower()}",
+                                roles=[f"symbol_{_snake(name)}", "observer_signal"],
+                                path=path,
+                                case_workspace=case_workspace,
+                                line_no=line_no,
+                                expression=name,
+                                module=current_scope,
+                                description=f"Indexed {inferred} observer signal {name}.",
+                            )
+                        )
 
     candidates = _assign_candidate_ids(candidates, prefix="obs")
     return {
@@ -460,13 +466,18 @@ def _candidate(
 ) -> Dict[str, Any]:
     channel = next((role[len("channel_"):] for role in roles if role.startswith("channel_")), None)
     phase = next((role[len("handshake_"):] for role in roles if role.startswith("handshake_")), None)
+    chisel_type, width, width_source = _candidate_chisel_type(candidate_type, expression)
     return {
-        "type": candidate_type,
+        "type": chisel_type,
+        "index_kind": candidate_type,
         "roles": sorted(set(roles)),
         "description": description,
-        "chisel_type": "unknown",
-        "width_source": "not_inferred",
+        "chisel_type": chisel_type,
+        "width": width,
+        "width_source": width_source,
         "clock_domain": "implicit_module_clock",
+        "reset_domain": "implicit_module_reset",
+        "scope": module,
         "channel": channel,
         "handshake_phase": phase or "observation",
         "observable": True,
@@ -477,6 +488,39 @@ def _candidate(
             "expression": expression,
         },
     }
+
+
+def _candidate_chisel_type(
+    candidate_type: str, expression: str
+) -> tuple[str, Optional[int], str]:
+    if candidate_type in {"tl_handshake", "tl_fire"}:
+        return "Bool", 1, "protocol_field"
+    if candidate_type == "tl_field":
+        field = expression.rsplit(".", 1)[-1]
+        if field in {"denied", "corrupt"}:
+            return "Bool", 1, "protocol_field"
+        fixed = {"opcode": 3, "param": 3}
+        return "UInt", fixed.get(field), (
+            "protocol_field" if field in fixed else "source_dependent"
+        )
+    if candidate_type == "observer_bool":
+        return "Bool", 1, "source_annotation"
+    if candidate_type == "observer_uint":
+        return "UInt", None, "source_dependent"
+    return "unbound", None, "not_inferred"
+
+
+def _infer_observer_value_type(rhs: str) -> Optional[str]:
+    if re.search(r"\.(?:fire|valid|ready)\b|\b(?:true|false)\.B\b|===|=/=|&&|\|\|", rhs):
+        return "Bool"
+    if re.search(r"\.bits\.(?:data|address|source|sink|size|opcode|param)\b|\.U\b|\bCat\(", rhs):
+        return "UInt"
+    return None
+
+
+def _snake(value: str) -> str:
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").lower()
 
 
 def _assign_candidate_ids(candidates: List[Dict[str, Any]], *, prefix: str) -> List[Dict[str, Any]]:

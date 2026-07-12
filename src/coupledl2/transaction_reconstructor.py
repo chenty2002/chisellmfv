@@ -139,7 +139,7 @@ def materialize_diagnosis_artifacts(input_path: Path, output_dir: Path) -> Dict[
         diagnosis_evidence(
             item,
             binding_ref=str(payload.get("binding_ref", "../02_bind_properties/binding_manifest.json")),
-            source_ref=str(payload.get("source_ref", "../02_bind_properties/assertion_traceability.json")),
+            source_ref=str(payload.get("source_ref", "../02_bind_properties/property_package.json#traceability")),
             transaction_ref="transaction_trace.json",
             state_ref="state_trace.json",
             wait_ref="wait_chain.json",
@@ -148,7 +148,18 @@ def materialize_diagnosis_artifacts(input_path: Path, output_dir: Path) -> Dict[
     ]
     evidence_path = output_dir / "diagnosis_evidence.json"
     evidence_path.write_text(
-        json.dumps({"schema_version": "diagnosis_evidence_set.v1", "properties": evidence_records}, indent=2, sort_keys=True) + "\n",
+        json.dumps(
+            {
+                "schema_version": "diagnosis_evidence_set.v1",
+                "reconstruction_status": payload.get(
+                    "reconstruction_status", "complete"
+                ),
+                "uncertainty": payload.get("uncertainty"),
+                "properties": evidence_records,
+            },
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
         encoding="utf-8",
     )
     artifacts["diagnosis_evidence"] = evidence_path

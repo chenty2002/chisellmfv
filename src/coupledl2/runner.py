@@ -8,10 +8,20 @@ from typing import Any, Callable, Dict, Optional, Type
 
 from .backend import CoupledL2BuildOperations
 from .binding_stage import BindingStage
+from .repair_proposal_stage import RepairProposalStage
 from .indexer import compute_index_hashes, compute_workspace_hash, refresh_indexes
 from .preflight import CoupledL2Preflight
 from .stages import COUPLEDL2_STAGES, get_stage_spec
-from .workspace import CoupledL2Workspace
+from .workspace import CoupledL2Workspace, initialize_stage_context
+from .artifacts import (
+    file_sha256,
+    validate_completed_stage,
+    write_stage_outcome,
+)
+from .non_vacuity import (
+    apply_non_vacuity_evidence,
+    build_runtime_non_vacuity_evidence,
+)
 from .revision import design_bug_is_eligible
 from .transaction_reconstructor import materialize_diagnosis_artifacts
 from ..core.records import (
@@ -77,6 +87,116 @@ class CoupledL2Runner:
             refresh_indexes(self.workspace)
         return result
 
+    def _run_deterministic_verification(self) -> Dict[str, Any]:
+        """Execute Stage 3 directly; no generic agent loop or model call exists."""
+        spec = get_stage_spec("invoke_verification")
+        stage_dir = self.workspace.results_dir / "by_stage" / spec.directory_name
+        backend_result = CoupledL2BuildOperations(
+            self.workspace, self.logger
+        ).run_full_verification_flow()
+        property_map = backend_result.get("property_result_map")
+        if not isinstance(property_map, dict):
+            result = write_stage_outcome(
+                stage_dir,
+                spec,
+                {
+                    "schema_version": "stage_result.v2",
+                    "stage": spec.name,
+                    "success": False,
+                    "termination_reason": "deterministic_verification_failed",
+                    "error_kind": "property_result_map_missing",
+                    "summary": backend_result.get("summary"),
+                    "model_calls": 0,
+                },
+            )
+            return {"success": False, "stage_result": result}
+
+        stage2_dir = self.workspace.results_dir / "by_stage" / get_stage_spec(
+            "bind_properties"
+        ).directory_name
+        package = json.loads(
+            (stage2_dir / "property_package.json").read_text(encoding="utf-8")
+        )
+        semantic_path = stage2_dir / "semantic_evidence.json"
+        semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+        witness_plan = package["witness_plan"]
+        runtime_evidence = build_runtime_non_vacuity_evidence(
+            witness_plan, property_map
+        )
+        updated_semantic = apply_non_vacuity_evidence(
+            semantic, witness_plan, runtime_evidence
+        )
+        _write_json(semantic_path, updated_semantic)
+        property_map["schema_version"] = "property_result_map.v3"
+        property_map["non_vacuity"] = {
+            "semantic_evidence_path": "../02_bind_properties/semantic_evidence.json",
+            "semantic_evidence_sha256": file_sha256(semantic_path),
+            "experiment_eligible": updated_semantic["experiment_eligible"],
+            "instances": [
+                {
+                    "instance_id": item["instance_id"],
+                    "status": item["non_vacuity"],
+                    "reason": item["non_vacuity_reason"],
+                }
+                for item in updated_semantic["instances"]
+            ],
+        }
+        _write_json(stage_dir / "property_result_map.json", property_map)
+
+        previous_handoff = self._read_handoff("bind_properties") or {}
+        stage2_result = self._read_stage_result("bind_properties")
+        if stage2_result is None:
+            raise ValueError("Stage 2 result disappeared before semantic update")
+        write_stage_outcome(
+            stage2_dir,
+            get_stage_spec("bind_properties"),
+            stage2_result,
+            source_state=previous_handoff.get("source_state"),
+        )
+
+        trace_paths = [
+            item["trace_path"]
+            for item in property_map.get("primary_results", [])
+            if item.get("status") == "cex" and item.get("trace_path")
+        ]
+        success = backend_result.get("success") is True
+        result = write_stage_outcome(
+            stage_dir,
+            spec,
+            {
+                "schema_version": "stage_result.v2",
+                "stage": spec.name,
+                "success": success,
+                "termination_reason": (
+                    "deterministic_verification_completed"
+                    if success
+                    else "deterministic_verification_failed"
+                ),
+                "summary": backend_result.get("summary"),
+                "model_calls": 0,
+                "verification_passed": backend_result.get("verification_passed"),
+                "verification_outcome": property_map.get("verification_outcome"),
+                "execution_status": property_map.get("execution_status"),
+                "expected_count": property_map.get("expected_count"),
+                "accounted_count": property_map.get("accounted_count"),
+                "cex_count": sum(
+                    item.get("status") == "cex"
+                    for item in property_map.get("primary_results", [])
+                ),
+                "proven_count": sum(
+                    item.get("status") == "proven"
+                    for item in property_map.get("primary_results", [])
+                ),
+                "trace_paths": trace_paths,
+                "trace_path": trace_paths[0] if trace_paths else None,
+                "property_result_map_path": "property_result_map.json",
+                "non_vacuity_experiment_eligible": updated_semantic[
+                    "experiment_eligible"
+                ],
+            },
+        )
+        return {"success": success, "stage_result": result}
+
     def run(
         self,
         *,
@@ -99,16 +219,34 @@ class CoupledL2Runner:
 
         for current_stage in stages:
             self._validate_predecessor(current_stage)
+            execution_kind = get_stage_spec(current_stage).execution_kind
             v2c_block = self._v2c_readiness_block(current_stage)
             if v2c_block is not None:
                 result = {"success": False, "stage_result": v2c_block}
                 self._write_stage_failure(current_stage, v2c_block)
-            elif current_stage == "bind_properties":
+            elif execution_kind == "binding":
+                stage_context = initialize_stage_context(
+                    self.workspace, current_stage
+                )
                 result = BindingStage(
                     self.workspace,
                     CoupledL2BuildOperations(self.workspace, self.logger),
                     self.llm_client,
                     self.logger,
+                    stage_context,
+                ).run()
+            elif execution_kind == "deterministic":
+                initialize_stage_context(self.workspace, current_stage)
+                result = self._run_deterministic_verification()
+            elif execution_kind == "repair_proposal":
+                stage_context = initialize_stage_context(
+                    self.workspace, current_stage
+                )
+                result = RepairProposalStage(
+                    self.workspace,
+                    self.llm_client,
+                    self.logger,
+                    stage_context,
                 ).run()
             else:
                 if current_stage == "waveform_explanation":
@@ -129,6 +267,13 @@ class CoupledL2Runner:
                 result = workflow.process_task(
                     self.query_for_stage(current_stage, self.workspace.config.case_name)
                 )
+                detail = dict(result.get("stage_result") or {})
+                detail.setdefault("stage", current_stage)
+                result["stage_result"] = write_stage_outcome(
+                    self._handoff_path(current_stage).parent,
+                    get_stage_spec(current_stage),
+                    detail,
+                )
             completed_stage = current_stage
             detail = dict(result.get("stage_result") or {})
             detail.setdefault("stage", current_stage)
@@ -137,7 +282,7 @@ class CoupledL2Runner:
             if not success:
                 break
 
-            if current_stage in {"bind_properties", "propose_bugfix"}:
+            if current_stage == "bind_properties":
                 state = refresh_indexes(self.workspace)
                 self._bind_state_to_handoff(current_stage, state)
 
@@ -194,14 +339,17 @@ class CoupledL2Runner:
         predecessor = get_stage_spec(stage).required_predecessor
         if predecessor == "preflight":
             return
-        handoff = self._read_handoff(predecessor)
-        if not handoff or handoff.get("success") is not True:
+        completed = validate_completed_stage(
+            self._handoff_path(predecessor).parent,
+            get_stage_spec(predecessor),
+        )
+        if completed is None:
             raise ValueError(f"{stage} requires a successful {predecessor} handoff")
         if stage == "waveform_explanation":
-            verification = handoff.get("verification") or {}
+            verification = completed
             if verification.get("verification_passed") is True:
                 raise ValueError("waveform_explanation cannot run after all properties were proven")
-            if not verification.get("counterexample_path"):
+            if not verification.get("trace_path"):
                 raise ValueError("waveform_explanation requires a counterexample path")
         if stage == "propose_bugfix":
             diagnoses = self._read_diagnoses()
@@ -211,8 +359,8 @@ class CoupledL2Runner:
                 )
 
     def _counterexample_path(self) -> Optional[str]:
-        handoff = self._read_handoff("invoke_verification") or {}
-        value = (handoff.get("verification") or {}).get("counterexample_path")
+        result = self._read_stage_result("invoke_verification") or {}
+        value = result.get("trace_path")
         if not value:
             return None
         path = Path(value)
@@ -222,8 +370,47 @@ class CoupledL2Runner:
         stage3 = self.workspace.results_dir / "by_stage" / get_stage_spec("invoke_verification").directory_name
         stage4 = self.workspace.results_dir / "by_stage" / get_stage_spec("waveform_explanation").directory_name
         decode_input = stage3 / "trace_decode_input.json"
-        if decode_input.is_file():
-            materialize_diagnosis_artifacts(decode_input, stage4)
+        if not decode_input.is_file():
+            result_map = json.loads(
+                (stage3 / "property_result_map.json").read_text(encoding="utf-8")
+            )
+            package = json.loads(
+                (
+                    self.workspace.results_dir
+                    / "by_stage"
+                    / get_stage_spec("bind_properties").directory_name
+                    / "property_package.json"
+                ).read_text(encoding="utf-8")
+            )
+            failed = [
+                item
+                for item in result_map.get("primary_results", [])
+                if item.get("status") == "cex"
+            ]
+            observations = sorted({
+                observation
+                for item in package.get("witness_plan", {}).get("instances", [])
+                for observation in item.get("observer_requirements", [])
+            })
+            _write_json(
+                decode_input,
+                {
+                    "schema_version": "trace_decode_input.v1",
+                    "cycles": [],
+                    "signal_map": {},
+                    "required_observations": observations,
+                    "wait_edges": [],
+                    "properties": failed,
+                    "binding_ref": "../02_bind_properties/binding_manifest.json",
+                    "source_ref": "../02_bind_properties/property_package.json#traceability",
+                    "reconstruction_status": "exact_signal_map_unavailable",
+                    "uncertainty": (
+                        "No reviewed exact waveform signal map was supplied; "
+                        "transaction, state, and wait-chain records are intentionally empty."
+                    ),
+                },
+            )
+        materialize_diagnosis_artifacts(decode_input, stage4)
 
     def _read_diagnoses(self) -> list[Dict[str, Any]]:
         path = (
@@ -278,6 +465,13 @@ class CoupledL2Runner:
             / get_stage_spec("waveform_explanation").directory_name
             / "revision_request.json"
         )
+        _write_json(
+            path,
+            {
+                "schema_version": "revision_request.v2",
+                "requests": requests,
+            },
+        )
 
     def _revision_asset_hash(self, target: str, diagnosis: Dict[str, Any]) -> str:
         import hashlib
@@ -288,7 +482,8 @@ class CoupledL2Runner:
         elif target in {"formal_contract", "environment"}:
             path = self.workspace.results_dir / "preflight" / "formal_contract.json"
         else:
-            traceability = json.loads((stage2 / "assertion_traceability.json").read_text(encoding="utf-8"))
+            package = json.loads((stage2 / "property_package.json").read_text(encoding="utf-8"))
+            traceability = package["traceability"]
             prop = next(
                 item for item in traceability.get("properties", [])
                 if item.get("instance_id") == diagnosis.get("instance_id")
@@ -302,26 +497,47 @@ class CoupledL2Runner:
                 if asset_path.startswith(prefix) and Path(asset_path).stem.lower() == asset_id.lower()
             )
         return hashlib.sha256(path.read_bytes()).hexdigest()
-        _write_json(
-            path,
-            {
-                "schema_version": "revision_request.v2",
-                "requests": requests,
-            },
-        )
 
     def _diagnoses_allow_bugfix(self, diagnoses: list[Dict[str, Any]]) -> bool:
         stage2 = self.workspace.results_dir / "by_stage" / get_stage_spec("bind_properties").directory_name
         stage4 = self.workspace.results_dir / "by_stage" / get_stage_spec("waveform_explanation").directory_name
         evidence_path = stage4 / "diagnosis_evidence.json"
         review_ok = False
-        traceability = stage2 / "assertion_traceability.json"
-        if traceability.is_file():
-            payload = json.loads(traceability.read_text(encoding="utf-8"))
-            review_ok = bool(payload.get("properties")) and all(item.get("review_status") == "approved" for item in payload["properties"])
+        formal_review_ok = False
+        package_path = stage2 / "property_package.json"
+        if package_path.is_file():
+            package = json.loads(package_path.read_text(encoding="utf-8"))
+            review = package.get("review") or {}
+            review_ok = review.get("reviewer") == "codex" and review.get("review_status") == "approved"
+            formal_path = self.workspace.results_dir / "preflight" / "formal_contract.json"
+            if formal_path.is_file():
+                formal = json.loads(formal_path.read_text(encoding="utf-8"))
+                formal_review_ok = any(
+                    item.get("kind") == "formal_contract"
+                    and item.get("sha256") == formal.get("sha256")
+                    for item in review.get("assets", [])
+                )
+            result_map_path = (
+                self.workspace.results_dir
+                / "by_stage"
+                / get_stage_spec("invoke_verification").directory_name
+                / "property_result_map.json"
+            )
+            if result_map_path.is_file():
+                result_map = json.loads(
+                    result_map_path.read_text(encoding="utf-8")
+                )
+                review_ok = review_ok and (
+                    result_map.get("property_package_sha256")
+                    == file_sha256(package_path)
+                )
         evidence_properties = set()
+        reconstruction_complete = False
         if evidence_path.is_file():
             evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            reconstruction_complete = (
+                evidence.get("reconstruction_status") == "complete"
+            )
             evidence_properties = {
                 item.get("property") for item in evidence.get("properties", [])
             }
@@ -329,8 +545,11 @@ class CoupledL2Runner:
             design_bug_is_eligible(
                 item,
                 package_approved=review_ok,
-                formal_contract_approved=review_ok,
-                reconstruction_available=item.get("property") in evidence_properties,
+                formal_contract_approved=formal_review_ok,
+                reconstruction_available=(
+                    reconstruction_complete
+                    and item.get("property") in evidence_properties
+                ),
             )
             for item in diagnoses
         )
@@ -340,7 +559,7 @@ class CoupledL2Runner:
         if not path.is_file():
             return None
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("schema_version") != "stage_handoff.v1" or payload.get("stage") != stage:
+        if payload.get("schema_version") != "stage_handoff.v2" or payload.get("stage") != stage:
             raise ValueError(f"invalid {stage} handoff")
         return payload
 
@@ -376,15 +595,8 @@ class CoupledL2Runner:
 
     def _write_stage_failure(self, stage: str, stage_result: Dict[str, Any]) -> None:
         path = self._handoff_path(stage)
-        _write_json(path.with_name("stage_result.json"), stage_result)
-        _write_json(
-            path,
-            {
-                "schema_version": "stage_handoff.v1",
-                "stage": stage,
-                "success": False,
-                "error_kind": stage_result.get("error_kind"),
-            },
+        write_stage_outcome(
+            path.parent, get_stage_spec(stage), stage_result
         )
 
     def _bind_state_to_handoff(self, stage: str, state: Dict[str, Any]) -> None:
@@ -392,8 +604,10 @@ class CoupledL2Runner:
         if not path.is_file():
             raise ValueError(f"successful {stage} did not write handoff.json")
         handoff = json.loads(path.read_text(encoding="utf-8"))
-        handoff["workspace_hash"] = state["workspace_hash"]
-        handoff["index_hashes"] = state["index_hashes"]
+        handoff["source_state"] = {
+            "workspace_hash": state["workspace_hash"],
+            "index_hashes": state["index_hashes"],
+        }
         _write_json(path, handoff)
 
     def _handoff_path(self, stage: str) -> Path:
