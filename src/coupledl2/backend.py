@@ -22,6 +22,12 @@ from .property_catalog import load_property_profile
 from .rtl_property_labeler import label_rtl_properties
 from .workspace import CoupledL2Workspace
 from .artifacts import file_sha256
+from .result_contract import (
+    ResultContractError,
+    map_primary_results_to_operations,
+    reduce_property_result_map,
+    validate_operation_plan,
+)
 
 
 INCONCLUSIVE_STATUSES = {"undetermined", "unknown", "error"}
@@ -86,20 +92,24 @@ class CoupledL2BuildOperations:
             return {
                 "success": False,
                 "summary": "Stage 2 canonical property artifacts are missing",
-                "verification_passed": False,
                 "execution_status": "tool_error",
-                "verification_outcome": "not_run",
+                "formal_outcome": "not_run",
             }
         manifest = self._load_json(manifest_path)
         package = self._load_json(package_path)
         traceability = package.get("traceability")
         if not isinstance(traceability, dict):
             raise ValueError("property package has no traceability ledger")
+        operation_plan = package.get("operation_plan")
+        if not isinstance(operation_plan, dict):
+            raise ValueError("property package has no verification operation plan")
+        validate_operation_plan(operation_plan)
         catalog = load_property_profile(self.workspace.config.property_profile)
         build = self._run_build(self._stage_dir("invoke_verification"))
         if not build.get("success"):
             return self._finalize_stage3_without_tool(
                 traceability,
+                operation_plan,
                 reason="compilation_failed",
                 summary="Compilation failed",
                 build_result=build,
@@ -113,6 +123,7 @@ class CoupledL2BuildOperations:
         except ValueError as exc:
             return self._finalize_stage3_without_tool(
                 traceability,
+                operation_plan,
                 reason="rtl_relabelling_failed",
                 summary=f"deterministic RTL relabelling failed: {exc}",
                 build_result=build,
@@ -126,6 +137,7 @@ class CoupledL2BuildOperations:
         if actual_labels != expected_labels:
             result = self._finalize_stage3_without_tool(
                 traceability,
+                operation_plan,
                 reason="rtl_label_set_mismatch",
                 summary="rebuilt RTL property labels do not match Stage 2 traceability",
                 build_result=build,
@@ -137,6 +149,7 @@ class CoupledL2BuildOperations:
         if not prepared.get("success"):
             return self._finalize_stage3_without_tool(
                 traceability,
+                operation_plan,
                 reason="verification_input_preparation_failed",
                 summary=prepared.get("error", "failed to prepare verification inputs"),
                 build_result=build,
@@ -149,25 +162,19 @@ class CoupledL2BuildOperations:
             property_map = join_property_results(
                 traceability,
                 jaspergold_result,
+                operation_plan=operation_plan,
+                property_profile_id=self.workspace.config.property_profile,
+                property_package_sha256=file_sha256(package_path),
+                assertion_delta_sha256=file_sha256(delta_path),
             )
-        except ValueError as exc:
+        except (ValueError, ResultContractError) as exc:
             return {
                 "success": False,
                 "summary": f"JasperGold traceability join failed: {exc}",
-                "verification_passed": False,
                 "build_result": build,
                 "prepare_result": prepared,
                 "backend_result": formal,
             }
-        property_map["property_package_sha256"] = file_sha256(package_path)
-        property_map["assertion_delta_sha256"] = file_sha256(delta_path)
-        property_map["formal"] = {
-            key: jaspergold_result.get(key)
-            for key in (
-                "tool", "formal_contract_path", "formal_contract_sha256",
-                "timed_out", "summary",
-            )
-        }
         self._write_json(
             self._stage_dir("invoke_verification") / "property_result_map.json",
             property_map,
@@ -175,7 +182,6 @@ class CoupledL2BuildOperations:
         return {
             "success": formal.get("success", False),
             "summary": formal.get("summary", ""),
-            "verification_passed": formal.get("verification_passed", False),
             "output": formal.get("output", ""),
             "build_result": build,
             "prepare_result": prepared,
@@ -185,15 +191,16 @@ class CoupledL2BuildOperations:
             "trace_paths": formal.get("trace_paths", []),
             "trace_path": formal.get("trace_path"),
             "property_result_map": property_map,
-            "execution_status": formal.get("execution_status"),
-            "verification_outcome": formal.get("verification_outcome"),
-            "accounted_count": formal.get("accounted_count"),
-            "expected_count": formal.get("expected_count"),
+            "execution_status": property_map.get("execution_status"),
+            "formal_outcome": property_map.get("formal_outcome"),
+            "accounted_operation_count": property_map.get("accounted_operation_count"),
+            "expected_operation_count": property_map.get("expected_operation_count"),
         }
 
     def _finalize_stage3_without_tool(
         self,
         traceability: Dict[str, Any],
+        operation_plan: Dict[str, Any],
         *,
         reason: str,
         summary: str,
@@ -223,7 +230,7 @@ class CoupledL2BuildOperations:
             "primary_results": primary,
             "auxiliary_results": [],
             "execution_status": "tool_error",
-            "verification_outcome": "inconclusive",
+            "formal_outcome": "inconclusive",
             "expected_count": len(expected),
             "accounted_count": len(primary),
             "primary_proven_count": 0,
@@ -240,21 +247,15 @@ class CoupledL2BuildOperations:
         contract = self._load_formal_contract_artifact()
         formal["formal_contract_path"] = "../../preflight/formal_contract.json"
         formal["formal_contract_sha256"] = contract["sha256"]
-        property_map = join_property_results(traceability, formal)
         stage2_dir = self._stage_dir("bind_properties")
-        property_map["property_package_sha256"] = file_sha256(
-            stage2_dir / "property_package.json"
+        property_map = join_property_results(
+            traceability,
+            formal,
+            operation_plan=operation_plan,
+            property_profile_id=self.workspace.config.property_profile,
+            property_package_sha256=file_sha256(stage2_dir / "property_package.json"),
+            assertion_delta_sha256=file_sha256(stage2_dir / "assertion_delta.json"),
         )
-        property_map["assertion_delta_sha256"] = file_sha256(
-            stage2_dir / "assertion_delta.json"
-        )
-        property_map["formal"] = {
-            "tool": None,
-            "formal_contract_path": formal["formal_contract_path"],
-            "formal_contract_sha256": formal["formal_contract_sha256"],
-            "timed_out": False,
-            "summary": formal["summary"],
-        }
         stage_dir = self._stage_dir("invoke_verification")
         (stage_dir / "jaspergold.log").write_text(
             f"JasperGold was not launched: {reason}\n", encoding="utf-8"
@@ -279,9 +280,8 @@ class CoupledL2BuildOperations:
             encoding="utf-8",
         )
         return {
-            "success": False,
+            "success": True,
             "summary": summary,
-            "verification_passed": False,
             "output": build_result.get("output", ""),
             "build_result": build_result,
             "prepare_result": prepare_result,
@@ -291,10 +291,10 @@ class CoupledL2BuildOperations:
             "trace_paths": [],
             "trace_path": None,
             "property_result_map": property_map,
-            "execution_status": "tool_error",
-            "verification_outcome": "inconclusive",
-            "accounted_count": len(primary),
-            "expected_count": len(expected),
+            "execution_status": property_map["execution_status"],
+            "formal_outcome": property_map["formal_outcome"],
+            "accounted_operation_count": property_map["accounted_operation_count"],
+            "expected_operation_count": property_map["expected_operation_count"],
         }
 
     def run_baseline_build(
@@ -687,9 +687,6 @@ class CoupledL2BuildOperations:
         cex_count = parsed.get("primary_cex_count", 0)
         proven_count = parsed.get("primary_proven_count", 0)
         invalid_environment = bool(parsed.get("invalid_environment"))
-        verification_passed = (
-            parsed["verification_outcome"] == "proven" and not invalid_environment
-        )
         summary = parsed["summary"]
         if invalid_environment:
             summary = "Invalid formal environment: assumption consistency failed"
@@ -709,7 +706,6 @@ class CoupledL2BuildOperations:
                 and not invalid_environment
             ),
             "summary": summary,
-            "verification_passed": verification_passed,
             "output": output,
             "jaspergold_result": parsed,
             "cex_count": cex_count,
@@ -717,7 +713,7 @@ class CoupledL2BuildOperations:
             "trace_paths": cex_traces,
             "trace_path": cex_traces[0] if cex_traces else None,
             "execution_status": parsed["execution_status"],
-            "verification_outcome": parsed["verification_outcome"],
+            "formal_outcome": parsed["formal_outcome"],
             "accounted_count": parsed["accounted_count"],
             "expected_count": parsed["expected_count"],
         }
@@ -1109,8 +1105,10 @@ def account_expected_properties(
         reason: str
         if raw is not None:
             raw_status = str(raw.get("status") or "").lower()
-            if raw_status in {"proven", "bounded_proven", "unreachable"}:
+            if raw_status in {"proven", "bounded_proven"}:
                 status, reason = "proven", "tool_reported_proven"
+            elif raw_status == "unreachable":
+                status, reason = "unreachable", "tool_reported_unreachable"
             elif raw_status == "cex":
                 if raw.get("fst_file"):
                     status, reason = "cex", "tool_reported_cex"
@@ -1153,16 +1151,23 @@ def account_expected_properties(
 
     counts = {
         status: sum(item["status"] == status for item in primary_results)
-        for status in ("proven", "cex", "inconclusive", "not_run", "tool_error")
+        for status in (
+            "proven",
+            "cex",
+            "unreachable",
+            "inconclusive",
+            "not_run",
+            "tool_error",
+        )
     }
     if counts["cex"]:
-        verification_outcome = "cex"
+        formal_outcome = "cex"
     elif primary_results and counts["proven"] == len(primary_results):
-        verification_outcome = "proven"
+        formal_outcome = "all_proven"
     elif counts["not_run"] == len(primary_results):
-        verification_outcome = "not_run"
+        formal_outcome = "not_run"
     else:
-        verification_outcome = "inconclusive"
+        formal_outcome = "inconclusive"
     if returncode not in (0, None) or counts["tool_error"]:
         execution_status = "tool_error"
     elif outer_timed_out or returncode is None:
@@ -1171,6 +1176,7 @@ def account_expected_properties(
         execution_status = "completed"
     summary = (
         f"{counts['proven']} proven, {counts['cex']} cex, "
+        f"{counts['unreachable']} unreachable, "
         f"{counts['inconclusive']} inconclusive, {counts['not_run']} not_run, "
         f"{counts['tool_error']} tool_error "
         f"({len(primary_results)}/{len(expected)} accounted)"
@@ -1182,11 +1188,12 @@ def account_expected_properties(
         "accounted_count": len(primary_results),
         "primary_proven_count": counts["proven"],
         "primary_cex_count": counts["cex"],
+        "primary_unreachable_count": counts["unreachable"],
         "primary_inconclusive_count": counts["inconclusive"],
         "primary_not_run_count": counts["not_run"],
         "primary_tool_error_count": counts["tool_error"],
         "execution_status": execution_status,
-        "verification_outcome": verification_outcome,
+        "formal_outcome": formal_outcome,
         "timed_out": outer_timed_out or per_property_timeout,
         "summary": summary,
     }
@@ -1201,8 +1208,10 @@ def _account_streamed_property(
     raw = parsed.get("property_statuses", {}).get(expected["expected_property_id"])
     if raw:
         raw_status = str(raw.get("status") or "").lower()
-        if raw_status in {"proven", "bounded_proven", "unreachable"}:
+        if raw_status in {"proven", "bounded_proven"}:
             status, reason = "proven", "tool_reported_proven"
+        elif raw_status == "unreachable":
+            status, reason = "unreachable", "tool_reported_unreachable"
         elif raw_status == "cex":
             status, reason = "cex", "tool_reported_cex_pending_trace_collection"
         elif raw_status in INCONCLUSIVE_STATUSES:
@@ -1236,48 +1245,55 @@ def _runtime_seconds(value: Any) -> Optional[float]:
 def join_property_results(
     traceability: Dict[str, Any],
     jaspergold_report: Dict[str, Any],
+    *,
+    operation_plan: Dict[str, Any],
+    property_profile_id: str,
+    property_package_sha256: str,
+    assertion_delta_sha256: str,
 ) -> Dict[str, Any]:
-    """Join total primary results and auxiliary tool rows to traceability."""
+    """Join the exact primary assertion ledger into the V4 result contract."""
     primary = jaspergold_report.get("primary_results")
     auxiliary = jaspergold_report.get("auxiliary_results")
     if not isinstance(primary, list) or not isinstance(auxiliary, list):
         raise ValueError("formal report has no total primary result ledger")
-    primary_by_label = {
-        item.get("rtl_label"): item
-        for item in primary
-        if isinstance(item, dict) and isinstance(item.get("rtl_label"), str)
-    }
-    properties = []
-    expected_labels = []
+    instance_metadata: Dict[str, Dict[str, Any]] = {}
     for prop in traceability.get("properties", []):
-        records = []
-        for rtl in prop.get("rtl_properties", []):
-            label = rtl.get("rtl_label")
-            expected_labels.append(label)
-            if label not in primary_by_label:
-                raise ValueError(f"missing primary result for RTL label: {label}")
-            records.append(primary_by_label[label])
-        record = {
+        record: Dict[str, Any] = {
             key: prop[key]
             for key in ("instance_id", "property_schema_id", "template_id", "base_label")
+            if key in prop
         }
+        refs: Dict[str, Any] = {}
         for key in ("binding_manifest_path", "source", "protocol_rule"):
             if key in prop:
-                record[key] = prop[key]
-        record["primary_results"] = records
-        properties.append(record)
-    if set(expected_labels) != set(primary_by_label):
-        raise ValueError("primary result labels do not exactly match traceability")
-    return {
-        "schema_version": "property_result_map.v2",
-        "execution_status": jaspergold_report.get("execution_status"),
-        "verification_outcome": jaspergold_report.get("verification_outcome"),
-        "expected_count": jaspergold_report.get("expected_count"),
-        "accounted_count": jaspergold_report.get("accounted_count"),
-        "primary_results": primary,
-        "auxiliary_results": auxiliary,
-        "properties": properties,
-    }
+                refs[key] = prop[key]
+        if refs:
+            record["refs"] = refs
+        if isinstance(record.get("instance_id"), str):
+            instance_metadata[record["instance_id"]] = record
+    operation_results = map_primary_results_to_operations(operation_plan, primary)
+    return reduce_property_result_map(
+        operation_plan=operation_plan,
+        operation_results=operation_results,
+        property_profile_id=property_profile_id,
+        property_package_sha256=property_package_sha256,
+        assertion_delta_sha256=assertion_delta_sha256,
+        instance_metadata=instance_metadata,
+        execution_status_hint=jaspergold_report.get("execution_status"),
+        formal_metadata={
+            key: jaspergold_report.get(key)
+            for key in (
+                "tool",
+                "formal_contract_path",
+                "formal_contract_sha256",
+                "timed_out",
+                "summary",
+                "returncode",
+            )
+            if jaspergold_report.get(key) is not None
+        },
+        unmatched_tool_results=auxiliary,
+    )
 
 
 def _phase_failed(text: str, phase: str) -> bool:

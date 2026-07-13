@@ -16,8 +16,10 @@ JasperGold quality evaluator, and the Verilog-to-Chisel converter. Treat
   `bind_properties -> invoke_verification -> waveform_explanation`, with
   `propose_bugfix` as an explicit run-local proposal stage.
 - CoupledL2 run isolation under `runs/<timestamp>-<case>-<id>/`.
-- Stage-local context files, skills, rules, source snapshots, tool operation
-  ledgers, stage results, handoff files, and run cost summaries.
+- Stage-local context files, bounded model inputs, source snapshots, stage
+  results, hash-bound handoff files, and run cost summaries. Agent-only
+  operation/tool-result ledgers are produced where a stage actually uses the
+  generic agent loop.
 - Repository-owned property assets for CoupledL2: the model selects a strict
   `property_schema`, template, binding candidates, and bounded parameters; Python
   resolves indexed IDs, renders repository-owned templates, labels elaborated
@@ -169,8 +171,7 @@ The current checked-in configuration accepts `small` mode and
   --case CoupledL2-Verification/<case-name> \
   --property-profile write_read_poc \
   --full \
-  --max-tokens 160000 \
-  --max-repair-rounds 3
+  --max-tokens 160000
 ```
 
 Fresh runs can execute only `bind_properties` as a single stage; later stages
@@ -187,22 +188,26 @@ must resume a run whose predecessor handoff succeeded:
 If `invoke_verification` proves all assertions, the workflow stops without
 running counterexample diagnosis or repair.
 
-The current M0 property profiles are case-specific feasibility checks:
-`write_read_poc` targets `XiangShan-CoupledL2-write_read`, and
-`mshr_wait_bound_poc` targets `XiangShan-CoupledL2-deadlock-v0`. Their
-`review_status=not_reviewed` traceability means the generated results are
-candidate verification evidence, not final proof that the property semantics are
-manually approved.
+The current repository-owned property profiles are case-specific:
+
+- `write_read_poc` targets `XiangShan-CoupledL2-write_read`;
+- `mshr_wait_bound_poc`, `tilelink_gold_poc`, and
+  `tl_grant_probe_serialization_poc` target
+  `XiangShan-CoupledL2-deadlock-v0`.
+
+Each checked-in profile has a hash-bound review record with `reviewer: codex`
+and `review_status: approved`. This approves the repository asset version; it
+does not make a formal result successful or non-vacuous. Each run must still
+pass exact-property accounting, formal execution, and the semantic-evidence
+gate.
 
 ### Token, Tool-Result, and Workspace Boundaries
 
-During a normal agent turn, `complete_stage` remains the model-facing protocol
-for proposing that a stage is ready to finish. The workflow then validates the
-proposal with the stage's deterministic local gate. If the stage instead
-reaches its token or model-turn boundary, or context compaction cannot proceed,
-the workflow invokes that gate directly. This forced convergence path does not
-send a final `complete_stage` LLM request and records either `completed` or
-`completion_gate_failed` with its trigger and missing evidence.
+For the active CoupledL2 flow, this generic agent protocol applies to Stage 4
+diagnosis. Stage 2 uses the narrower `submit_binding_manifest` contract, Stage
+3 has no model turn, and Stage 5 uses the narrower
+`submit_repair_proposal` contract. Where `complete_stage` is available, the
+workflow validates it with the deterministic local gate.
 
 Every model tool result has two views:
 
@@ -212,7 +217,8 @@ Every model tool result has two views:
   is added to model history. Agent stages limit one visible result to 6,000
   estimated tokens and one turn's combined results to 10,000 estimated tokens.
 
-Workspace access applies separate discovery, explicit-read, and write rules.
+Agent-stage workspace access applies separate discovery, explicit-read, and
+write rules.
 `list_files` is shallow and bounded by default, and recursive discovery plus
 `rg` exclude system caches, build outputs such as `out/` and `target/`, and
 generated output. Explicit bounded browsing or text reads can still inspect
@@ -222,8 +228,9 @@ build output, or workflow control artifacts return a structured
 `path_policy_denied` result.
 
 FLASH context compaction and the shared PRO/FLASH run token ledger remain in
-effect for ordinary model work. Tool-result limiting occurs before compaction,
-so raw results never enter model history.
+effect for generic agent work. Tool-result limiting occurs before compaction,
+so raw results never enter model history. The bounded Stage 2 manifest call and
+deterministic Stage 3 do not use that generic loop.
 
 ### Resume A Verified Handoff
 
@@ -268,32 +275,37 @@ results/by_stage/04_waveform_explanation/
 results/by_stage/05_propose_bugfix/
 ```
 
-Each stage directory may contain:
+Agent stage directories may contain:
 
 ```text
-stage_inputs.json              # stable input contract for the stage
 operations.jsonl               # model tool operations for agent stages
 tool_results/                  # complete raw JSON results referenced by bounded views
 context_compactions.jsonl      # FLASH compaction attempts and budget decisions
 stage_events.jsonl             # machine-readable stage events
-stage_result.json              # normalized stage result
-handoff.json                   # compact downstream-stage contract
 source_snapshot/               # source snapshots used by deterministic render/audit
 snapshot_manifest_before.json
 snapshot_manifest_after.json
+```
+
+Every active stage instead has the following common completion records:
+
+```text
+stage_result.json              # normalized result plus artifact contract
+handoff.json                   # artifact paths and hashes only
 ```
 
 Stage-specific artifacts include:
 
 | Stage | Typical artifacts |
 |---|---|
-| `bind_properties` | `stage_inputs.json`, `binding_manifest.json`, `property_package.json`, `assertion_delta.json`, `semantic_evidence.json`, render/build audit files |
-| `invoke_verification` | `verify.tcl`, `property_result_map.json`, `proof_events.jsonl`, `jaspergold.log`, traces |
+| `bind_properties` | `stage_inputs.json`, `binding_manifest.json`, `property_package.json` (including the V4 operation/observation contracts), `assertion_delta.json`, render/build audit files |
+| `invoke_verification` | `property_result_map.json` (V4), `semantic_evidence.json`, `proof_events.jsonl`, `jaspergold.log`, traces |
 | `waveform_explanation` | `transaction_trace.json`, `state_trace.json`, `wait_chain.json`, `diagnosis_evidence.json`, `diagnosis.json`, `counterexample_analysis.md` |
 | `propose_bugfix` | unapplied `repair_proposal.json`, `repair_proposal.patch` |
 
-Downstream stages read earlier `handoff.json` files through
-`stage_inputs.json`; successful Stage 2 rendering refreshes the indexes and
+Downstream stages validate earlier `handoff.json` files before execution;
+bounded predecessor references may also be included in an agent stage's
+`stage_inputs.json`. Successful Stage 2 rendering refreshes the indexes and
 binds workspace/index hashes into the handoff. Every successful stage is
 validated against the single `StageSpec.artifact_contract`, and handoffs store
 only artifact paths and hashes. `run_cost_summary.json` aggregates
@@ -437,30 +449,31 @@ after publishing:
 
 ## Development Checks
 
-For repository-level Python checks, prefer the repo-owned tests:
+The complete repository test tree includes legacy workflow coverage and is not
+currently a clean acceptance signal for the simplified CoupledL2 flow. It can
+still be run for migration work with:
 
 ```bash
-pytest -q tests
+rtk codex-run pytest -q tests
 ```
 
-For focused CoupledL2 checks:
+For the active simplified CoupledL2 contract:
 
 ```bash
-pytest -q \
-  tests/test_coupledl2_initialization.py \
-  tests/test_coupledl2_backend.py \
-  tests/test_coupledl2_commit3_context_tools.py \
-  tests/test_coupledl2_commit4_acceptance.py \
-  tests/test_coupledl2_runner.py \
-  tests/test_optimization_p0.py \
-  tests/test_optimization_p1.py \
-  tests/test_optimization_p2.py
+rtk codex-run pytest -q tests/test_coupledl2_simplification.py
 ```
+
+The broader test tree still contains historical CoupledL2 tests for retired
+`write_assertions`, `property_category`, campaign, AutoVerify patching, and old
+artifact/handoff contracts. Do not restore those production interfaces merely
+to satisfy the historical tests; rewrite or remove the tests when migrating
+that older coverage.
 
 Syntax-check edited Python modules with:
 
 ```bash
-python -m py_compile main.py src/core/*.py src/coupledl2/*.py
+rtk codex-run python -m compileall -q src/core src/coupledl2
+git diff --check
 ```
 
 Avoid bare repo-root `pytest` if this checkout contains unrelated external

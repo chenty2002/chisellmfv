@@ -73,12 +73,50 @@ def validate_research_protocol(value: Dict[str, Any]) -> None:
     if execution.get("per_property_timeout_s", 0) <= 0 or not execution.get("tool_version"):
         raise ResearchProtocolError("tool version and positive proof budget must be frozen")
     accounting = value["result_accounting"]
-    required_states = {
-        "proven", "cex", "inconclusive", "timeout", "missing", "invalid",
-        "vacuous", "environment_excluded", "not_applicable", "tool_error",
+    required_operation_statuses = {
+        "proven", "cex", "covered", "unreachable", "inconclusive", "not_run", "tool_error",
     }
-    if not required_states <= set(accounting["reported_statuses"]):
-        raise ResearchProtocolError("result accounting omits a required status")
+    required_execution_statuses = {"completed", "partial", "tool_error"}
+    required_formal_outcomes = {"all_proven", "cex", "inconclusive", "not_run"}
+    required_semantic_statuses = {"eligible", "ineligible", "inconclusive"}
+    required_experiment_statuses = {"eligible", "excluded", "invalid"}
+    required_exclusion_reasons = {
+        "formal_counterexample",
+        "formal_inconclusive",
+        "formal_not_run",
+        "primary_operation_incomplete",
+        "trigger_cover_not_run",
+        "trigger_cover_failed",
+        "observer_cover_not_run",
+        "observer_cover_failed",
+        "state_cover_not_run",
+        "state_cover_failed",
+        "assumption_sat_not_run",
+        "assumption_sat_failed",
+        "negative_oracle_not_run",
+        "negative_oracle_failed",
+        "trace_decode_unavailable",
+        "operation_set_mismatch",
+        "execution_incomplete",
+    }
+    if set(accounting.get("operation_statuses", [])) != required_operation_statuses:
+        raise ResearchProtocolError("result accounting omits or changes an operation status")
+    if set(accounting.get("reported_statuses", [])) != required_operation_statuses:
+        raise ResearchProtocolError("reported statuses must be the canonical operation statuses")
+    if set(accounting.get("execution_statuses", [])) != required_execution_statuses:
+        raise ResearchProtocolError("result accounting has an invalid execution status set")
+    if set(accounting.get("formal_outcomes", [])) != required_formal_outcomes:
+        raise ResearchProtocolError("result accounting has an invalid formal outcome set")
+    if set(accounting.get("semantic_statuses", [])) != required_semantic_statuses:
+        raise ResearchProtocolError("result accounting has an invalid semantic status set")
+    if set(accounting.get("experiment_statuses", [])) != required_experiment_statuses:
+        raise ResearchProtocolError("result accounting has an invalid experiment status set")
+    if set(accounting.get("exclusion_reasons", [])) != required_exclusion_reasons:
+        raise ResearchProtocolError("result accounting has an invalid exclusion reason set")
+    if set(accounting.get("denominators", {})) != {"requested", "accounted", "semantic", "experiment"}:
+        raise ResearchProtocolError("result accounting must freeze all denominators")
+    if accounting.get("stage_success_is_execution_only") is not True:
+        raise ResearchProtocolError("stage success must be separate from proof and experiment status")
     if accounting.get("drop_missing_or_inconclusive") is not False:
         raise ResearchProtocolError("missing and inconclusive results must remain in denominators")
     if value["statistics"].get("confidence_interval") != "bootstrap_95_percent":

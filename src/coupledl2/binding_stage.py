@@ -30,7 +30,12 @@ from .artifacts import (
 from .property_compiler import (
     build_witness_plan,
     compile_manifest,
-    initial_semantic_evidence,
+)
+from .result_contract import (
+    bind_operation_plan_to_package,
+    build_primary_operation_plan,
+    build_unmaterialized_observation_map,
+    canonical_sha256,
 )
 
 
@@ -151,7 +156,6 @@ class BindingStage:
                 "binding_manifest_path": "binding_manifest.json",
                 "property_package_path": "property_package.json",
                 "assertion_delta_path": "assertion_delta.json",
-                "semantic_evidence_path": "semantic_evidence.json",
                 "rtl_property_count": len(rtl_properties),
             }
             result = write_stage_outcome(
@@ -432,6 +436,13 @@ class BindingStage:
                 **record,
                 "expected_property_id": f"{top_module}.{label}" if top_module else None,
             })
+        expected_by_label = {
+            item["rtl_label"]: item["expected_property_id"]
+            for item in delta_records
+        }
+        for trace_record in traceability["properties"]:
+            for rtl_record in trace_record["rtl_properties"]:
+                rtl_record["expected_property_id"] = expected_by_label[rtl_record["rtl_label"]]
         baseline_scan_path = (
             self.workspace.results_dir / "preflight" / "generated_assertion_scan.json"
         )
@@ -450,8 +461,12 @@ class BindingStage:
             )
         certificate = compile_manifest(manifest, self.catalog, rtl_properties=records)
         witness_plan = build_witness_plan(manifest, self.catalog)
+        operation_plan = build_primary_operation_plan(
+            traceability,
+            package_sha256="0" * 64,
+        )
         property_package = {
-            "schema_version": "property_package.v1",
+            "schema_version": "property_package.v2",
             "property_profile_id": self.catalog.profile["property_profile_id"],
             "binding_manifest": {
                 "path": "binding_manifest.json",
@@ -479,13 +494,31 @@ class BindingStage:
             ],
             "compilation_certificate": certificate,
             "witness_plan": witness_plan,
+            "semantic_requirements": {
+                "required_roles": [
+                    "trigger_cover",
+                    "observer_cover",
+                    "state_cover",
+                    "assumption_sat",
+                    "negative_oracle",
+                ],
+                "status": "declared_not_executed",
+            },
+            "operation_plan": operation_plan,
+            "package_semantics_sha256": "",
+            "observation_map": build_unmaterialized_observation_map(
+                top_module=top_module,
+                package_sha256="0" * 64,
+                reason="Iteration 0 freezes the observation contract without elaboration-time signal mapping",
+            ),
             "traceability": traceability,
         }
+        property_package = bind_operation_plan_to_package(property_package)
         _write_json(self.stage_dir / "property_package.json", property_package)
         _write_json(
             self.stage_dir / "assertion_delta.json",
             {
-                "schema_version": "assertion_delta.v1",
+                "schema_version": "assertion_delta.v2",
                 "property_profile_id": self.catalog.profile["property_profile_id"],
                 "instance_ids": [item["instance_id"] for item in manifest["instances"]],
                 "base_labels": [item["base_label"] for item in manifest["instances"]],
@@ -502,15 +535,15 @@ class BindingStage:
                 "property_package_sha256": file_sha256(
                     self.stage_dir / "property_package.json"
                 ),
+                "operation_plan_sha256": canonical_sha256(property_package["operation_plan"]),
+                "operation_ids": [
+                    item["operation_id"] for item in property_package["operation_plan"]["operations"]
+                ],
                 "rtl_properties": delta_records,
                 "rtl_property_count": len(delta_records),
                 "baseline_label_overlap": [],
             },
         )
-        semantic_evidence = initial_semantic_evidence(
-            self.catalog, certificate
-        )
-        _write_json(self.stage_dir / "semantic_evidence.json", semantic_evidence)
         self._snapshot_source(target, "after")
 
     def _snapshot_source(self, target: Path, phase: str) -> None:

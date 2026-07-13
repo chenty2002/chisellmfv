@@ -64,7 +64,6 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
             "binding_manifest.json",
             "property_package.json",
             "assertion_delta.json",
-            "semantic_evidence.json",
             "render_result.json",
             "assertion_diff.patch",
             "build_result.json",
@@ -91,6 +90,7 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         completion_gate="property_result_map",
         artifact_contract=(
             "property_result_map.json",
+            "semantic_evidence.json",
             "proof_events.jsonl",
             "jaspergold.log",
         ),

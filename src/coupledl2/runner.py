@@ -18,12 +18,13 @@ from .artifacts import (
     validate_completed_stage,
     write_stage_outcome,
 )
-from .non_vacuity import (
-    apply_non_vacuity_evidence,
-    build_runtime_non_vacuity_evidence,
+from .result_contract import (
+    ResultContractError,
+    build_semantic_evidence,
+    validate_operation_plan,
+    validate_property_result_map,
 )
 from .revision import design_bug_is_eligible
-from .transaction_reconstructor import materialize_diagnosis_artifacts
 from ..core.records import (
     build_run_cost_summary,
     merge_run_cost_summaries,
@@ -117,85 +118,94 @@ class CoupledL2Runner:
         package = json.loads(
             (stage2_dir / "property_package.json").read_text(encoding="utf-8")
         )
-        semantic_path = stage2_dir / "semantic_evidence.json"
-        semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
-        witness_plan = package["witness_plan"]
-        runtime_evidence = build_runtime_non_vacuity_evidence(
-            witness_plan, property_map
-        )
-        updated_semantic = apply_non_vacuity_evidence(
-            semantic, witness_plan, runtime_evidence
-        )
-        _write_json(semantic_path, updated_semantic)
-        property_map["schema_version"] = "property_result_map.v3"
-        property_map["non_vacuity"] = {
-            "semantic_evidence_path": "../02_bind_properties/semantic_evidence.json",
-            "semantic_evidence_sha256": file_sha256(semantic_path),
-            "experiment_eligible": updated_semantic["experiment_eligible"],
-            "instances": [
+        operation_plan = package.get("operation_plan")
+        try:
+            validate_operation_plan(operation_plan)
+            validate_property_result_map(property_map, operation_plan=operation_plan)
+        except (ResultContractError, TypeError) as exc:
+            result = write_stage_outcome(
+                stage_dir,
+                spec,
                 {
-                    "instance_id": item["instance_id"],
-                    "status": item["non_vacuity"],
-                    "reason": item["non_vacuity_reason"],
-                }
-                for item in updated_semantic["instances"]
-            ],
-        }
+                    "schema_version": "stage_result.v2",
+                    "stage": spec.name,
+                    "success": False,
+                    "termination_reason": "deterministic_verification_failed",
+                    "error_kind": "invalid_v4_result_contract",
+                    "summary": str(exc),
+                    "model_calls": 0,
+                },
+            )
+            return {"success": False, "stage_result": result}
+
         _write_json(stage_dir / "property_result_map.json", property_map)
-
-        previous_handoff = self._read_handoff("bind_properties") or {}
-        stage2_result = self._read_stage_result("bind_properties")
-        if stage2_result is None:
-            raise ValueError("Stage 2 result disappeared before semantic update")
-        write_stage_outcome(
-            stage2_dir,
-            get_stage_spec("bind_properties"),
-            stage2_result,
-            source_state=previous_handoff.get("source_state"),
+        result_map_sha256 = file_sha256(stage_dir / "property_result_map.json")
+        semantic = build_semantic_evidence(
+            property_map,
+            property_result_map_sha256=result_map_sha256,
         )
-
-        trace_paths = [
-            item["trace_path"]
-            for item in property_map.get("primary_results", [])
-            if item.get("status") == "cex" and item.get("trace_path")
+        _write_json(stage_dir / "semantic_evidence.json", semantic)
+        if not (stage_dir / "jaspergold.log").is_file():
+            (stage_dir / "jaspergold.log").write_text(
+                str(backend_result.get("summary") or "deterministic verification completed") + "\n",
+                encoding="utf-8",
+            )
+        if not (stage_dir / "proof_events.jsonl").is_file():
+            operations = [
+                operation
+                for instance in property_map.get("instances", [])
+                for operation in instance.get("operations", [])
+            ]
+            (stage_dir / "proof_events.jsonl").write_text(
+                "".join(
+                    json.dumps(
+                        {"schema_version": "proof_event.v1", "event": "property_finalized", "sequence": index, **item},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                    for index, item in enumerate(operations)
+                ),
+                encoding="utf-8",
+            )
+        cex_work_items = property_map.get("cex_work_items", [])
+        primary_operations = [
+            item
+            for instance in property_map.get("instances", [])
+            for item in instance.get("operations", [])
+            if item.get("role") == "primary_assertion"
         ]
-        success = backend_result.get("success") is True
         result = write_stage_outcome(
             stage_dir,
             spec,
             {
                 "schema_version": "stage_result.v2",
                 "stage": spec.name,
-                "success": success,
-                "termination_reason": (
-                    "deterministic_verification_completed"
-                    if success
-                    else "deterministic_verification_failed"
-                ),
+                "success": True,
+                "termination_reason": "deterministic_verification_completed",
                 "summary": backend_result.get("summary"),
                 "model_calls": 0,
-                "verification_passed": backend_result.get("verification_passed"),
-                "verification_outcome": property_map.get("verification_outcome"),
                 "execution_status": property_map.get("execution_status"),
-                "expected_count": property_map.get("expected_count"),
-                "accounted_count": property_map.get("accounted_count"),
-                "cex_count": sum(
-                    item.get("status") == "cex"
-                    for item in property_map.get("primary_results", [])
-                ),
-                "proven_count": sum(
-                    item.get("status") == "proven"
-                    for item in property_map.get("primary_results", [])
-                ),
-                "trace_paths": trace_paths,
-                "trace_path": trace_paths[0] if trace_paths else None,
-                "property_result_map_path": "property_result_map.json",
-                "non_vacuity_experiment_eligible": updated_semantic[
-                    "experiment_eligible"
+                "formal_outcome": property_map.get("formal_outcome"),
+                "semantic_status": property_map.get("semantic_status"),
+                "experiment_status": property_map.get("experiment_status"),
+                "exclusion_reasons": property_map.get("exclusion_reasons", []),
+                "operation_set_complete": property_map.get("operation_set_complete"),
+                "expected_operation_count": property_map.get("expected_operation_count"),
+                "accounted_operation_count": property_map.get("accounted_operation_count"),
+                "cex_count": sum(item.get("status") == "cex" for item in primary_operations),
+                "proven_count": sum(item.get("status") == "proven" for item in primary_operations),
+                "trace_paths": [
+                    item.get("trace_path")
+                    for item in cex_work_items
+                    if item.get("trace_path")
                 ],
+                "cex_work_items": cex_work_items,
+                "property_result_map_path": "property_result_map.json",
+                "semantic_evidence_path": "semantic_evidence.json",
             },
         )
-        return {"success": success, "stage_result": result}
+        return {"success": True, "stage_result": result}
 
     def run(
         self,
@@ -288,9 +298,14 @@ class CoupledL2Runner:
 
             if current_stage == "invoke_verification":
                 self.last_verification_result = detail
-                if detail.get("verification_passed"):
+                if detail.get("formal_outcome") == "all_proven":
                     break
-                if detail.get("verification_outcome") != "cex":
+                if detail.get("formal_outcome") != "cex":
+                    break
+                if not any(
+                    item.get("diagnosis_readiness") == "ready"
+                    for item in detail.get("cex_work_items", [])
+                ):
                     break
             if current_stage == "waveform_explanation":
                 diagnoses = self._read_diagnoses()
@@ -304,7 +319,24 @@ class CoupledL2Runner:
             "success": success,
             "completed_stage": completed_stage,
             "resumed": self.resumed,
+            "execution_status": "not_run",
+            "formal_outcome": "not_run",
+            "semantic_status": "inconclusive",
+            "experiment_status": "excluded",
         }
+        verification = next(
+            (item for item in reversed(stage_results) if item.get("stage") == "invoke_verification"),
+            None,
+        )
+        if verification:
+            for key in (
+                "execution_status",
+                "formal_outcome",
+                "semantic_status",
+                "experiment_status",
+            ):
+                if verification.get(key) is not None:
+                    summary[key] = verification[key]
         self._write_cost_summary(stage_results)
         self._write_final_result(summary, stage_results)
         return summary
@@ -347,10 +379,19 @@ class CoupledL2Runner:
             raise ValueError(f"{stage} requires a successful {predecessor} handoff")
         if stage == "waveform_explanation":
             verification = completed
-            if verification.get("verification_passed") is True:
+            if verification.get("formal_outcome") == "all_proven":
                 raise ValueError("waveform_explanation cannot run after all properties were proven")
-            if not verification.get("trace_path"):
-                raise ValueError("waveform_explanation requires a counterexample path")
+            if verification.get("formal_outcome") != "cex":
+                raise ValueError("waveform_explanation requires a formal counterexample")
+            ready_cex = [
+                item
+                for item in verification.get("cex_work_items", [])
+                if item.get("diagnosis_readiness") == "ready"
+            ]
+            if not ready_cex:
+                raise ValueError(
+                    "waveform_explanation requires at least one decode-ready counterexample"
+                )
         if stage == "propose_bugfix":
             diagnoses = self._read_diagnoses()
             if not self._diagnoses_allow_bugfix(diagnoses):
@@ -360,57 +401,28 @@ class CoupledL2Runner:
 
     def _counterexample_path(self) -> Optional[str]:
         result = self._read_stage_result("invoke_verification") or {}
-        value = result.get("trace_path")
+        value = next(
+            (
+                item.get("trace_path")
+                for item in result.get("cex_work_items", [])
+                if item.get("diagnosis_readiness") == "ready" and item.get("trace_path")
+            ),
+            None,
+        )
         if not value:
             return None
         path = Path(value)
         return str(path if path.is_absolute() else self.workspace.run_dir / path)
 
     def _materialize_trace_evidence(self) -> None:
-        stage3 = self.workspace.results_dir / "by_stage" / get_stage_spec("invoke_verification").directory_name
-        stage4 = self.workspace.results_dir / "by_stage" / get_stage_spec("waveform_explanation").directory_name
-        decode_input = stage3 / "trace_decode_input.json"
-        if not decode_input.is_file():
-            result_map = json.loads(
-                (stage3 / "property_result_map.json").read_text(encoding="utf-8")
-            )
-            package = json.loads(
-                (
-                    self.workspace.results_dir
-                    / "by_stage"
-                    / get_stage_spec("bind_properties").directory_name
-                    / "property_package.json"
-                ).read_text(encoding="utf-8")
-            )
-            failed = [
-                item
-                for item in result_map.get("primary_results", [])
-                if item.get("status") == "cex"
-            ]
-            observations = sorted({
-                observation
-                for item in package.get("witness_plan", {}).get("instances", [])
-                for observation in item.get("observer_requirements", [])
-            })
-            _write_json(
-                decode_input,
-                {
-                    "schema_version": "trace_decode_input.v1",
-                    "cycles": [],
-                    "signal_map": {},
-                    "required_observations": observations,
-                    "wait_edges": [],
-                    "properties": failed,
-                    "binding_ref": "../02_bind_properties/binding_manifest.json",
-                    "source_ref": "../02_bind_properties/property_package.json#traceability",
-                    "reconstruction_status": "exact_signal_map_unavailable",
-                    "uncertainty": (
-                        "No reviewed exact waveform signal map was supplied; "
-                        "transaction, state, and wait-chain records are intentionally empty."
-                    ),
-                },
-            )
-        materialize_diagnosis_artifacts(decode_input, stage4)
+        """Leave trace decoding to the V4 trace contracts.
+
+        Iteration 0 intentionally has no elaboration-time observation map.  It
+        therefore must not synthesize the retired empty ``signal_map`` input.
+        A future Stage 4 invocation consumes the ready per-CEX contracts
+        directly.
+        """
+        return
 
     def _read_diagnoses(self) -> list[Dict[str, Any]]:
         path = (

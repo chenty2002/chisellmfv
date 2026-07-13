@@ -20,8 +20,7 @@ from .property_ir import semantic_review_completeness, structural_completeness
 ASSET_ROOT = Path(__file__).with_name("property_assets")
 SCHEMA_ROOT = ASSET_ROOT / "schemas"
 PRIMARY_STATUSES = {
-    "proven", "cex", "inconclusive", "timeout", "not_run", "tool_error",
-    "vacuous", "environment_excluded", "not_applicable", "invalid",
+    "proven", "cex", "covered", "unreachable", "inconclusive", "not_run", "tool_error",
 }
 REQUIRED_EXPERIMENT_CASES = (
     "XiangShan-CoupledL2-deadlock-v0",
@@ -97,7 +96,7 @@ def _load_runs(run_dirs: Iterable[Path | str]) -> List[Dict[str, Any]]:
             "result_map": _read_artifact(results / "by_stage/03_invoke_verification/property_result_map.json"),
             "diagnosis": _read_artifact(results / "by_stage/04_waveform_explanation/diagnosis.json"),
             "diagnosis_evidence": _read_artifact(results / "by_stage/04_waveform_explanation/diagnosis_evidence.json"),
-            "semantic_evidence": _read_artifact(results / "by_stage/02_bind_properties/semantic_evidence.json"),
+            "semantic_evidence": _read_artifact(results / "by_stage/03_invoke_verification/semantic_evidence.json"),
         }
         revision_files = sorted(results.rglob("revision_outcome.json")) if results.is_dir() else []
         manifest_artifact = _read_artifact(run_dir / "manifest.json")
@@ -167,6 +166,8 @@ def _property_coverage(runs: List[Dict[str, Any]], schemas: Mapping[str, Dict[st
         semantic_artifact = run["artifacts"]["semantic_evidence"]
         semantic_by_instance = {}
         independent_gold = {"status": "not_adjudicated"}
+        semantic_status = "inconclusive"
+        experiment_status = "excluded"
         if semantic_artifact["state"] == "present" and isinstance(semantic_artifact["value"], dict):
             semantic_by_instance = {
                 entry.get("instance_id"): entry
@@ -176,6 +177,8 @@ def _property_coverage(runs: List[Dict[str, Any]], schemas: Mapping[str, Dict[st
             independent_gold = semantic_artifact["value"].get(
                 "independent_gold_label", independent_gold
             )
+            semantic_status = semantic_artifact["value"].get("semantic_status", semantic_status)
+            experiment_status = semantic_artifact["value"].get("experiment_status", experiment_status)
         for item in properties:
             if not isinstance(item, dict):
                 artifact_states["invalid_property"] += 1
@@ -203,7 +206,10 @@ def _property_coverage(runs: List[Dict[str, Any]], schemas: Mapping[str, Dict[st
                     "template_id": item.get("template_id"),
                     "approved_by_codex": review_status == "approved",
                     "review_status": review_status,
-                    "experiment_eligible": bool(instance_evidence.get("experiment_eligible")),
+                    "semantic_status": instance_evidence.get("semantic_verdict", {}).get("status", semantic_status),
+                    "experiment_status": experiment_status,
+                    "experiment_eligible": experiment_status == "eligible"
+                    and instance_evidence.get("semantic_verdict", {}).get("status") == "eligible",
                     "independent_gold_status": independent_gold.get("status", "not_adjudicated"),
                     "layer": semantic.get("layer"),
                     "channels": channels if isinstance(channels, list) else [],
@@ -399,6 +405,8 @@ def _generation_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _formal_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
     records, states = [], Counter()
+    operation_denominators = Counter()
+    instance_denominators = Counter()
     for run in runs:
         artifacts = run["artifacts"]
         result_map = artifacts["result_map"]
@@ -406,16 +414,71 @@ def _formal_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         result_payload = result_map["value"] if result_map["state"] == "present" else {}
         states[f"result_map_{result_map['state']}"] += 1
         by_label = {}
+        instance_by_operation = {}
         if isinstance(result_payload, dict):
-            for item in result_payload.get("primary_results", []):
-                if isinstance(item, dict) and isinstance(item.get("rtl_label"), str):
-                    by_label[item["rtl_label"]] = item
+            if result_payload.get("schema_version") == "property_result_map.v4":
+                trace_value = artifacts["traceability"].get("value")
+                trace_properties = trace_value.get("properties", []) if isinstance(trace_value, dict) else []
+                label_by_property_id = {
+                    item.get("expected_property_id"): item.get("rtl_label")
+                    for prop in trace_properties
+                    if isinstance(prop, dict)
+                    for item in prop.get("rtl_properties", [])
+                    if isinstance(item, dict)
+                    and isinstance(item.get("expected_property_id"), str)
+                    and isinstance(item.get("rtl_label"), str)
+                }
+                for instance in result_payload.get("instances", []):
+                    if not isinstance(instance, dict):
+                        continue
+                    semantic_verdict = instance.get("semantic_verdict", {})
+                    instance_denominators["instances"] += 1
+                    instance_denominators[
+                        f"semantic_{semantic_verdict.get('status', 'inconclusive')}"
+                    ] += 1
+                    if (
+                        semantic_verdict.get("status") == "eligible"
+                        and result_payload.get("experiment_status") == "eligible"
+                    ):
+                        instance_denominators["experiment_eligible"] += 1
+                    for item in instance.get("operations", []):
+                        if item.get("role") != "primary_assertion":
+                            continue
+                        label = label_by_property_id.get(item.get("rtl_property_id"))
+                        if label:
+                            by_label[label] = item
+                            instance_by_operation[item.get("operation_id")] = semantic_verdict
+                operation_denominators["requested"] += int(
+                    result_payload.get("expected_operation_count", 0)
+                )
+                operation_denominators["accounted"] += int(
+                    result_payload.get("accounted_operation_count", 0)
+                )
         for label in expected:
             item = by_label.pop(label, None)
             status = item.get("status") if isinstance(item, dict) else "missing"
             if status not in PRIMARY_STATUSES:
                 status = "missing"
-            records.append(_formal_record(run["run_id"], label, status, item, result_map))
+            semantic_verdict = (
+                instance_by_operation.get(item.get("operation_id"), {})
+                if isinstance(item, dict)
+                else {}
+            )
+            records.append(
+                _formal_record(
+                    run["run_id"],
+                    label,
+                    status,
+                    item,
+                    result_map,
+                    semantic_verdict=semantic_verdict,
+                    experiment_status=(
+                        result_payload.get("experiment_status")
+                        if isinstance(result_payload, dict)
+                        else "excluded"
+                    ),
+                )
+            )
         for label, item in sorted(by_label.items()):
             records.append(_formal_record(run["run_id"], label, "unexpected", item, result_map))
     counts = Counter(record["status"] for record in records)
@@ -426,6 +489,15 @@ def _formal_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "denominators": {
             "runs_requested": len(runs),
             "expected_primary_properties": sum(record["status"] != "unexpected" for record in records),
+            "requested_operations": operation_denominators["requested"],
+            "accounted_operations": operation_denominators["accounted"],
+            "semantic_instances": instance_denominators["instances"],
+            "semantic_eligible_instances": instance_denominators["semantic_eligible"],
+            "experiment_eligible_instances": instance_denominators[
+                "experiment_eligible"
+            ],
+            "experiment_excluded_instances": instance_denominators["instances"]
+            - instance_denominators["experiment_eligible"],
             "result_map_runs": states["result_map_present"],
             "counterexamples": len(cex_records),
         },
@@ -438,11 +510,34 @@ def _formal_metrics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "runtime_s_total": runtime,
         "records": records,
         "artifact_states": dict(sorted(states.items())),
+        "status_layers": [
+            {
+                "run_id": run["run_id"],
+                **{
+                    key: run["artifacts"]["result_map"]["value"].get(key)
+                    for key in ("execution_status", "formal_outcome", "semantic_status", "experiment_status")
+                },
+            }
+            for run in runs
+            if run["artifacts"]["result_map"]["state"] == "present"
+            and isinstance(run["artifacts"]["result_map"]["value"], dict)
+        ],
     }
 
 
-def _formal_record(run_id: str, label: str, status: str, item: Optional[Dict[str, Any]], result_map: Dict[str, Any]) -> Dict[str, Any]:
+def _formal_record(
+    run_id: str,
+    label: str,
+    status: str,
+    item: Optional[Dict[str, Any]],
+    result_map: Dict[str, Any],
+    *,
+    semantic_verdict: Optional[Mapping[str, Any]] = None,
+    experiment_status: str = "excluded",
+) -> Dict[str, Any]:
     item = item or {}
+    semantic_verdict = semantic_verdict or {}
+    semantic_status = semantic_verdict.get("status", "inconclusive")
     return {
         "run_id": run_id,
         "rtl_label": label,
@@ -452,6 +547,11 @@ def _formal_record(run_id: str, label: str, status: str, item: Optional[Dict[str
         "runtime_s": item.get("runtime_s"),
         "trace_path": item.get("trace_path"),
         "trace_available": bool(item.get("trace_path")),
+        "semantic_status": semantic_status,
+        "experiment_status": experiment_status,
+        "experiment_eligible": (
+            semantic_status == "eligible" and experiment_status == "eligible"
+        ),
         "result_map_artifact": result_map["path"],
     }
 
@@ -645,6 +745,7 @@ def _write_coverage_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     fields = (
         "run_id", "instance_id", "property_schema_id", "template_id",
         "approved_by_codex", "review_status", "experiment_eligible",
+        "semantic_status", "experiment_status",
         "independent_gold_status", "layer", "channels", "trigger_events",
         "response_events", "obligation_kind", "lowering_family", "rule_id",
         "rule_locator", "source_kind", "structural_complete",
