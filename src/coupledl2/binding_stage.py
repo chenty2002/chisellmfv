@@ -33,7 +33,7 @@ from .property_compiler import (
 )
 from .result_contract import (
     bind_operation_plan_to_package,
-    build_primary_operation_plan,
+    build_operation_plan,
     build_unmaterialized_observation_map,
     canonical_sha256,
 )
@@ -140,6 +140,7 @@ class BindingStage:
                 generated,
                 manifest,
                 self.catalog,
+                require_evidence=True,
             )
             self._write_success_artifacts(
                 manifest,
@@ -304,6 +305,9 @@ class BindingStage:
                 "role": "system",
                 "content": (
                     "Select one to eight applicable repository property bindings. "
+                    "Select at most one template instance for each property schema; "
+                    "alternative approved templates are choices, not additional instances. "
+                    "Every instance_id and base_label must be globally unique. "
                     "Use only candidate IDs and bounded parameters. "
                     "For bounded-liveness parameters, choose a conservative "
                     "bound from the schema/template range and the exposed "
@@ -406,7 +410,12 @@ class BindingStage:
                 "binding_manifest_path": "binding_manifest.json",
                 "source": schema["source"],
                 "review_status": self.catalog.review["review_status"] if self.catalog.review else "not_reviewed",
-                "rtl_properties": [item for item in records if item["rtl_label"].startswith(instance["base_label"] + "__E")],
+                "rtl_properties": [
+                    item
+                    for item in records
+                    if item["instance_id"] == instance["instance_id"]
+                    and item["role"] == "primary_assertion"
+                ],
             }
             if self.catalog.review:
                 trace_record["review"] = {
@@ -429,13 +438,16 @@ class BindingStage:
             self.workspace.results_dir / "preflight" / "baseline_assertion_inventory.json"
         )
         baseline_sha = _file_sha256(baseline_path) if baseline_path.is_file() else None
-        delta_records = []
+        labelled_records = []
         for record in records:
             label = record["rtl_label"]
-            delta_records.append({
+            labelled_records.append({
                 **record,
                 "expected_property_id": f"{top_module}.{label}" if top_module else None,
             })
+        delta_records = [
+            item for item in labelled_records if item["role"] == "primary_assertion"
+        ]
         expected_by_label = {
             item["rtl_label"]: item["expected_property_id"]
             for item in delta_records
@@ -461,8 +473,13 @@ class BindingStage:
             )
         certificate = compile_manifest(manifest, self.catalog, rtl_properties=records)
         witness_plan = build_witness_plan(manifest, self.catalog)
-        operation_plan = build_primary_operation_plan(
+        operation_plan = build_operation_plan(
             traceability,
+            [
+                item
+                for item in labelled_records
+                if item["role"] != "primary_assertion"
+            ],
             package_sha256="0" * 64,
         )
         property_package = {
@@ -502,14 +519,14 @@ class BindingStage:
                     "assumption_sat",
                     "negative_oracle",
                 ],
-                "status": "declared_not_executed",
+                "status": "positive_portfolio_compiled",
             },
             "operation_plan": operation_plan,
             "package_semantics_sha256": "",
             "observation_map": build_unmaterialized_observation_map(
                 top_module=top_module,
                 package_sha256="0" * 64,
-                reason="Iteration 0 freezes the observation contract without elaboration-time signal mapping",
+                reason="elaboration-time observation mapping is deferred to Iteration 3",
             ),
             "traceability": traceability,
         }

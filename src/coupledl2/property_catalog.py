@@ -67,6 +67,8 @@ def load_property_profile(profile_id: str, *, require_approved: bool = True) -> 
         raise PropertyCatalogError("profile references missing property schemas")
     if set(templates) != set(profile["template_ids"]):
         raise PropertyCatalogError("profile references missing assertion templates")
+    if any("evidence_fragments" not in template for template in templates.values()):
+        raise PropertyCatalogError("profile template has no non-vacuity evidence fragments")
     if any(template["chisel_family"] != profile["chisel_family"] for template in templates.values()):
         raise PropertyCatalogError("template chisel family does not match profile")
 
@@ -180,6 +182,21 @@ def validate_obligation_corpus() -> Dict[str, Any]:
             }
             if actual_slots != expected_slots:
                 raise PropertyCatalogError("schema/template slot contract mismatch")
+            evidence = template.get("evidence_fragments")
+            if evidence is None:
+                continue
+            required_triggers = set(
+                schema["oracle_plan"]["non_vacuity"]["trigger_event_ids"]
+            )
+            if not required_triggers <= set(evidence["events"]):
+                raise PropertyCatalogError("template omits a non-vacuity trigger expression")
+            required_observers = set(
+                schema["oracle_plan"]["non_vacuity"]["observer_requirements"]
+            )
+            if not required_observers <= set(evidence["observers"]):
+                raise PropertyCatalogError("template observer evidence does not match schema")
+            if set(schema["observable_contract"]["ghost_state"]) != set(evidence["states"]):
+                raise PropertyCatalogError("template state evidence does not match schema")
     return {
         "schema_version": "obligation_corpus_validation.v1",
         "obligation_count": len(schemas),
@@ -303,11 +320,11 @@ def _validate_template(value: Dict[str, Any]) -> None:
         "schema_version", "template_id", "chisel_family",
         "property_schema_ids", "slots", "parameters", "fragments", "rtl_match",
         "api_family", "api_primitive", "semantic_shape", "requires_formal_mixin",
-        "allowed_profile_ids",
+        "allowed_profile_ids", "evidence_fragments",
     }
     required = fields - {
         "api_family", "api_primitive", "semantic_shape", "requires_formal_mixin",
-        "allowed_profile_ids",
+        "allowed_profile_ids", "evidence_fragments",
     }
     _exact_fields(value, fields, required, "assertion_template")
     if value["schema_version"] != "assertion_template.v1":
@@ -324,6 +341,7 @@ def _validate_template(value: Dict[str, Any]) -> None:
             or not all(isinstance(item, str) and item for item in value["allowed_profile_ids"])
         ):
             raise PropertyCatalogError("allowed_profile_ids must be a non-empty string list")
+    evidence = value.get("evidence_fragments")
     _exact_fields(
         value["fragments"],
         {"support_block", "assertion_block", "source_block"},
@@ -359,6 +377,56 @@ def _validate_template(value: Dict[str, Any]) -> None:
     allowed_source = allowed | {"source_label"}
     if source_placeholders - allowed_source:
         raise PropertyCatalogError("source block has undeclared placeholders")
+    if evidence is not None:
+        _validate_evidence_fragments(evidence, allowed)
+
+
+def _validate_evidence_fragments(evidence: Dict[str, Any], allowed: set[str]) -> None:
+    _exact_fields(
+        evidence,
+        {"events", "observers", "states", "assumption_guard"},
+        {"events", "observers", "states", "assumption_guard"},
+        "assertion_template.evidence_fragments",
+    )
+    for name in ("events", "observers", "states"):
+        if not isinstance(evidence[name], dict):
+            raise PropertyCatalogError(f"evidence_fragments.{name} must be an object")
+    if not evidence["events"]:
+        raise PropertyCatalogError("evidence_fragments.events must not be empty")
+    for event_id, expression in evidence["events"].items():
+        if not isinstance(event_id, str) or not event_id or not isinstance(expression, str) or not expression:
+            raise PropertyCatalogError("event evidence must map non-empty ids to expressions")
+    for group in ("observers", "states"):
+        for evidence_id, targets in evidence[group].items():
+            if not isinstance(evidence_id, str) or not evidence_id or not isinstance(targets, list) or not targets:
+                raise PropertyCatalogError(f"evidence_fragments.{group} has an invalid target list")
+            for target in targets:
+                _exact_fields(
+                    target,
+                    {"target", "expression"},
+                    {"target", "expression"},
+                    f"evidence_fragments.{group}.{evidence_id}[]",
+                )
+                if not all(isinstance(target[key], str) and target[key] for key in ("target", "expression")):
+                    raise PropertyCatalogError("evidence target fields must be non-empty strings")
+    guard = evidence["assumption_guard"]
+    if not isinstance(guard, str) or not guard:
+        raise PropertyCatalogError("evidence_fragments.assumption_guard must be an expression")
+    expressions = [
+        *evidence["events"].values(),
+        guard,
+        *(
+            target["expression"]
+            for group in ("observers", "states")
+            for targets in evidence[group].values()
+            for target in targets
+        ),
+    ]
+    placeholders = set().union(
+        *(set(PLACEHOLDER_RE.findall(expression)) for expression in expressions)
+    )
+    if placeholders - allowed:
+        raise PropertyCatalogError("evidence fragment has undeclared placeholders")
 
 
 def _validate_profile(value: Dict[str, Any], requested_id: str) -> None:

@@ -58,6 +58,9 @@ def render_property_source(
         replacements.update({name: str(value) for name, value in instance["parameters"].items()})
         replacements["base_label"] = instance["base_label"]
         assertion = _render_fragment(template["fragments"]["assertion_block"], replacements)
+        assertion += "\n" + _render_evidence_covers(
+            template["evidence_fragments"], replacements
+        )
         support = template["fragments"]["support_block"]
         if support:
             allowed_support = set(replacements) | {"ASSERTION_BLOCK"}
@@ -152,6 +155,34 @@ def _render_fragment(fragment: str, replacements: Dict[str, str]) -> str:
     if PLACEHOLDER_RE.search(rendered):
         raise AssertionRenderError("undeclared placeholder remains after rendering")
     return rendered
+
+
+def _render_evidence_covers(evidence: Dict, replacements: Dict[str, str]) -> str:
+    """Render repository-owned non-vacuity goals next to the primary property."""
+    base_label = replacements["base_label"]
+    rows = []
+    for event_id, expression in sorted(evidence["events"].items()):
+        rows.append(("trigger_cover", event_id, expression))
+    for role, group in (
+        ("observer_cover", evidence["observers"]),
+        ("state_cover", evidence["states"]),
+    ):
+        for evidence_id, targets in sorted(group.items()):
+            for target in targets:
+                rows.append(
+                    (role, f"{evidence_id}__{target['target']}", target["expression"])
+                )
+    rows.append(("assumption_sat", "environment", evidence["assumption_guard"]))
+    return "\n".join(
+        "chisel3.cover("
+        + _render_fragment(expression, replacements)
+        + f', "{base_label}__NV__{role}__{_safe_label(target)}")'
+        for role, target, expression in rows
+    )
+
+
+def _safe_label(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
 
 
 def _render_into_marker(original: str, marker: str, rendered: str) -> str:

@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, Optional
 
 FORMAL_CONTRACT_ROOT = Path(__file__).with_name("property_assets") / "formal_contracts"
 FORMAL_CONTRACT_SCHEMA_VERSION = "formal_contract.v1"
-PRIMARY_STATUSES = {"proven", "cex", "inconclusive", "not_run", "tool_error"}
+TRACE_STATUSES = {"cex", "covered"}
 
 
 class FormalContractError(ValueError):
@@ -120,7 +120,7 @@ def audit_case_formal_setup(
             superseded.append({
                 "kind": "proof_selection",
                 "command": command,
-                "reason": "replaced_by_exact_assertion_delta",
+                "reason": "replaced_by_exact_operation_plan",
             })
         elif head in {
             "set_prove_time_limit",
@@ -219,24 +219,34 @@ def _validate_contract(value: Dict[str, Any], requested_id: str) -> None:
             isinstance(item, str) and item for item in value[name]
         ):
             raise FormalContractError(f"{name} must be a string list")
-    if value["proof_selection_policy"] != "exact_assertion_delta":
-        raise FormalContractError("formal proof selection must use assertion delta")
+    if value["proof_selection_policy"] != "exact_operation_plan":
+        raise FormalContractError("formal proof selection must use the operation plan")
     _exact_fields(
         value["resources"],
-        {"per_property_timeout_s", "global_timeout_s", "engine_threads", "max_jobs"},
-        {"per_property_timeout_s", "global_timeout_s", "engine_threads", "max_jobs"},
+        {"per_property_timeout_s", "global_timeout_s", "engine_threads", "max_jobs", "by_role"},
+        {"per_property_timeout_s", "global_timeout_s", "engine_threads", "max_jobs", "by_role"},
         "resources",
     )
     resources = value["resources"]
-    if any(not isinstance(resources[key], int) or resources[key] <= 0 for key in resources):
+    if any(
+        not isinstance(resources[key], int) or resources[key] <= 0
+        for key in ("per_property_timeout_s", "global_timeout_s", "engine_threads", "max_jobs")
+    ):
         raise FormalContractError("formal resource limits must be positive integers")
+    by_role = resources["by_role"]
+    if not isinstance(by_role, dict) or set(by_role) != {"proof", "cover", "assumption"}:
+        raise FormalContractError("resources.by_role is invalid")
+    for name, budget in by_role.items():
+        _exact_fields(budget, {"timeout_s"}, {"timeout_s"}, f"resources.by_role.{name}")
+        if not isinstance(budget["timeout_s"], int) or budget["timeout_s"] <= 0:
+            raise FormalContractError("role timeout must be a positive integer")
     _exact_fields(
         value["trace_policy"],
         {"statuses", "format", "optimization"},
         {"statuses", "format", "optimization"},
         "trace_policy",
     )
-    if set(value["trace_policy"]["statuses"]) - PRIMARY_STATUSES:
+    if set(value["trace_policy"]["statuses"]) - TRACE_STATUSES:
         raise FormalContractError("invalid trace status")
     if value["trace_policy"]["format"] != "vcd":
         raise FormalContractError("unsupported trace format")

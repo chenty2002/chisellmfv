@@ -14,6 +14,7 @@ import selectors
 import signal
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,7 +25,6 @@ from .workspace import CoupledL2Workspace
 from .artifacts import file_sha256
 from .result_contract import (
     ResultContractError,
-    map_primary_results_to_operations,
     reduce_property_result_map,
     validate_operation_plan,
 )
@@ -119,6 +119,10 @@ class CoupledL2BuildOperations:
                 [Path(path) for path in build.get("generated_files", [])],
                 manifest,
                 catalog,
+                require_evidence=any(
+                    item["role"] != "primary_assertion"
+                    for item in operation_plan["operations"]
+                ),
             )
         except ValueError as exc:
             return self._finalize_stage3_without_tool(
@@ -129,9 +133,8 @@ class CoupledL2BuildOperations:
                 build_result=build,
             )
         expected_labels = {
-            item["rtl_label"]
-            for prop in traceability.get("properties", [])
-            for item in prop.get("rtl_properties", [])
+            item["rtl_property_id"].rsplit(".", 1)[-1]
+            for item in operation_plan["operations"]
         }
         actual_labels = {item.rtl_label for item in relabelled}
         if actual_labels != expected_labels:
@@ -208,11 +211,10 @@ class CoupledL2BuildOperations:
         prepare_result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Persist a total tool-error ledger when Stage 3 cannot launch JG."""
-        expected = self._expected_delta_properties()
-        primary = [
+        expected = self._expected_operations()
+        operation_results = [
             {
-                "rtl_label": item["rtl_label"],
-                "expected_property_id": item["expected_property_id"],
+                "operation_id": item["operation_id"],
                 "observed_property_id": None,
                 "status": "tool_error",
                 "reason": reason,
@@ -223,16 +225,26 @@ class CoupledL2BuildOperations:
             }
             for item in expected
         ]
+        primary = [
+            {
+                "rtl_label": item["target"],
+                "expected_property_id": item["rtl_property_id"],
+                **result,
+            }
+            for item, result in zip(expected, operation_results)
+            if item["role"] == "primary_assertion"
+        ]
         formal = {
             "analyze_ok": False,
             "elaborate_ok": False,
             "property_statuses": {},
+            "operation_results": operation_results,
             "primary_results": primary,
             "auxiliary_results": [],
             "execution_status": "tool_error",
             "formal_outcome": "inconclusive",
             "expected_count": len(expected),
-            "accounted_count": len(primary),
+            "accounted_count": len(operation_results),
             "primary_proven_count": 0,
             "primary_cex_count": 0,
             "primary_inconclusive_count": 0,
@@ -241,7 +253,7 @@ class CoupledL2BuildOperations:
             "timed_out": False,
             "summary": (
                 f"0 proven, 0 cex, 0 inconclusive, 0 not_run, "
-                f"{len(primary)} tool_error ({len(primary)}/{len(expected)} accounted)"
+                f"{len(operation_results)} tool_error ({len(operation_results)}/{len(expected)} accounted)"
             ),
         }
         contract = self._load_formal_contract_artifact()
@@ -275,7 +287,7 @@ class CoupledL2BuildOperations:
                     sort_keys=True,
                 )
                 + "\n"
-                for index, item in enumerate(primary)
+                for index, item in enumerate(operation_results)
             ),
             encoding="utf-8",
         )
@@ -456,7 +468,7 @@ class CoupledL2BuildOperations:
             self._write_json(stage_dir / "verilog_files.json", result)
             return result
         delta = self._load_json(delta_path)
-        if delta.get("schema_version") != "assertion_delta.v1":
+        if delta.get("schema_version") != "assertion_delta.v2":
             result = {
                 "success": False,
                 "error": "unsupported assertion delta schema",
@@ -476,12 +488,13 @@ class CoupledL2BuildOperations:
             }
             self._write_json(stage_dir / "verilog_files.json", result)
             return result
-        property_ids = []
-        for item in delta.get("rtl_properties", []):
-            label = item.get("rtl_label")
-            if not isinstance(label, str) or not label:
-                continue
-            property_ids.append(f"{top_module}.{label}")
+        package = self._load_json(
+            self._stage_dir("bind_properties") / "property_package.json"
+        )
+        operation_plan = package.get("operation_plan")
+        validate_operation_plan(operation_plan)
+        operations = operation_plan["operations"]
+        property_ids = [item.get("rtl_property_id") for item in operations]
         if not property_ids or len(property_ids) != len(set(property_ids)):
             result = {
                 "success": False,
@@ -504,7 +517,7 @@ class CoupledL2BuildOperations:
         verify_tcl = self.build_verify_tcl(
             verilog_files,
             top_module,
-            property_ids=property_ids,
+            operations=operations,
             formal_contract=formal_contract,
         )
         (stage_dir / "verify.tcl").write_text(verify_tcl, encoding="utf-8")
@@ -530,10 +543,10 @@ class CoupledL2BuildOperations:
         verilog_files: List[Path],
         top_module: str,
         *,
-        property_ids: List[str],
+        operations: List[Dict[str, Any]],
         formal_contract: Dict[str, Any],
     ) -> str:
-        """Build an exact-delta, per-property JasperGold Tcl schedule."""
+        """Build an exact, role-grouped JasperGold operation schedule."""
         analyze_files = " ".join(_tcl_quote(self._rel_to_verilog(path)) for path in verilog_files)
         resources = formal_contract["resources"]
         lines = [
@@ -549,14 +562,30 @@ class CoupledL2BuildOperations:
             f"set_engine_threads {resources['engine_threads']}",
             f"set_proofgrid_per_engine_max_jobs {resources['max_jobs']}",
         ]
-        trace_properties = property_ids
-        if trace_properties:
+        role_order = {
+            "assumption_sat": 0,
+            "trigger_cover": 1,
+            "observer_cover": 2,
+            "state_cover": 3,
+            "primary_assertion": 4,
+        }
+        schedule = sorted(
+            operations,
+            key=lambda item: (role_order.get(item["role"], 99), item["operation_id"]),
+        )
+        if schedule:
             lines.extend(
                 [
                     "file mkdir traces",
                     "set_trace_optimization standard",
-                    "proc chisellmfv_save_trace {property filename} {",
-                    "  if {[catch {visualize -violation -property $property} result]} {",
+                    "set_trace_optimization -irrelevant_value_computation true",
+                    "proc chisellmfv_save_trace {property filename kind} {",
+                    "  if {$kind eq \"primary_assertion\"} {",
+                    "    set command [list visualize -violation -property $property]",
+                    "  } else {",
+                    "    set command [list visualize -property $property]",
+                    "  }",
+                    "  if {[catch {eval $command} result]} {",
                     "    puts \"CHISELLMFV_TRACE_SKIP $property $result\"",
                     "    return",
                     "  }",
@@ -568,7 +597,15 @@ class CoupledL2BuildOperations:
                     "}",
                 ]
             )
-            for property_id in trace_properties:
+            current_budget = None
+            by_role = resources["by_role"]
+            for operation in schedule:
+                property_id = operation["rtl_property_id"]
+                role = operation["role"]
+                budget = by_role[operation["budget_class"]]["timeout_s"]
+                if budget != current_budget:
+                    lines.append(f"set_prove_time_limit {budget}s")
+                    current_budget = budget
                 lines.extend(
                     [
                         f"puts \"CHISELLMFV_PROPERTY_BEGIN {property_id}\"",
@@ -577,17 +614,21 @@ class CoupledL2BuildOperations:
                         "report",
                     ]
                 )
-                filename = "traces/" + _safe_trace_filename(property_id) + ".vcd"
+                filename = "traces/" + _safe_trace_filename(operation["operation_id"]) + ".vcd"
+                expected_outcome = "cex" if role == "primary_assertion" else "covered"
+                trace_needed = role == "primary_assertion" or operation["trace_required"]
                 lines.extend(
                     [
-                        'if {$chisellmfv_outcome eq "cex"} {',
+                        f'if {{$chisellmfv_outcome eq "{expected_outcome}"}} {{',
                         "  chisellmfv_save_trace "
                         + _tcl_quote(property_id)
                         + " "
-                        + _tcl_quote(filename),
+                        + _tcl_quote(filename)
+                        + " "
+                        + _tcl_quote(role),
                         "}",
                     ]
-                )
+                ) if trace_needed else None
                 lines.append(f"puts \"CHISELLMFV_PROPERTY_END {property_id}\"")
         lines.append("")
         return "\n".join(lines)
@@ -608,7 +649,7 @@ class CoupledL2BuildOperations:
         stage_dir.mkdir(parents=True, exist_ok=True)
         formal_contract = self._load_formal_contract_artifact()
         timeout_s = timeout_s or int(formal_contract["resources"]["global_timeout_s"])
-        expected = self._expected_delta_properties()
+        expected = self._expected_operations()
         project_dir = stage_dir / "jgproject"
         if project_dir.exists():
             shutil.rmtree(project_dir)
@@ -622,18 +663,18 @@ class CoupledL2BuildOperations:
 
         def record_completed_property(property_id: str, segment: str) -> None:
             match = next(
-                (item for item in expected if item["expected_property_id"] == property_id),
+                (item for item in expected if item["rtl_property_id"] == property_id),
                 None,
             )
             if match is None:
                 return
-            primary = _account_streamed_property(match, segment)
-            streamed.append(primary)
+            operation = _account_streamed_operation(match, segment)
+            streamed.append(operation)
             event = {
                 "schema_version": "proof_event.v1",
                 "event": "property_completed",
                 "sequence": len(streamed) - 1,
-                **primary,
+                **operation,
             }
             with events_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
@@ -653,12 +694,13 @@ class CoupledL2BuildOperations:
         parsed["returncode"] = returncode
         parsed["command"] = command
         parsed["outer_timed_out"] = outer_timed_out
-        accounted = account_expected_properties(
+        accounted = account_expected_operations(
             expected,
             parsed,
             log_text=output,
             returncode=returncode,
             outer_timed_out=outer_timed_out,
+            trace_dir=trace_dir,
         )
         parsed.update(accounted)
         parsed["formal_contract_path"] = "../../preflight/formal_contract.json"
@@ -674,12 +716,12 @@ class CoupledL2BuildOperations:
                 else formal_contract["tool"]["version"]
             ),
         }
-        for index, primary in enumerate(parsed["primary_results"]):
+        for index, operation in enumerate(parsed["operation_results"]):
             event = {
                 "schema_version": "proof_event.v1",
                 "event": "property_finalized",
                 "sequence": index,
-                **primary,
+                **operation,
             }
             with events_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
@@ -809,23 +851,11 @@ class CoupledL2BuildOperations:
         selector.close()
         return "".join(chunks), (None if timed_out else process.returncode), timed_out
 
-    def _expected_delta_properties(self) -> List[Dict[str, Any]]:
-        delta_path = self._stage_dir("bind_properties") / "assertion_delta.json"
-        delta = self._load_json(delta_path)
-        expected = []
-        top = delta.get("top_module")
-        for item in delta.get("rtl_properties", []):
-            label = item.get("rtl_label")
-            property_id = item.get("expected_property_id")
-            if not isinstance(label, str) or not isinstance(property_id, str):
-                raise ValueError("assertion delta contains an incomplete property")
-            expected.append({
-                "rtl_label": label,
-                "expected_property_id": property_id,
-            })
-        if not expected or len({item["rtl_label"] for item in expected}) != len(expected):
-            raise ValueError("assertion delta contains no unique expected properties")
-        return expected
+    def _expected_operations(self) -> List[Dict[str, Any]]:
+        package_path = self._stage_dir("bind_properties") / "property_package.json"
+        plan = self._load_json(package_path).get("operation_plan")
+        validate_operation_plan(plan)
+        return [dict(item) for item in plan["operations"]]
 
     def _collect_trace_artifacts(self, stage_dir: Path) -> Optional[Path]:
         """Copy JasperGold waveform artifacts into the stage-3 traces directory."""
@@ -978,10 +1008,49 @@ class CoupledL2BuildOperations:
             encoding="utf-8",
         )
         wrapper.chmod(0o755)
+        original_home = Path(env.get("HOME") or Path.home()).resolve()
+        if not _directory_is_writable(original_home):
+            self._prepare_writable_tool_home(env, original_home)
         existing_path = env.get("PATH", "")
         env["PATH"] = str(wrapper_dir) + (os.pathsep + existing_path if existing_path else "")
         env["CHISELLMFV_MILL"] = str(mill)
         env["CHISELLMFV_MILL_VERSION"] = MILL_VERSION
+
+    def _prepare_writable_tool_home(
+        self, env: Dict[str, str], original_home: Path
+    ) -> None:
+        """Preserve offline caches when the execution sandbox mounts HOME read-only."""
+        tool_home = self.workspace.run_dir / "tool_home"
+        tool_home.mkdir(parents=True, exist_ok=True)
+
+        seed_cache = original_home / ".cache" / "coursier"
+        if seed_cache.is_dir():
+            shared_cache = Path(tempfile.gettempdir()) / "chisellmfv-coursier-cache"
+            if not (shared_cache / "v1").is_dir():
+                temporary = shared_cache.with_name(
+                    f"{shared_cache.name}.{os.getpid()}.tmp"
+                )
+                if temporary.exists():
+                    shutil.rmtree(temporary)
+                shutil.copytree(seed_cache, temporary)
+                try:
+                    os.replace(temporary, shared_cache)
+                except OSError:
+                    if temporary.exists():
+                        shutil.rmtree(temporary)
+            cache_link = tool_home / ".cache" / "coursier"
+            cache_link.parent.mkdir(parents=True, exist_ok=True)
+            if not cache_link.exists():
+                cache_link.symlink_to(shared_cache, target_is_directory=True)
+
+        mill_download = original_home / ".cache" / "mill" / "download"
+        if mill_download.is_dir():
+            env["MILL_DOWNLOAD_PATH"] = str(mill_download)
+        env["HOME"] = str(tool_home)
+        user_home_opt = f"-Duser.home={tool_home}"
+        for key in ("JAVA_OPTS", "JAVA_TOOL_OPTIONS"):
+            existing = env.get(key, "").strip()
+            env[key] = " ".join(item for item in (existing, user_home_opt) if item)
 
     @staticmethod
     def _find_mill_executable() -> Optional[Path]:
@@ -992,6 +1061,17 @@ class CoupledL2BuildOperations:
         if home_mill.is_file() and os.access(home_mill, os.X_OK):
             return home_mill.resolve()
         return None
+
+
+def _directory_is_writable(path: Path) -> bool:
+    """Probe effective mount writability instead of trusting mode bits."""
+    probe = path / f".chisellmfv-write-probe-{os.getpid()}"
+    try:
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
 
 
 def parse_jaspergold_report(log_text: str, trace_dir: Optional[Path] = None) -> Dict[str, Any]:
@@ -1066,168 +1146,156 @@ def parse_jaspergold_report(log_text: str, trace_dir: Optional[Path] = None) -> 
     return result
 
 
-def account_expected_properties(
+def account_expected_operations(
     expected: List[Dict[str, Any]],
     parsed_report: Dict[str, Any],
     *,
     log_text: str,
     returncode: Optional[int],
     outer_timed_out: bool,
+    trace_dir: Optional[Path],
 ) -> Dict[str, Any]:
-    """Make the primary property result relation total over assertion delta."""
+    """Account every exact operation, including cover and assumption goals."""
     statuses = parsed_report.get("property_statuses")
     statuses = statuses if isinstance(statuses, dict) else {}
-    primary_results: List[Dict[str, Any]] = []
-    auxiliary_results: List[Dict[str, Any]] = []
-    primary_ids = {item["expected_property_id"] for item in expected}
-    for property_id, raw in sorted(statuses.items()):
-        if property_id not in primary_ids:
-            auxiliary_results.append({
-                "observed_property_id": property_id,
-                "status": raw.get("status"),
-                "engine": raw.get("engine"),
-                "bound": raw.get("bound"),
-                "runtime_s": _runtime_seconds(raw.get("time")),
-                "trace_path": raw.get("fst_file"),
-            })
-
-    per_property_timeout = bool(re.search(
-        r"Per property time limit expired",
-        log_text,
-        flags=re.IGNORECASE,
-    ))
+    expected_ids = {item["rtl_property_id"] for item in expected}
+    auxiliary_results = [
+        {
+            "observed_property_id": property_id,
+            "status": raw.get("status"),
+            "engine": raw.get("engine"),
+            "bound": raw.get("bound"),
+            "runtime_s": _runtime_seconds(raw.get("time")),
+        }
+        for property_id, raw in sorted(statuses.items())
+        if property_id not in expected_ids
+    ]
+    per_property_timeout = bool(
+        re.search(r"Per property time limit expired", log_text, re.IGNORECASE)
+    )
+    rows = []
     for item in expected:
-        label = item["rtl_label"]
-        expected_id = item["expected_property_id"]
-        observed_id = expected_id if expected_id in statuses else None
-        raw = statuses.get(expected_id)
-        status: str
-        reason: str
+        property_id = item["rtl_property_id"]
+        raw = statuses.get(property_id)
+        trace = _match_trace_for_property(item["operation_id"], trace_dir)
         if raw is not None:
             raw_status = str(raw.get("status") or "").lower()
-            if raw_status in {"proven", "bounded_proven"}:
+            if item["role"] == "primary_assertion" and raw_status in {
+                "proven",
+                "bounded_proven",
+            }:
                 status, reason = "proven", "tool_reported_proven"
+            elif item["role"] != "primary_assertion" and raw_status == "covered":
+                status, reason = "covered", "tool_reported_covered"
             elif raw_status == "unreachable":
                 status, reason = "unreachable", "tool_reported_unreachable"
-            elif raw_status == "cex":
-                if raw.get("fst_file"):
-                    status, reason = "cex", "tool_reported_cex"
-                else:
-                    status, reason = "inconclusive", "counterexample_trace_missing"
+            elif item["role"] == "primary_assertion" and raw_status == "cex":
+                status, reason = (
+                    ("cex", "tool_reported_cex")
+                    if trace
+                    else ("inconclusive", "counterexample_trace_missing")
+                )
             elif raw_status in INCONCLUSIVE_STATUSES:
                 status, reason = "inconclusive", f"tool_reported_{raw_status}"
             else:
-                status, reason = "tool_error", f"unsupported_tool_status:{raw_status or 'missing'}"
-        elif per_property_timeout and (
-            expected_id in log_text or not statuses
-        ):
+                status, reason = "tool_error", f"unexpected_{item['role']}_status:{raw_status}"
+        elif per_property_timeout and (property_id in log_text or not statuses):
             status, reason = "inconclusive", "per_property_timeout"
         elif outer_timed_out:
-            if expected_id in log_text:
-                status, reason = "inconclusive", "global_timeout"
-            else:
-                status, reason = "not_run", "global_timeout_before_property"
+            status, reason = (
+                ("inconclusive", "global_timeout")
+                if property_id in log_text
+                else ("not_run", "global_timeout_before_operation")
+            )
         elif returncode not in (0, None):
             status, reason = "tool_error", f"jaspergold_exit_{returncode}"
         elif returncode is None:
             status, reason = "not_run", "signal_termination_or_missing_exit"
         else:
             status, reason = "tool_error", "no_results_row"
-        primary_results.append({
-            "rtl_label": label,
-            "expected_property_id": expected_id,
-            "observed_property_id": observed_id,
+        row = {
+            "operation_id": item["operation_id"],
             "status": status,
             "reason": reason,
+            "observed_property_id": property_id if raw else None,
             "engine": raw.get("engine") if raw else None,
             "bound": raw.get("bound") if raw else None,
             "runtime_s": _runtime_seconds(raw.get("time")) if raw else None,
-            "trace_path": (
-                raw.get("fst_file")
-                if raw and status == "cex"
-                else None
-            ),
-        })
+            "trace_path": str(trace) if trace else None,
+        }
+        rows.append(row)
 
+    primary = [
+        {
+            "rtl_label": item["target"],
+            "expected_property_id": item["rtl_property_id"],
+            **row,
+        }
+        for item, row in zip(expected, rows)
+        if item["role"] == "primary_assertion"
+    ]
     counts = {
-        status: sum(item["status"] == status for item in primary_results)
-        for status in (
-            "proven",
-            "cex",
-            "unreachable",
-            "inconclusive",
-            "not_run",
-            "tool_error",
-        )
+        status: sum(row["status"] == status for row in rows)
+        for status in ("proven", "cex", "covered", "unreachable", "inconclusive", "not_run", "tool_error")
     }
-    if counts["cex"]:
-        formal_outcome = "cex"
-    elif primary_results and counts["proven"] == len(primary_results):
-        formal_outcome = "all_proven"
-    elif counts["not_run"] == len(primary_results):
-        formal_outcome = "not_run"
-    else:
-        formal_outcome = "inconclusive"
-    if returncode not in (0, None) or counts["tool_error"]:
-        execution_status = "tool_error"
-    elif outer_timed_out or returncode is None:
-        execution_status = "partial"
-    else:
-        execution_status = "completed"
-    summary = (
-        f"{counts['proven']} proven, {counts['cex']} cex, "
-        f"{counts['unreachable']} unreachable, "
-        f"{counts['inconclusive']} inconclusive, {counts['not_run']} not_run, "
-        f"{counts['tool_error']} tool_error "
-        f"({len(primary_results)}/{len(expected)} accounted)"
+    primary_statuses = [row["status"] for row in primary]
+    formal_outcome = (
+        "cex"
+        if "cex" in primary_statuses
+        else "all_proven"
+        if primary_statuses and all(status == "proven" for status in primary_statuses)
+        else "not_run"
+        if primary_statuses and all(status == "not_run" for status in primary_statuses)
+        else "inconclusive"
+    )
+    execution_status = (
+        "tool_error"
+        if returncode not in (0, None) or counts["tool_error"]
+        else "partial"
+        if outer_timed_out or returncode is None or counts["not_run"] or counts["inconclusive"]
+        else "completed"
     )
     return {
-        "primary_results": primary_results,
+        "operation_results": rows,
+        "primary_results": primary,
         "auxiliary_results": auxiliary_results,
         "expected_count": len(expected),
-        "accounted_count": len(primary_results),
-        "primary_proven_count": counts["proven"],
-        "primary_cex_count": counts["cex"],
-        "primary_unreachable_count": counts["unreachable"],
-        "primary_inconclusive_count": counts["inconclusive"],
-        "primary_not_run_count": counts["not_run"],
-        "primary_tool_error_count": counts["tool_error"],
+        "accounted_count": len(rows),
+        "primary_proven_count": sum(row["status"] == "proven" for row in primary),
+        "primary_cex_count": sum(row["status"] == "cex" for row in primary),
+        "primary_not_run_count": sum(row["status"] == "not_run" for row in primary),
+        "primary_tool_error_count": sum(row["status"] == "tool_error" for row in primary),
         "execution_status": execution_status,
         "formal_outcome": formal_outcome,
         "timed_out": outer_timed_out or per_property_timeout,
-        "summary": summary,
+        "summary": ", ".join(f"{counts[name]} {name}" for name in counts)
+        + f" ({len(rows)}/{len(expected)} accounted)",
     }
 
 
-def _account_streamed_property(
-    expected: Dict[str, Any],
-    segment: str,
+def _account_streamed_operation(
+    expected: Dict[str, Any], segment: str
 ) -> Dict[str, Any]:
-    """Create an immediate checkpoint from one Tcl property scope."""
     parsed = parse_jaspergold_report(segment)
-    raw = parsed.get("property_statuses", {}).get(expected["expected_property_id"])
-    if raw:
-        raw_status = str(raw.get("status") or "").lower()
-        if raw_status in {"proven", "bounded_proven"}:
-            status, reason = "proven", "tool_reported_proven"
-        elif raw_status == "unreachable":
-            status, reason = "unreachable", "tool_reported_unreachable"
-        elif raw_status == "cex":
-            status, reason = "cex", "tool_reported_cex_pending_trace_collection"
-        elif raw_status in INCONCLUSIVE_STATUSES:
-            status, reason = "inconclusive", f"tool_reported_{raw_status}"
-        else:
-            status, reason = "tool_error", "unsupported_tool_status"
+    raw = parsed.get("property_statuses", {}).get(expected["rtl_property_id"])
+    raw_status = str((raw or {}).get("status") or "").lower()
+    if expected["role"] == "primary_assertion" and raw_status in {"proven", "bounded_proven"}:
+        status, reason = "proven", "tool_reported_proven"
+    elif expected["role"] != "primary_assertion" and raw_status == "covered":
+        status, reason = "covered", "tool_reported_covered"
+    elif raw_status == "unreachable":
+        status, reason = "unreachable", "tool_reported_unreachable"
+    elif expected["role"] == "primary_assertion" and raw_status == "cex":
+        status, reason = "cex", "tool_reported_cex_pending_trace_collection"
     elif re.search(r"Per property time limit expired", segment, re.IGNORECASE):
         status, reason = "inconclusive", "per_property_timeout"
     else:
         status, reason = "tool_error", "no_results_row"
     return {
-        "rtl_label": expected["rtl_label"],
-        "expected_property_id": expected["expected_property_id"],
-        "observed_property_id": expected["expected_property_id"] if raw else None,
+        "operation_id": expected["operation_id"],
         "status": status,
         "reason": reason,
+        "observed_property_id": expected["rtl_property_id"] if raw else None,
         "engine": raw.get("engine") if raw else None,
         "bound": raw.get("bound") if raw else None,
         "runtime_s": _runtime_seconds(raw.get("time")) if raw else None,
@@ -1251,11 +1319,13 @@ def join_property_results(
     property_package_sha256: str,
     assertion_delta_sha256: str,
 ) -> Dict[str, Any]:
-    """Join the exact primary assertion ledger into the V4 result contract."""
-    primary = jaspergold_report.get("primary_results")
+    """Join the exact operation ledger into the V4 result contract."""
+    operation_results = jaspergold_report.get("operation_results")
     auxiliary = jaspergold_report.get("auxiliary_results")
-    if not isinstance(primary, list) or not isinstance(auxiliary, list):
-        raise ValueError("formal report has no total primary result ledger")
+    if not isinstance(operation_results, list):
+        raise ValueError("formal report has no total operation result ledger")
+    if not isinstance(auxiliary, list):
+        raise ValueError("formal report has no auxiliary result ledger")
     instance_metadata: Dict[str, Dict[str, Any]] = {}
     for prop in traceability.get("properties", []):
         record: Dict[str, Any] = {
@@ -1271,7 +1341,6 @@ def join_property_results(
             record["refs"] = refs
         if isinstance(record.get("instance_id"), str):
             instance_metadata[record["instance_id"]] = record
-    operation_results = map_primary_results_to_operations(operation_plan, primary)
     return reduce_property_result_map(
         operation_plan=operation_plan,
         operation_results=operation_results,
@@ -1342,12 +1411,10 @@ def _scan_verilog_assertions(path: Path, text: str) -> List[Dict[str, Any]]:
 def _match_trace_for_property(name: str, trace_dir: Optional[Path]) -> Optional[Path]:
     if not trace_dir or not trace_dir.exists():
         return None
-    normalized = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
-    for path in sorted(trace_dir.glob("*")):
-        if path.suffix not in {".fst", ".vcd"}:
-            continue
-        candidate = re.sub(r"[^A-Za-z0-9]+", "_", path.stem).strip("_").lower()
-        if normalized and (normalized in candidate or candidate in normalized):
+    stem = _safe_trace_filename(name)
+    for suffix in (".fst", ".vcd"):
+        path = trace_dir / f"{stem}{suffix}"
+        if path.is_file():
             return path
     return None
 

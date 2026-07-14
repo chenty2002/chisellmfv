@@ -158,6 +158,58 @@ def build_primary_operation_plan(
     return plan
 
 
+def build_operation_plan(
+    traceability: Mapping[str, Any],
+    auxiliary_properties: Sequence[Mapping[str, Any]],
+    *,
+    package_sha256: str,
+) -> Dict[str, Any]:
+    """Build the executable Iteration-1 portfolio from labelled RTL properties."""
+    plan = build_primary_operation_plan(
+        traceability,
+        package_sha256=package_sha256,
+    )
+    operations = list(plan["operations"])
+    for index, item in enumerate(auxiliary_properties):
+        path = f"auxiliary_properties[{index}]"
+        if not isinstance(item, Mapping):
+            raise ResultContractError(f"{path} must be an object")
+        instance_id = _string(item, "instance_id", path)
+        role = _string(item, "role", path)
+        if role not in SEMANTIC_GATE_ROLES or role == "negative_oracle":
+            raise ResultContractError(f"{path}.role is not an Iteration-1 role")
+        target = _string(item, "rtl_label", path)
+        rtl_property_id = _string(item, "expected_property_id", path)
+        evidence_target = _string(item, "target", path)
+        operations.append(
+            {
+                "operation_id": operation_id(instance_id, role, target),
+                "instance_id": instance_id,
+                "role": role,
+                "target": target,
+                "rtl_property_id": rtl_property_id,
+                "expected_statuses": [
+                    "covered",
+                    "unreachable",
+                    "inconclusive",
+                    "not_run",
+                    "tool_error",
+                ],
+                "trace_required": role != "assumption_sat",
+                "budget_class": "assumption" if role == "assumption_sat" else "cover",
+                "evidence_target": f"{role}:{evidence_target}",
+            }
+        )
+    plan = {
+        "schema_version": OPERATION_PLAN_SCHEMA_VERSION,
+        "package_sha256": package_sha256,
+        "required_roles": sorted({item["role"] for item in operations}),
+        "operations": operations,
+    }
+    validate_operation_plan(plan)
+    return plan
+
+
 def bind_operation_plan_to_package(package: Mapping[str, Any]) -> Dict[str, Any]:
     """Return a package copy with the plan bound to its semantic package hash.
 
@@ -731,48 +783,16 @@ def validate_semantic_evidence(value: Mapping[str, Any]) -> None:
         raise ResultContractError("semantic_evidence.instances must be a list")
 
 
-def map_primary_results_to_operations(
-    operation_plan: Mapping[str, Any], primary_results: Iterable[Mapping[str, Any]]
-) -> list[Dict[str, Any]]:
-    """Map the existing exact assertion ledger into operation rows."""
-    validate_operation_plan(operation_plan)
-    by_property_id: Dict[str, Mapping[str, Any]] = {}
-    by_label: Dict[str, Mapping[str, Any]] = {}
-    for raw in primary_results:
-        if not isinstance(raw, Mapping):
-            raise ResultContractError("primary result must be an object")
-        property_id = raw.get("expected_property_id") or raw.get("rtl_property_id")
-        if isinstance(property_id, str) and property_id:
-            by_property_id[property_id] = raw
-        label = raw.get("rtl_label")
-        if isinstance(label, str) and label:
-            by_label[label] = raw
-    rows = []
-    for plan_item in operation_plan["operations"]:
-        raw = by_property_id.get(plan_item["rtl_property_id"])
-        if raw is None:
-            raw = by_label.get(plan_item.get("target", ""))
-        if raw is None:
-            rows.append(
-                {
-                    "operation_id": plan_item["operation_id"],
-                    "status": "not_run",
-                    "reason": "missing_primary_result",
-                }
-            )
-        else:
-            row = dict(raw)
-            row["operation_id"] = plan_item["operation_id"]
-            rows.append(row)
-    return rows
-
-
 def _reduce_instance_semantics(
     operations: Sequence[Mapping[str, Any]],
     plan: Mapping[str, Any],
     *,
     operation_set_complete: bool,
 ) -> Dict[str, Any]:
+    plan_by_id = {
+        item["operation_id"]: item
+        for item in plan["operations"]
+    }
     by_role: Dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for item in operations:
         by_role[item["role"]].append(item)
@@ -782,11 +802,15 @@ def _reduce_instance_semantics(
     for role in sorted(declared_roles):
         if role == "primary_assertion":
             rows = by_role.get(role, [])
-            if not rows or any(row["status"] in {"not_run", "tool_error", "inconclusive"} for row in rows):
+            refs = [row["operation_id"] for row in rows]
+            if any(row["status"] == "cex" for row in rows):
+                gate_verdicts[role] = {"status": "failed", "operation_refs": refs}
+                reasons.append("primary_assertion_failed")
+            elif rows and all(row["status"] == "proven" for row in rows):
+                gate_verdicts[role] = {"status": "passed", "operation_refs": refs}
+            else:
                 gate_verdicts[role] = {"status": "inconclusive", "operation_refs": [row["operation_id"] for row in rows]}
                 reasons.append("primary_operation_incomplete")
-            else:
-                gate_verdicts[role] = {"status": "passed", "operation_refs": [row["operation_id"] for row in rows]}
             continue
         rows = by_role.get(role, [])
         refs = [row["operation_id"] for row in rows]
@@ -794,23 +818,42 @@ def _reduce_instance_semantics(
             gate_verdicts[role] = {"status": "not_run", "operation_refs": refs}
             reasons.append(f"{role}_not_run")
             continue
-        statuses = {row["status"] for row in rows}
-        if any(status in {"tool_error", "inconclusive", "not_run"} for status in statuses):
-            gate_verdicts[role] = {"status": "inconclusive", "operation_refs": refs}
-            reasons.append(f"{role}_not_run")
-        elif role == "negative_oracle":
-            killed = all(
-                row.get("oracle_verdict") == "killed" or row["status"] == "killed"
-                for row in rows
+        goals: Dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+        for row in rows:
+            goal = plan_by_id[row["operation_id"]]["evidence_target"]
+            goals[goal].append(row)
+        if role == "negative_oracle":
+            passed = all(
+                any(
+                    row.get("oracle_verdict") == "killed"
+                    for row in goal_rows
+                )
+                for goal_rows in goals.values()
             )
-            gate_verdicts[role] = {"status": "passed" if killed else "failed", "operation_refs": refs}
-            if not killed:
-                reasons.append("negative_oracle_failed")
-        elif all(status == "covered" for status in statuses):
+        else:
+            passed = all(
+                any(row["status"] == "covered" for row in goal_rows)
+                for goal_rows in goals.values()
+            )
+        if passed:
             gate_verdicts[role] = {"status": "passed", "operation_refs": refs}
         else:
-            gate_verdicts[role] = {"status": "failed", "operation_refs": refs}
-            reasons.append(f"{role}_failed")
+            terminal_failure = any(
+                row["status"] in {"cex", "unreachable"}
+                for goal_rows in goals.values()
+                if not any(
+                    (candidate.get("oracle_verdict") == "killed")
+                    if role == "negative_oracle"
+                    else (candidate["status"] == "covered")
+                    for candidate in goal_rows
+                )
+                for row in goal_rows
+            )
+            status = "failed" if terminal_failure else "inconclusive"
+            gate_verdicts[role] = {"status": status, "operation_refs": refs}
+            reasons.append(
+                f"{role}_failed" if terminal_failure else f"{role}_not_run"
+            )
     if not operation_set_complete:
         reasons.append("operation_set_mismatch")
     statuses = {item["status"] for item in gate_verdicts.values()}
@@ -924,6 +967,9 @@ def _build_cex_work_items(operations: Sequence[Mapping[str, Any]]) -> list[Dict[
 def _normalize_operation_result(plan_item: Mapping[str, Any], raw: Mapping[str, Any]) -> Dict[str, Any]:
     status = _normalize_status(raw.get("status"))
     reason = str(raw.get("reason") or "unspecified")
+    if status == "covered" and plan_item["trace_required"] and not raw.get("trace_path"):
+        status = "inconclusive"
+        reason = "covered_trace_missing"
     if status not in plan_item["expected_statuses"]:
         reason = f"status_not_allowed_for_operation:{status}"
         status = "tool_error"
