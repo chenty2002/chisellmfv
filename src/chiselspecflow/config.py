@@ -20,6 +20,13 @@ BINDING_SCHEMA_VERSION = "chisel_bindings.v1"
 MONITOR_SCHEMA_VERSION = "chisel_monitors.v1"
 EXPRESSION_SCHEMA_VERSION = "expression_ir.v1"
 REVIEW_RECORD_SCHEMA_VERSION = "review_record.v1"
+STAGE_INPUTS_SCHEMA_VERSION = "specflow_stage_inputs.v1"
+AUTHORING_CANDIDATES_SCHEMA_VERSION = "authoring_candidates.v1"
+CANDIDATE_ASSET_DELTA_SCHEMA_VERSION = "candidate_asset_delta.v1"
+REVIEW_REQUEST_SCHEMA_VERSION = "review_request.v1"
+VERIFICATION_PACKAGE_SCHEMA_VERSION = "verification_package.v1"
+OVERLAY_MANIFEST_SCHEMA_VERSION = "overlay_manifest.v1"
+SOURCE_ASSERTION_DELTA_SCHEMA_VERSION = "source_assertion_delta.v1"
 ELABORATION_CERTIFICATE_SCHEMA_VERSION = "elaboration_certificate.v1"
 OPERATION_PLAN_SCHEMA_VERSION = "verification_operation_plan.v2"
 PROPERTY_RESULT_MAP_SCHEMA_VERSION = "property_result_map.v5"
@@ -40,6 +47,13 @@ SCHEMA_VERSIONS: Mapping[str, str] = MappingProxyType(
         "monitors": MONITOR_SCHEMA_VERSION,
         "expression": EXPRESSION_SCHEMA_VERSION,
         "review_record": REVIEW_RECORD_SCHEMA_VERSION,
+        "stage_inputs": STAGE_INPUTS_SCHEMA_VERSION,
+        "authoring_candidates": AUTHORING_CANDIDATES_SCHEMA_VERSION,
+        "candidate_asset_delta": CANDIDATE_ASSET_DELTA_SCHEMA_VERSION,
+        "review_request": REVIEW_REQUEST_SCHEMA_VERSION,
+        "verification_package": VERIFICATION_PACKAGE_SCHEMA_VERSION,
+        "overlay_manifest": OVERLAY_MANIFEST_SCHEMA_VERSION,
+        "source_assertion_delta": SOURCE_ASSERTION_DELTA_SCHEMA_VERSION,
         "elaboration_certificate": ELABORATION_CERTIFICATE_SCHEMA_VERSION,
         "operation_plan": OPERATION_PLAN_SCHEMA_VERSION,
         "property_result_map": PROPERTY_RESULT_MAP_SCHEMA_VERSION,
