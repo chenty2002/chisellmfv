@@ -9,6 +9,7 @@ ChiselLMFV - 统一入口
    - → waveform_explanation (结合 VerilogCausalAnalysis 因果分析)
    - → propose_bugfix
 2. Verilog→Chisel 转换 (Verilog2Chisel)：自动将 Verilog 代码转换为 Chisel
+3. ChiselSpecFlow V5：Iteration 0 仅暴露冻结的 CLI/contract 帮助
 
 使用方式：
     # 形式化验证
@@ -761,6 +762,18 @@ def parse_args(argv=None):
     run_parser.add_argument('--max-repair-rounds', type=int, default=3,
                             help='stage 5 repair-regression loop 最大轮数（默认: 3）')
 
+    # ChiselSpecFlow V5 contract-only entrypoint. Operational nested commands
+    # are added by their owning iterations; Iteration 0 promises help only.
+    subparsers.add_parser(
+        'specflow',
+        help='ChiselSpecFlow V5 三阶段工作流（Iteration 0 contract only）',
+        description=(
+            'ChiselSpecFlow V5: asset_authoring -> compile_verify -> diagnose. '
+            'Iteration 0 freezes schemas and stage contracts; start/review/resume '
+            'execution is not implemented yet.'
+        ),
+    )
+
     return parser.parse_args(argv)
 
 
@@ -789,8 +802,13 @@ def main():
         main_quality(args)
     elif args.command == 'run':
         main_coupledl2_run(args)
+    elif args.command == 'specflow':
+        print(
+            "ChiselSpecFlow Iteration 0 only freezes the CLI and data contracts; "
+            "start/review/resume are not implemented yet."
+        )
     else:
-        print("错误: 请指定工作流类型 (formal, v2c, quality, run)")
+        print("错误: 请指定工作流类型 (formal, v2c, quality, run, specflow)")
         print("运行 'python main.py --help' 查看帮助")
         sys.exit(1)
 

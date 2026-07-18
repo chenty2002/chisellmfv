@@ -14,11 +14,17 @@ assertion is never used as evidence for a semantic gate by itself.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections import defaultdict
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
+
+from ..core.formal_operations import (
+    FormalOperationError,
+    canonical_sha256,
+    join_exact_operation_rows,
+    stable_operation_id,
+)
 
 
 OPERATION_PLAN_SCHEMA_VERSION = "verification_operation_plan.v1"
@@ -67,17 +73,6 @@ class ResultContractError(ValueError):
     """Raised when a V4 contract or result ledger is malformed."""
 
 
-def canonical_sha256(value: Any) -> str:
-    """Hash a JSON value with the repository's deterministic encoding."""
-    payload = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
 def operation_id(instance_id: str, role: str, target: str) -> str:
     """Return the stable ID for one instance/role/target tuple."""
     for name, value in (("instance_id", instance_id), ("role", role), ("target", target)):
@@ -88,7 +83,7 @@ def operation_id(instance_id: str, role: str, target: str) -> str:
     safe_target = re.sub(r"[^A-Za-z0-9_.-]+", "_", target).strip("_")
     if not safe_target:
         raise ResultContractError("operation target becomes empty after normalization")
-    return f"{instance_id}__{role}__{safe_target}"
+    return stable_operation_id((instance_id, role, safe_target))
 
 
 def build_primary_operation_plan(
@@ -620,30 +615,19 @@ def reduce_property_result_map(
     _require_sha(property_package_sha256, "property_package_sha256")
     _require_sha(assertion_delta_sha256, "assertion_delta_sha256")
     plan_by_id = {item["operation_id"]: item for item in operation_plan["operations"]}
-    raw_by_id: Dict[str, Dict[str, Any]] = {}
-    unexpected: list[str] = []
-    for raw in operation_results:
-        if not isinstance(raw, Mapping):
-            raise ResultContractError("operation result must be an object")
-        operation_id_value = raw.get("operation_id")
-        if not isinstance(operation_id_value, str) or not operation_id_value:
-            raise ResultContractError("operation result has no operation_id")
-        if operation_id_value not in plan_by_id:
-            unexpected.append(operation_id_value)
-            continue
-        if operation_id_value in raw_by_id:
-            raise ResultContractError(f"duplicate operation result: {operation_id_value}")
-        raw_by_id[operation_id_value] = dict(raw)
-
-    normalized: list[Dict[str, Any]] = []
-    missing: list[str] = []
-    for plan_item in operation_plan["operations"]:
-        op_id = plan_item["operation_id"]
-        raw = raw_by_id.get(op_id)
-        if raw is None:
-            missing.append(op_id)
-            raw = {"status": "not_run", "reason": "missing_operation_result"}
-        normalized.append(_normalize_operation_result(plan_item, raw))
+    try:
+        joined = join_exact_operation_rows(
+            operation_plan["operations"],
+            operation_results,
+        )
+    except FormalOperationError as exc:
+        raise ResultContractError(str(exc)) from exc
+    unexpected = joined["unexpected_operation_ids"]
+    missing = joined["missing_operation_ids"]
+    normalized = [
+        _normalize_operation_result(plan_item, raw)
+        for plan_item, raw in zip(operation_plan["operations"], joined["rows"])
+    ]
 
     groups: Dict[str, list[Dict[str, Any]]] = defaultdict(list)
     for item in normalized:

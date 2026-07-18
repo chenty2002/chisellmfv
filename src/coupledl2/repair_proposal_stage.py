@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .artifacts import write_stage_outcome
+from ..core.artifact_contract import write_stage_outcome
 from .stages import get_stage_spec
 from .workspace import (
     StageContext,

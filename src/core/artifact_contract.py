@@ -1,13 +1,23 @@
-"""Canonical stage artifact validation and compact handoff persistence."""
+"""Workflow-independent stage artifact and handoff contracts.
+
+The helpers in this module deliberately know only a stage name and its exact
+artifact list.  Workflow-specific stage enums, reducers, and business payloads
+remain outside the generic core.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol, Tuple
 
-from .stages import StageSpec
+
+class StageContract(Protocol):
+    """Minimal structural contract required by the artifact helpers."""
+
+    name: str
+    artifact_contract: Tuple[str, ...]
 
 
 class StageArtifactError(ValueError):
@@ -15,11 +25,16 @@ class StageArtifactError(ValueError):
 
 
 def file_sha256(path: Path) -> str:
+    """Return the lowercase SHA-256 digest of one file."""
+
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def validate_stage_artifacts(stage_dir: Path, spec: StageSpec) -> Dict[str, Dict[str, Any]]:
-    """Validate and hash exactly the artifacts declared by ``StageSpec``."""
+def validate_stage_artifacts(
+    stage_dir: Path, spec: StageContract
+) -> Dict[str, Dict[str, Any]]:
+    """Validate and hash exactly the artifacts declared by ``spec``."""
+
     stage_dir = Path(stage_dir)
     records: Dict[str, Dict[str, Any]] = {}
     for relative in spec.artifact_contract:
@@ -47,7 +62,8 @@ def validate_stage_artifacts(stage_dir: Path, spec: StageSpec) -> Dict[str, Dict
         elif path.suffix == ".jsonl":
             try:
                 lines = [
-                    line for line in path.read_text(encoding="utf-8").splitlines()
+                    line
+                    for line in path.read_text(encoding="utf-8").splitlines()
                     if line.strip()
                 ]
                 if not lines:
@@ -69,12 +85,13 @@ def validate_stage_artifacts(stage_dir: Path, spec: StageSpec) -> Dict[str, Dict
 
 def write_stage_outcome(
     stage_dir: Path,
-    spec: StageSpec,
+    spec: StageContract,
     stage_result: Dict[str, Any],
     *,
     source_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Write one stage result and one reference-only handoff from the same data."""
+
     stage_dir = Path(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
     normalized = dict(stage_result)
@@ -108,8 +125,11 @@ def write_stage_outcome(
     return normalized
 
 
-def validate_completed_stage(stage_dir: Path, spec: StageSpec) -> Optional[Dict[str, Any]]:
-    """Return a completed result only when result, handoff, hashes and contract agree."""
+def validate_completed_stage(
+    stage_dir: Path, spec: StageContract
+) -> Optional[Dict[str, Any]]:
+    """Return a result only when result, handoff, hashes, and contract agree."""
+
     stage_dir = Path(stage_dir)
     result_path = stage_dir / "stage_result.json"
     handoff_path = stage_dir / "handoff.json"
@@ -124,7 +144,8 @@ def validate_completed_stage(stage_dir: Path, spec: StageSpec) -> Optional[Dict[
             or handoff.get("schema_version") != "stage_handoff.v2"
             or handoff.get("stage") != spec.name
             or handoff.get("success") is not True
-            or handoff.get("stage_result", {}).get("sha256") != file_sha256(result_path)
+            or handoff.get("stage_result", {}).get("sha256")
+            != file_sha256(result_path)
         ):
             return None
         actual = validate_stage_artifacts(stage_dir, spec)

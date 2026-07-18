@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .property_catalog import load_property_profile
 from .rtl_property_labeler import label_rtl_properties
 from .workspace import CoupledL2Workspace
-from .artifacts import file_sha256
+from ..core.artifact_contract import file_sha256
 from .result_contract import (
     ResultContractError,
     reduce_property_result_map,

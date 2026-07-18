@@ -13,7 +13,7 @@ from .indexer import compute_index_hashes, compute_workspace_hash, refresh_index
 from .preflight import CoupledL2Preflight
 from .stages import COUPLEDL2_STAGES, get_stage_spec
 from .workspace import CoupledL2Workspace, initialize_stage_context
-from .artifacts import (
+from ..core.artifact_contract import (
     file_sha256,
     validate_completed_stage,
     write_stage_outcome,

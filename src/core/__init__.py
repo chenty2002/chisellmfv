@@ -14,7 +14,6 @@ TileLinkLLM Core Module
 from .llm_client import LLMClient, TokenBudgetExceeded
 from .llm_router import LLMRouter
 from .escape_policy import EscapeAction, EscapePolicy, EscapePolicyConfig
-from .workflow import FormalWorkflow
 from .prompt_builder import (
     build_system_prompt,
     build_user_prompt,
@@ -51,3 +50,13 @@ __all__ = [
 ]
 
 __version__ = "0.3.0"
+
+
+def __getattr__(name):
+    """Load the workflow lazily so generic core primitives stay cycle-free."""
+
+    if name == "FormalWorkflow":
+        from .workflow import FormalWorkflow
+
+        return FormalWorkflow
+    raise AttributeError(name)

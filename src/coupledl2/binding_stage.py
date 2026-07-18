@@ -22,7 +22,7 @@ from .binding_contract import (
 from .rtl_property_labeler import RTLProperty, label_rtl_properties
 from .workspace import StageContext, build_protocol_evidence, initialize_stage_context
 from .stages import get_stage_spec
-from .artifacts import (
+from ..core.artifact_contract import (
     file_sha256,
     validate_completed_stage,
     write_stage_outcome,
