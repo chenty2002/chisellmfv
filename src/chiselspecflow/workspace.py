@@ -1,17 +1,43 @@
-"""Pure path contracts for isolated SpecFlow runs and immutable rounds."""
+"""Atomic isolated workspaces, allowlisted model views, and immutable rounds."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
-from .config import RUN_MANIFEST_SCHEMA_VERSION, SpecFlowRunConfig
+from .config import (
+    MODEL_VIEW_MANIFEST_SCHEMA_VERSION,
+    RUN_MANIFEST_SCHEMA_VERSION,
+    GeneratorConfiguration,
+    ProjectContract,
+    SpecFlowRunConfig,
+)
 from .stages import get_stage_spec, stage_contract_snapshot
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MODEL_LEAK_RE = re.compile(
+    r"\b(?:buggy(?:_[0-9]+)?|gold(?:en)?|mutation|expected[_ -]?verdict|"
+    r"private[_ -]?trigger|reference[_ -]?diff)\b",
+    re.IGNORECASE,
+)
+_COPY_IGNORES = {
+    ".git",
+    ".bloop",
+    ".metals",
+    ".scala-build",
+    "target",
+    "generated",
+    "jgproject",
+    "formal",
+    "__pycache__",
+}
 
 
 @dataclass(frozen=True)
@@ -52,7 +78,7 @@ class SpecFlowRound:
 
 @dataclass(frozen=True)
 class SpecFlowWorkspace:
-    """Resolved workspace layout without any Iteration-1 creation side effects."""
+    """Resolved workspace layout with explicit, fail-if-existing materialization."""
 
     run_dir: Path
     config: SpecFlowRunConfig
@@ -104,7 +130,7 @@ class SpecFlowWorkspace:
         return self.round_dir(round_ref) / get_stage_spec(stage).directory_name
 
     def manifest_contract(self) -> dict:
-        """Return only the fields frozen before Iteration 1 fills live hashes."""
+        """Return the stage/layout portion embedded in every live manifest."""
 
         return {
             "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
@@ -113,3 +139,239 @@ class SpecFlowWorkspace:
             "rounds_root": "rounds",
             "workspace_project": "workspace/project",
         }
+
+    def materialize(
+        self,
+        project: ProjectContract,
+        configuration: GeneratorConfiguration,
+        public_spec_package: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Create one isolated run atomically and return its frozen manifest."""
+
+        if self.run_dir.exists():
+            raise FileExistsError(f"SpecFlow run already exists: {self.run_dir}")
+        if project.path != self.config.project_contract:
+            raise ValueError("validated project contract does not match run config")
+        if configuration.path != self.config.configuration:
+            raise ValueError("validated configuration does not match run config")
+        if Path(self.config.specification).resolve() != (
+            project.repository_root / public_spec_package["spec_path"]
+        ).resolve():
+            raise ValueError("validated public spec does not match run config")
+
+        self.run_dir.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{self.run_dir.name}.staging-", dir=self.run_dir.parent)
+        )
+        try:
+            project_copy = staging / "workspace" / "project"
+            shutil.copytree(
+                project.project_root,
+                project_copy,
+                ignore=lambda _directory, names: sorted(set(names) & _COPY_IGNORES),
+            )
+            inputs = staging / "inputs"
+            indexes = staging / "indexes"
+            logs = staging / "logs"
+            inputs.mkdir(parents=True)
+            indexes.mkdir(parents=True)
+            logs.mkdir(parents=True)
+            (staging / "rounds").mkdir()
+            _copy_file(project.path, inputs / "project_contract.json")
+            _copy_file(configuration.path, inputs / "configuration.json")
+            _copy_file(self.config.specification, inputs / "specification.md")
+            _write_json(inputs / "public_spec_package.json", public_spec_package)
+            model_view = _materialize_model_view(
+                project, project_copy, inputs / "model_sources"
+            )
+            _write_json(inputs / "model_view_manifest.json", model_view)
+
+            input_hashes = {
+                "project_contract_sha256": _file_sha256(inputs / "project_contract.json"),
+                "configuration_sha256": _file_sha256(inputs / "configuration.json"),
+                "specification_sha256": _file_sha256(inputs / "specification.md"),
+                "public_spec_package_sha256": _file_sha256(
+                    inputs / "public_spec_package.json"
+                ),
+                "model_view_manifest_sha256": _file_sha256(
+                    inputs / "model_view_manifest.json"
+                ),
+            }
+            _write_json(inputs / "input_hashes.json", input_hashes)
+            first_round = SpecFlowRound(1)
+            for stage in stage_contract_snapshot():
+                (staging / "rounds" / first_round.directory_name / (
+                    f"{stage['ordinal']:02d}_{stage['name']}"
+                )).mkdir(parents=True)
+            round_manifest = {
+                "schema_version": "specflow_round.v1",
+                "round_id": 1,
+                "parent_round": None,
+                "revision_request_sha256": None,
+                "state": "indexing",
+            }
+            _write_json(
+                staging / "rounds" / first_round.directory_name / "round.json",
+                round_manifest,
+            )
+
+            manifest = self.manifest_contract()
+            manifest.update(
+                {
+                    "project_id": project.project_id,
+                    "configuration_id": configuration.configuration_id,
+                    "opaque_task_id": self.config.opaque_task_id,
+                    "input_hashes": input_hashes,
+                    "workspace_hash": _tree_sha256(project_copy),
+                    "visible_source_root_allowlist": [
+                        str(root.relative_to(project.project_root))
+                        for root in project.model_visible_roots
+                    ],
+                    "model_view_manifest_sha256": input_hashes[
+                        "model_view_manifest_sha256"
+                    ],
+                    "public_spec_sha256": public_spec_package["spec_sha256"],
+                    "suite_ledger_sha256": public_spec_package[
+                        "suite_ledger_sha256"
+                    ],
+                    "current_round": 1,
+                    "review_state": "not_started",
+                    "index_hashes": {},
+                }
+            )
+            _write_json(staging / "manifest.json", manifest)
+            staging.rename(self.run_dir)
+            return manifest
+        except BaseException:
+            if staging.exists():
+                shutil.rmtree(staging)
+            raise
+
+    def create_round(self, round_ref: SpecFlowRound) -> Path:
+        """Create a new round without modifying any earlier round."""
+
+        if round_ref.round_id == 1:
+            raise ValueError("round 1 is created with the workspace")
+        path = self.round_dir(round_ref)
+        if path.exists():
+            raise FileExistsError(f"SpecFlow round already exists: {path}")
+        manifest = _read_json(self.manifest_path)
+        if manifest.get("current_round") != round_ref.parent_round:
+            raise ValueError("new round must name the current round as its parent")
+        path.mkdir(parents=False, exist_ok=False)
+        try:
+            for stage in stage_contract_snapshot():
+                (path / f"{stage['ordinal']:02d}_{stage['name']}").mkdir()
+            _write_json(
+                path / "round.json",
+                {
+                    "schema_version": "specflow_round.v1",
+                    "round_id": round_ref.round_id,
+                    "parent_round": round_ref.parent_round,
+                    "revision_request_sha256": round_ref.revision_request_sha256,
+                    "state": "indexing",
+                },
+            )
+        except BaseException:
+            shutil.rmtree(path)
+            raise
+        manifest["current_round"] = round_ref.round_id
+        _write_json(self.manifest_path, manifest)
+        return path
+
+    def record_indexes(self, artifacts: Dict[str, Path]) -> Dict[str, str]:
+        """Bind completed deterministic index artifacts into the run manifest."""
+
+        manifest = _read_json(self.manifest_path)
+        if manifest.get("index_hashes"):
+            raise ValueError("index hashes are immutable once recorded")
+        hashes = {}
+        for name, path in sorted(artifacts.items()):
+            path = Path(path).resolve()
+            try:
+                path.relative_to(self.indexes_dir)
+            except ValueError as exc:
+                raise ValueError("index artifact is outside the run indexes directory") from exc
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            hashes[name] = _file_sha256(path)
+        manifest["index_hashes"] = hashes
+        manifest["preflight_status"] = "index_ready"
+        _write_json(self.manifest_path, manifest)
+        round_path = self.round_dir(manifest["current_round"]) / "round.json"
+        round_manifest = _read_json(round_path)
+        round_manifest["state"] = "index_ready"
+        _write_json(round_path, round_manifest)
+        return hashes
+
+
+def _materialize_model_view(
+    project: ProjectContract, project_copy: Path, destination: Path
+) -> Dict[str, Any]:
+    files = []
+    source_ids = set()
+    for relative in project.model_visible_files:
+        source = project_copy / relative
+        text = source.read_text(encoding="utf-8")
+        match = _MODEL_LEAK_RE.search(text)
+        if match is not None:
+            raise ValueError(
+                f"model-visible source contains evaluator leakage token {match.group(0)!r}: {relative}"
+            )
+        source_id = "source_" + hashlib.sha256(str(relative).encode("utf-8")).hexdigest()[:16]
+        if source_id in source_ids:
+            raise ValueError("duplicate model-visible source ID")
+        source_ids.add(source_id)
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        files.append(
+            {
+                "source_id": source_id,
+                "path": str(relative),
+                "sha256": _file_sha256(target),
+                "provenance": {
+                    "kind": "allowlisted_exact_copy",
+                    "project_contract_sha256": _file_sha256(project.path),
+                },
+            }
+        )
+    return {
+        "schema_version": MODEL_VIEW_MANIFEST_SCHEMA_VERSION,
+        "files": files,
+    }
+
+
+def _copy_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(Path(source), destination)
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _tree_sha256(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(item for item in Path(root).rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(_file_sha256(path)))
+    return digest.hexdigest()
+
+
+def _write_json(path: Path, value: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"JSON object required: {path}")
+    return value
