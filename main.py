@@ -9,7 +9,7 @@ ChiselLMFV - 统一入口
    - → waveform_explanation (结合 VerilogCausalAnalysis 因果分析)
    - → propose_bugfix
 2. Verilog→Chisel 转换 (Verilog2Chisel)：自动将 Verilog 代码转换为 Chisel
-3. ChiselSpecFlow V5：typed authoring/review 与 deterministic compile_verify
+3. ChiselSpecFlow V5：typed authoring/review、deterministic compile_verify 与 reviewed diagnose
 
 使用方式：
     # 形式化验证
@@ -40,12 +40,12 @@ def _exit(llm_client, logger, success: bool):
 
 
 def main_specflow(args):
-    """Run the implemented SpecFlow boundary through deterministic Stage 2."""
+    """Run the implemented three-stage SpecFlow production boundary."""
 
     if args.specflow_action is None:
         print(
-            "ChiselSpecFlow supports `start`, `review`, and `resume --through compile_verify`. "
-            "Diagnosis belongs to Iteration 4."
+            "ChiselSpecFlow supports `start`, `review`, and "
+            "`resume --through compile_verify|diagnose` (or `--new-round`)."
         )
         return
     if args.specflow_action == "start":
@@ -76,9 +76,15 @@ def main_specflow(args):
         print(json.dumps({"run_dir": str(run_dir), "status": result.status}, sort_keys=True))
         return
     if args.specflow_action == "review":
-        from src.chiselspecflow.review import install_review
+        record = json.loads(Path(args.review_record).read_text(encoding="utf-8"))
+        if record.get("schema_version") == "diagnosis_review.v1":
+            from src.chiselspecflow.diagnosis import install_diagnosis_review
 
-        result = install_review(Path(args.run), Path(args.review_record))
+            result = install_diagnosis_review(Path(args.run), Path(args.review_record))
+        else:
+            from src.chiselspecflow.review import install_review
+
+            result = install_review(Path(args.run), Path(args.review_record))
         print(
             json.dumps(
                 {
@@ -91,15 +97,49 @@ def main_specflow(args):
         )
         return
     if args.specflow_action == "resume":
+        if args.new_round:
+            from src.chiselspecflow.diagnosis import create_revision_round
+
+            round_dir = create_revision_round(Path(args.run))
+            print(
+                json.dumps(
+                    {
+                        "run_dir": str(Path(args.run).resolve()),
+                        "status": "revision_round_created",
+                        "round_dir": str(round_dir),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return
+
         from src.chiselspecflow.runner import run_compile_verify
 
-        if args.through != "compile_verify":
-            raise ValueError("Iteration 3 can resume only through compile_verify")
-        result = run_compile_verify(
-            Path(args.run),
-            timeout_seconds=args.timeout_seconds,
-            per_property_seconds=args.per_property_seconds,
-        )
+        run_path = Path(args.run)
+        if args.through == "compile_verify":
+            result = run_compile_verify(
+                run_path,
+                timeout_seconds=args.timeout_seconds,
+                per_property_seconds=args.per_property_seconds,
+            )
+        else:
+            from src.chiselspecflow.diagnosis import run_diagnose
+            from src.chiselspecflow.runner import load_existing_workspace
+            from src.chiselspecflow.stages import get_stage_spec
+            from src.core.artifact_contract import validate_completed_stage
+            from src.core.llm_router import LLMRouter
+
+            workspace = load_existing_workspace(run_path)
+            manifest = json.loads(workspace.manifest_path.read_text(encoding="utf-8"))
+            stage2 = workspace.stage_dir(manifest["current_round"], "compile_verify")
+            if validate_completed_stage(stage2, get_stage_spec("compile_verify")) is None:
+                run_compile_verify(
+                    run_path,
+                    timeout_seconds=args.timeout_seconds,
+                    per_property_seconds=args.per_property_seconds,
+                )
+            model = LLMRouter(max_token_budget=args.max_tokens)
+            result = run_diagnose(run_path, model, track_d=args.track_d)
         print(
             json.dumps(
                 {
@@ -108,6 +148,7 @@ def main_specflow(args):
                     "formal_outcome": result.get("formal_outcome"),
                     "evidence_status": result.get("evidence_status"),
                     "semantic_candidate": result.get("semantic_candidate"),
+                    "final_verdict": result.get("final_verdict"),
                     "model_calls": result.get("model_calls"),
                 },
                 sort_keys=True,
@@ -841,14 +882,14 @@ def parse_args(argv=None):
     run_parser.add_argument('--max-repair-rounds', type=int, default=3,
                             help='stage 5 repair-regression loop 最大轮数（默认: 3）')
 
-    # ChiselSpecFlow V5 production entrypoint through deterministic Stage 2.
+    # ChiselSpecFlow V5 three-stage production entrypoint.
     specflow_parser = subparsers.add_parser(
         'specflow',
-        help='ChiselSpecFlow V5 typed authoring/review/compile_verify',
+        help='ChiselSpecFlow V5 typed authoring/review/compile_verify/diagnose',
         description=(
             'ChiselSpecFlow V5: asset_authoring -> compile_verify -> diagnose. '
-            'Iteration 3 implements bounded asset authoring, external review, '
-            'and deterministic formal Stage 2.'
+            'Implements bounded authoring, external review, deterministic formal, '
+            'source projection, reviewed verdicts, and immutable revision rounds.'
         ),
     )
     specflow_subparsers = specflow_parser.add_subparsers(dest='specflow_action')
@@ -870,14 +911,23 @@ def parse_args(argv=None):
     specflow_review.add_argument('--run', required=True)
     specflow_review.add_argument('--review-record', required=True)
     specflow_resume = specflow_subparsers.add_parser(
-        'resume', help='resume an approved run through deterministic Stage 2'
+        'resume', help='resume through Stage 2, reviewed Stage 3, or a revision round'
     )
     specflow_resume.add_argument('--run', required=True)
     specflow_resume.add_argument(
-        '--through', choices=['compile_verify'], default='compile_verify'
+        '--through', choices=['compile_verify', 'diagnose'], default='compile_verify'
     )
     specflow_resume.add_argument('--timeout-seconds', type=int, default=300)
     specflow_resume.add_argument('--per-property-seconds', type=int, default=60)
+    specflow_resume.add_argument('--max-tokens', type=int, default=None)
+    specflow_resume.add_argument(
+        '--track-d', action='store_true',
+        help='要求 diagnosis candidate 提交可评测 source ranking',
+    )
+    specflow_resume.add_argument(
+        '--new-round', action='store_true',
+        help='从 reviewed typed revision_request 创建下一不可变 round',
+    )
 
     return parser.parse_args(argv)
 

@@ -74,6 +74,7 @@ def run_asset_authoring(
     public_spec = _read_json(workspace.inputs_dir / "public_spec_package.json")
     project = _read_json(workspace.inputs_dir / "project_contract.json")
     configuration = _read_json(workspace.inputs_dir / "configuration.json")
+    revision_context = _load_revision_context(workspace, round_id)
     confirmed = [
         row for row in semantic.get("objects", [])
         if row.get("fact_status") == "elaboration_confirmed"
@@ -116,6 +117,7 @@ def run_asset_authoring(
         "asset_library": assets.snapshot(),
         "input_hashes": manifest["input_hashes"],
         "index_hashes": manifest["index_hashes"],
+        "revision_context": revision_context,
     }
     _write_json(stage_dir / "stage_inputs.json", stage_inputs)
     calls = 0
@@ -205,9 +207,17 @@ def run_asset_authoring(
         )
         calls += used
         call_refs += refs
+        if revision_context["status"] == "required":
+            _validate_revision_scope(
+                workspace,
+                revision_context,
+                raw_obligations,
+                raw_bindings,
+                raw_monitors,
+            )
     except AuthoringError as exc:
         calls = len(call_audit)
-        _write_jsonl(workspace.logs_dir / "model_calls.jsonl", call_audit)
+        _write_jsonl(_model_log_path(workspace, round_id), call_audit)
         _write_json(
             stage_dir / "authoring_candidates.json",
             {
@@ -250,7 +260,7 @@ def run_asset_authoring(
         "model_call_refs": call_refs,
     }
     calls = len(call_audit)
-    _write_jsonl(workspace.logs_dir / "model_calls.jsonl", call_audit)
+    _write_jsonl(_model_log_path(workspace, round_id), call_audit)
     _write_json(stage_dir / "authoring_candidates.json", candidates)
     delta = {
         "schema_version": CANDIDATE_ASSET_DELTA_SCHEMA_VERSION,
@@ -532,6 +542,110 @@ def _contains_forbidden_authoring_content(value: Any) -> bool:
     return False
 
 
+def _load_revision_context(
+    workspace: SpecFlowWorkspace, round_id: int
+) -> Dict[str, Any]:
+    if round_id == 1:
+        return {
+            "schema_version": "revision_context.v1",
+            "status": "not_required",
+            "reason": "initial_round",
+        }
+    round_manifest = _read_json(workspace.round_dir(round_id) / "round.json")
+    parent = round_manifest.get("parent_round")
+    digest = round_manifest.get("revision_request_sha256")
+    if not isinstance(parent, int) or parent >= round_id or not isinstance(digest, str):
+        raise AuthoringError("revision_identity_invalid", "child round identity is malformed")
+    revision_path = workspace.stage_dir(parent, "diagnose") / "revision_request.json"
+    if not revision_path.is_file() or file_sha256(revision_path) != digest:
+        raise AuthoringError("revision_identity_invalid", "parent revision request hash drifted")
+    revision = _read_json(revision_path)
+    if (
+        revision.get("schema_version") != "revision_request.v1"
+        or revision.get("status") != "required"
+        or revision.get("parent_round") != parent
+    ):
+        raise AuthoringError("revision_identity_invalid", "parent revision request is not actionable")
+    return {
+        "schema_version": "revision_context.v1",
+        "status": "required",
+        "parent_round": parent,
+        "revision_request_sha256": digest,
+        "revision_layer": revision["revision_layer"],
+        "evidence_refs": revision["evidence_refs"],
+        "allowed_change_scope": revision["allowed_change_scope"],
+        "forbidden_change_scope": revision["forbidden_change_scope"],
+    }
+
+
+def _validate_revision_scope(
+    workspace: SpecFlowWorkspace,
+    revision: Mapping[str, Any],
+    obligations: list[Mapping[str, Any]],
+    bindings: list[Mapping[str, Any]],
+    monitors: list[Mapping[str, Any]],
+) -> None:
+    parent = revision["parent_round"]
+    reference = _read_json(
+        workspace.stage_dir(parent, "compile_verify") / "verification_package_ref.json"
+    )
+    source_run = Path(reference["source_run"]).resolve()
+    relative = Path(reference["path"])
+    if relative.is_absolute() or ".." in relative.parts:
+        raise AuthoringError("revision_identity_invalid", "parent package path is unsafe")
+    package_path = (source_run / relative).resolve()
+    try:
+        package_path.relative_to(source_run)
+    except ValueError as exc:
+        raise AuthoringError("revision_identity_invalid", "parent package path escapes") from exc
+    if not package_path.is_file() or file_sha256(package_path) != reference.get("sha256"):
+        raise AuthoringError("revision_identity_invalid", "parent package hash drifted")
+    parent_package = _read_json(package_path)
+    layer = revision["revision_layer"]
+    changed = {
+        "obligation": _revision_rows(obligations, "obligation")
+        != _revision_rows(parent_package["obligations"], "obligation"),
+        "binding": _revision_rows(bindings, "binding")
+        != _revision_rows(parent_package["bindings"], "binding"),
+        "monitor": _revision_rows(monitors, "monitor")
+        != _revision_rows(parent_package["monitors"], "monitor"),
+    }
+    allowed = {
+        "obligation": {"obligation", "monitor"},
+        "assumption": {"obligation", "monitor"},
+        "binding": {"binding", "monitor"},
+        "monitor": {"monitor"},
+    }.get(layer)
+    if allowed is None:
+        raise AuthoringError("revision_scope_invalid", f"unsupported revision layer: {layer}")
+    forbidden_changes = sorted(name for name, differs in changed.items() if differs and name not in allowed)
+    if forbidden_changes:
+        raise AuthoringError(
+            "revision_scope_violation",
+            "candidate changes outside typed scope: " + ",".join(forbidden_changes),
+        )
+    if not any(changed[name] for name in allowed):
+        raise AuthoringError("revision_noop", "revision candidate does not change an allowed layer")
+
+
+def _revision_rows(rows: list[Mapping[str, Any]], layer: str) -> str:
+    normalized = []
+    for source in rows:
+        row = json.loads(json.dumps(source, sort_keys=True))
+        row.pop("configuration_domain", None)
+        if layer == "obligation":
+            row.pop("authoring_provenance", None)
+        elif layer == "binding":
+            row.pop("rationale", None)
+            row.pop("rejected_alternatives", None)
+            row.pop("review_state", None)
+            row.pop("validation_errors", None)
+            if isinstance(row.get("compatibility"), dict):
+                row["compatibility"].pop("configuration", None)
+        normalized.append(row)
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+
+
 def _set_review_state(workspace: SpecFlowWorkspace, review_state: str, round_state: str) -> None:
     manifest = _read_json(workspace.manifest_path)
     manifest["review_state"] = review_state
@@ -563,3 +677,10 @@ def _write_jsonl(path: Path, rows: list[Mapping[str, Any]]) -> None:
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
         encoding="utf-8",
     )
+
+
+def _model_log_path(workspace: SpecFlowWorkspace, round_id: int) -> Path:
+    """Keep the round-1 name stable while allowing immutable revision logs."""
+
+    name = "model_calls.jsonl" if round_id == 1 else f"model_calls.round-{round_id:04d}.jsonl"
+    return workspace.logs_dir / name

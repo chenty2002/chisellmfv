@@ -1,4 +1,4 @@
-"""ChiselSpecFlow V5 contracts, deterministic preflight, and Stage-1 gate."""
+"""ChiselSpecFlow V5 three-stage production contracts."""
 
 from .config import (
     GeneratorConfiguration,
@@ -11,6 +11,12 @@ from .preflight import prepare_iteration1_workspace
 from .authoring import run_asset_authoring
 from .monitor_compiler import compile_reviewed_package
 from .review import install_review
+from .diagnosis import (
+    build_diagnosis_review_template,
+    create_revision_round,
+    install_diagnosis_review,
+    run_diagnose,
+)
 from .stages import FINAL_VERDICTS, SPEC_FLOW_STAGES, STAGE_SPECS
 from .workspace import SpecFlowRound, SpecFlowWorkspace
 
@@ -29,4 +35,8 @@ __all__ = [
     "run_asset_authoring",
     "install_review",
     "compile_reviewed_package",
+    "build_diagnosis_review_template",
+    "create_revision_round",
+    "install_diagnosis_review",
+    "run_diagnose",
 ]
