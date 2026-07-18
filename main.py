@@ -9,7 +9,7 @@ ChiselLMFV - 统一入口
    - → waveform_explanation (结合 VerilogCausalAnalysis 因果分析)
    - → propose_bugfix
 2. Verilog→Chisel 转换 (Verilog2Chisel)：自动将 Verilog 代码转换为 Chisel
-3. ChiselSpecFlow V5：Iteration 0 仅暴露冻结的 CLI/contract 帮助
+3. ChiselSpecFlow V5：typed authoring/review 与 deterministic compile_verify
 
 使用方式：
     # 形式化验证
@@ -25,6 +25,7 @@ import sys
 import argparse
 import json
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -36,6 +37,84 @@ def _exit(llm_client, logger, success: bool):
     """辅助退出函数，打印 token 使用情况"""
     llm_client.print_token_usage(logger)
     sys.exit(0 if success else 1)
+
+
+def main_specflow(args):
+    """Run the implemented SpecFlow boundary through deterministic Stage 2."""
+
+    if args.specflow_action is None:
+        print(
+            "ChiselSpecFlow supports `start`, `review`, and `resume --through compile_verify`. "
+            "Diagnosis belongs to Iteration 4."
+        )
+        return
+    if args.specflow_action == "start":
+        from src.chiselspecflow.authoring import run_asset_authoring
+        from src.chiselspecflow.config import SpecFlowRunConfig, load_project_contract
+        from src.chiselspecflow.preflight import prepare_iteration1_workspace
+        from src.core.llm_router import LLMRouter
+
+        project_path = Path(args.project_contract).resolve()
+        project = load_project_contract(project_path)
+        run_root = Path(args.run_root).resolve()
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_dir = run_root / f"{stamp}-{project.project_id}-{os.urandom(4).hex()}"
+        config = SpecFlowRunConfig(
+            project_contract=project_path,
+            specification=Path(args.spec).resolve(),
+            configuration=Path(args.config).resolve(),
+            run_root=run_root,
+            opaque_task_id=args.task_id,
+        )
+        workspace = prepare_iteration1_workspace(
+            config,
+            run_dir,
+            Path(args.suite_ledger).resolve(),
+        )
+        model = LLMRouter(max_token_budget=args.max_tokens)
+        result = run_asset_authoring(workspace, model)
+        print(json.dumps({"run_dir": str(run_dir), "status": result.status}, sort_keys=True))
+        return
+    if args.specflow_action == "review":
+        from src.chiselspecflow.review import install_review
+
+        result = install_review(Path(args.run), Path(args.review_record))
+        print(
+            json.dumps(
+                {
+                    "run_dir": str(Path(args.run).resolve()),
+                    "status": result.get("status"),
+                    "success": result.get("success") is True,
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    if args.specflow_action == "resume":
+        from src.chiselspecflow.runner import run_compile_verify
+
+        if args.through != "compile_verify":
+            raise ValueError("Iteration 3 can resume only through compile_verify")
+        result = run_compile_verify(
+            Path(args.run),
+            timeout_seconds=args.timeout_seconds,
+            per_property_seconds=args.per_property_seconds,
+        )
+        print(
+            json.dumps(
+                {
+                    "run_dir": str(Path(args.run).resolve()),
+                    "status": result.get("status"),
+                    "formal_outcome": result.get("formal_outcome"),
+                    "evidence_status": result.get("evidence_status"),
+                    "semantic_candidate": result.get("semantic_candidate"),
+                    "model_calls": result.get("model_calls"),
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    raise ValueError(f"unknown specflow action: {args.specflow_action}")
 
 
 def main_formal(args):
@@ -762,17 +841,43 @@ def parse_args(argv=None):
     run_parser.add_argument('--max-repair-rounds', type=int, default=3,
                             help='stage 5 repair-regression loop 最大轮数（默认: 3）')
 
-    # ChiselSpecFlow V5 contract-only entrypoint. Operational nested commands
-    # are added by their owning iterations; Iteration 0 promises help only.
-    subparsers.add_parser(
+    # ChiselSpecFlow V5 production entrypoint through deterministic Stage 2.
+    specflow_parser = subparsers.add_parser(
         'specflow',
-        help='ChiselSpecFlow V5 三阶段工作流（Iteration 0 contract only）',
+        help='ChiselSpecFlow V5 typed authoring/review/compile_verify',
         description=(
             'ChiselSpecFlow V5: asset_authoring -> compile_verify -> diagnose. '
-            'Iteration 0 freezes schemas and stage contracts; start/review/resume '
-            'execution is not implemented yet.'
+            'Iteration 3 implements bounded asset authoring, external review, '
+            'and deterministic formal Stage 2.'
         ),
     )
+    specflow_subparsers = specflow_parser.add_subparsers(dest='specflow_action')
+    specflow_start = specflow_subparsers.add_parser(
+        'start', help='materialize/index a project and author typed Stage-1 candidates'
+    )
+    specflow_start.add_argument('--project-contract', required=True)
+    specflow_start.add_argument('--spec', required=True)
+    specflow_start.add_argument('--config', required=True)
+    specflow_start.add_argument('--run-root', default='runs/specflow')
+    specflow_start.add_argument(
+        '--suite-ledger', default='benchmark/synth/SPECIFICATIONS.sha256'
+    )
+    specflow_start.add_argument('--task-id', default=None)
+    specflow_start.add_argument('--max-tokens', type=int, default=None)
+    specflow_review = specflow_subparsers.add_parser(
+        'review', help='install one external hash-bound Codex/human review record'
+    )
+    specflow_review.add_argument('--run', required=True)
+    specflow_review.add_argument('--review-record', required=True)
+    specflow_resume = specflow_subparsers.add_parser(
+        'resume', help='resume an approved run through deterministic Stage 2'
+    )
+    specflow_resume.add_argument('--run', required=True)
+    specflow_resume.add_argument(
+        '--through', choices=['compile_verify'], default='compile_verify'
+    )
+    specflow_resume.add_argument('--timeout-seconds', type=int, default=300)
+    specflow_resume.add_argument('--per-property-seconds', type=int, default=60)
 
     return parser.parse_args(argv)
 
@@ -803,10 +908,7 @@ def main():
     elif args.command == 'run':
         main_coupledl2_run(args)
     elif args.command == 'specflow':
-        print(
-            "ChiselSpecFlow Iteration 0 only freezes the CLI and data contracts; "
-            "start/review/resume are not implemented yet."
-        )
+        main_specflow(args)
     else:
         print("错误: 请指定工作流类型 (formal, v2c, quality, run, specflow)")
         print("运行 'python main.py --help' 查看帮助")

@@ -10,10 +10,16 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .config import GeneratorConfiguration, ProjectContract
+from src.core.artifact_contract import file_sha256
+from .property_identity import label_emitted_properties, write_certificate
 
 
 class BaselineElaborationError(RuntimeError):
     """Raised when the deterministic baseline elaboration cannot be trusted."""
+
+
+class VerificationElaborationError(RuntimeError):
+    """Raised when the reviewed overlay cannot be elaborated exactly."""
 
 
 _MODULE_RE = re.compile(r"\bmodule\s+([A-Za-z_][A-Za-z0-9_$]*)\s*\(")
@@ -137,6 +143,78 @@ def elaborate_baseline(
     return value
 
 
+def elaborate_verification_overlay(
+    workspace_project: Path,
+    stage_dir: Path,
+    *,
+    configuration_id: str,
+    verification_package_path: Path,
+    overlay_manifest_path: Path,
+    source_assertion_delta_path: Path,
+) -> Dict[str, Any]:
+    """Clean-compile and elaborate the generated wrapper with source locators."""
+
+    workspace_project = Path(workspace_project).resolve()
+    stage_dir = Path(stage_dir).resolve()
+    generated_root = workspace_project / "specflow-verify-generated"
+    if generated_root.exists():
+        raise VerificationElaborationError(
+            "verification elaboration output already exists; round artifacts are immutable"
+        )
+    compile_argv = ["sbt", "--error", "compile"]
+    compile_result = _run(compile_argv, workspace_project)
+    if compile_result.returncode != 0:
+        raise VerificationElaborationError(
+            "verification overlay compile failed:\n" + compile_result.stdout[-5000:]
+        )
+    run_main = "runMain chisellmfv.generated.EmitSpecFlowOverlay " + _sbt_quote(
+        generated_root
+    )
+    elaborate_argv = ["sbt", "--error", run_main]
+    elaborate_result = _run(elaborate_argv, workspace_project)
+    if elaborate_result.returncode != 0:
+        raise VerificationElaborationError(
+            "verification overlay elaboration failed:\n"
+            + elaborate_result.stdout[-5000:]
+        )
+    sv_files = sorted(path.resolve() for path in generated_root.rglob("*.sv"))
+    if not sv_files:
+        raise VerificationElaborationError("verification overlay emitted no SystemVerilog")
+    source_delta = _read_json(source_assertion_delta_path)
+    overlay_manifest = _read_json(overlay_manifest_path)
+    identities = label_emitted_properties(
+        sv_files,
+        source_delta,
+        wrapper_top=overlay_manifest["wrapper_top"],
+    )
+    if len(identities) != len(source_delta.get("properties", [])):
+        raise VerificationElaborationError("not every source property has an exact identity")
+    generated_files = [
+        {
+            "path": str(path),
+            "sha256": file_sha256(path),
+            "bytes": path.stat().st_size,
+        }
+        for path in sv_files
+    ]
+    certificate = {
+        "schema_version": "elaboration_certificate.v1",
+        "configuration_id": configuration_id,
+        "wrapper_top": overlay_manifest["wrapper_top"],
+        "verification_package_sha256": file_sha256(verification_package_path),
+        "source_assertion_delta_sha256": file_sha256(source_assertion_delta_path),
+        "overlay_manifest_sha256": file_sha256(overlay_manifest_path),
+        "commands": {
+            "compile_argv": compile_argv,
+            "elaborate_argv": elaborate_argv,
+        },
+        "generated_files": generated_files,
+        "property_identities": identities,
+    }
+    write_certificate(stage_dir / "elaboration_certificate.json", certificate)
+    return certificate
+
+
 def _run(argv: List[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         argv,
@@ -246,3 +324,10 @@ def _sbt_quote(value: Path) -> str:
 
 def _file_sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise VerificationElaborationError(f"JSON object required: {path}")
+    return value

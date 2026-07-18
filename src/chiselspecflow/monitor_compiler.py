@@ -227,7 +227,12 @@ def render_overlay(
     if adapter.get("project_id") != project_contract.get("project_id") or adapter.get("strategy") != "wrapper":
         raise MonitorCompilerError("API adapter does not match the wrapper project")
     constructor = _render_constructor(adapter["constructor_template"], configuration["parameters"])
-    imports = ["import chisel3._", "import chisel3.util._"] + [
+    imports = [
+        "import chisel3._",
+        "import chisel3.util._",
+        "import _root_.circt.stage.ChiselStage",
+        "import java.nio.file.Paths",
+    ] + [
         f"import {item}" for item in adapter["imports"]
     ]
     lines = ["package chisellmfv.generated", "", *imports, "", "final class SpecFlowOverlay extends Module {", f"  val dut = Module({constructor})"]
@@ -254,14 +259,16 @@ def render_overlay(
             role = row["role"]
             lines.append(f"  // {label} {row['source_property_id']} {role}")
             anchor_line = len(lines) + 1
-            predicate = f"(({row['guard']}) && ({row['expression']}))"
             if role == "primary_assertion":
+                predicate = f"((!({row['guard']})) || ({row['expression']}))"
                 lines.append(f"  assert({predicate}, \"{label}\")")
                 kind = "assert"
             elif role == "assumption_sat":
+                predicate = f"(({row['guard']}) && ({row['expression']}))"
                 lines.append(f"  cover({predicate})")
                 kind = "cover"
             else:
+                predicate = f"(({row['guard']}) && ({row['expression']}))"
                 lines.append(f"  cover({predicate})")
                 kind = "cover"
             properties.append(
@@ -275,7 +282,26 @@ def render_overlay(
                     },
                 }
             )
-    lines.append("}")
+    lines.extend(
+        [
+            "}",
+            "",
+            "/** Verification-only overlay emitter; source locations are retained. */",
+            "object EmitSpecFlowOverlay extends App {",
+            '  require(args.length == 1, "output directory is required")',
+            '  val targetDir = Paths.get(args(0)).resolve("rtl").toAbsolutePath.toString',
+            "  ChiselStage.emitSystemVerilogFile(",
+            "    new SpecFlowOverlay,",
+            '    args = Array("--target-dir", targetDir),',
+            "    firtoolOpts = Array(",
+            '      "--disable-all-randomization",',
+            '      "--emit-chisel-asserts-as-sva",',
+            '      "--lowering-options=disallowLocalVariables,disallowPackedArrays,verifLabels"',
+            "    )",
+            "  )",
+            "}",
+        ]
+    )
     return RenderedOverlay("\n".join(lines) + "\n", tuple(properties), "SpecFlowOverlay")
 
 
@@ -283,18 +309,25 @@ def compile_reviewed_package(
     workspace: Any,
     output_dir: Optional[Path] = None,
     asset_library: Optional[AssetLibrary] = None,
+    package_path: Optional[Path] = None,
+    frozen_replay: bool = False,
 ) -> CompiledOverlay:
     """Render the reviewed package into the copied project, transactionally."""
 
     assets = asset_library or load_reviewed_assets()
     manifest = _read_json(workspace.manifest_path)
-    if manifest.get("review_state") != "approved":
-        raise MonitorCompilerError("verification package is not review-approved")
     round_id = manifest["current_round"]
-    stage1 = workspace.stage_dir(round_id, "asset_authoring")
-    if validate_completed_stage(stage1, get_stage_spec("asset_authoring")) is None:
-        raise MonitorCompilerError("asset_authoring handoff or artifact hash is invalid")
-    package_path = stage1 / "verification_package.json"
+    if frozen_replay:
+        if package_path is None:
+            raise MonitorCompilerError("frozen replay requires an exact package path")
+        package_path = Path(package_path).resolve()
+    else:
+        if manifest.get("review_state") != "approved":
+            raise MonitorCompilerError("verification package is not review-approved")
+        stage1 = workspace.stage_dir(round_id, "asset_authoring")
+        if validate_completed_stage(stage1, get_stage_spec("asset_authoring")) is None:
+            raise MonitorCompilerError("asset_authoring handoff or artifact hash is invalid")
+        package_path = stage1 / "verification_package.json"
     package = load_run_local_package(package_path)
     semantic = _read_json(workspace.indexes_dir / "chisel_semantic_index.json")
     project = _read_json(workspace.inputs_dir / "project_contract.json")
@@ -309,7 +342,7 @@ def compile_reviewed_package(
         for row in package["bindings"]
     }
     if len(adapters) != 1:
-        raise MonitorCompilerError("Iteration 2 requires one exact wrapper API adapter")
+        raise MonitorCompilerError("the current compiler requires one exact wrapper API adapter")
     adapter_id = next(iter(adapters))
     adapter = assets.api_adapters.get(adapter_id)
     if adapter is None:
@@ -349,7 +382,7 @@ def compile_reviewed_package(
             },
             "monitor_ids": [unit.monitor_id for unit in units],
             "property_count": len(rendered.properties),
-            "compiler": "chiselspecflow.monitor_compiler.iteration2",
+            "compiler": "chiselspecflow.monitor_compiler.v1",
         },
     )
     diff_path = output / "overlay_diff.patch"

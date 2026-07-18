@@ -30,6 +30,8 @@ SOURCE_ASSERTION_DELTA_SCHEMA_VERSION = "source_assertion_delta.v1"
 ELABORATION_CERTIFICATE_SCHEMA_VERSION = "elaboration_certificate.v1"
 OPERATION_PLAN_SCHEMA_VERSION = "verification_operation_plan.v2"
 PROPERTY_RESULT_MAP_SCHEMA_VERSION = "property_result_map.v5"
+SEMANTIC_EVIDENCE_SCHEMA_VERSION = "semantic_evidence.v3"
+TRACE_MANIFEST_SCHEMA_VERSION = "trace_manifest.v1"
 EVIDENCE_PROJECTION_SCHEMA_VERSION = "evidence_projection.v1"
 DIAGNOSIS_CANDIDATE_SCHEMA_VERSION = "diagnosis_candidate.v1"
 FINAL_VERDICT_SCHEMA_VERSION = "final_verdict.v1"
@@ -57,6 +59,8 @@ SCHEMA_VERSIONS: Mapping[str, str] = MappingProxyType(
         "elaboration_certificate": ELABORATION_CERTIFICATE_SCHEMA_VERSION,
         "operation_plan": OPERATION_PLAN_SCHEMA_VERSION,
         "property_result_map": PROPERTY_RESULT_MAP_SCHEMA_VERSION,
+        "semantic_evidence": SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+        "trace_manifest": TRACE_MANIFEST_SCHEMA_VERSION,
         "evidence_projection": EVIDENCE_PROJECTION_SCHEMA_VERSION,
         "diagnosis_candidate": DIAGNOSIS_CANDIDATE_SCHEMA_VERSION,
         "final_verdict": FINAL_VERDICT_SCHEMA_VERSION,

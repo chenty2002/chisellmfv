@@ -74,7 +74,7 @@ def validate_monitor(
         raise MonitorValidationError("observer_strategy_unsupported", str(overlay.get("strategy")))
     if value["reset_policy"] != "disable_while_reset":
         raise MonitorValidationError(
-            "invalid_reset_policy", "Iteration 2 requires disable_while_reset"
+            "invalid_reset_policy", "the current compiler requires disable_while_reset"
         )
     observations = value["required_observations"]
     if not isinstance(observations, list) or not observations or any(ref not in binding_ids for ref in observations):
