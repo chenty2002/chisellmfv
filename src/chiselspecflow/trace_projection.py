@@ -237,6 +237,13 @@ def _build_observation_map(
         if object_id in seen_objects:
             raise TraceProjectionError("multiple bindings alias one source object")
         seen_objects.add(object_id)
+        emitted_signal = f"{wrapper_top}.{row['name']}"
+        if row.get("direction") == "internal" and row.get("accessibility") == "wrapper":
+            # Wrapper-accessible internals are acquired with BoringUtils for
+            # property compilation, while formal traces retain the exact DUT
+            # register in the nested instance scope.  Join to that stable
+            # semantic object rather than a CIRCT-generated bore wire name.
+            emitted_signal = f"{wrapper_top}.dut.{row['name']}"
         bindings.append(
             {
                 "binding_id": binding["binding_id"],
@@ -247,7 +254,7 @@ def _build_observation_map(
                     "width": row["chisel_type"]["width"],
                     "signed": row["chisel_type"]["signed"],
                 },
-                "emitted_signal": f"{wrapper_top}.{row['name']}",
+                "emitted_signal": emitted_signal,
             }
         )
     states = []
@@ -702,6 +709,15 @@ def _evaluate_expression(
     if op == "popcount":
         value = _evaluate_expression(node["arg"], objects, states)
         return None if value is None else int(value).bit_count()
+    if op == "bit_select":
+        value = _evaluate_expression(node["arg"], objects, states)
+        return None if value is None else (int(value) >> node["index"]) & 1
+    if op == "slice":
+        value = _evaluate_expression(node["arg"], objects, states)
+        if value is None:
+            return None
+        width = node["high"] - node["low"] + 1
+        return (int(value) >> node["low"]) & ((1 << width) - 1)
     if op == "bounded_counter_relation":
         value = states.get(node["counter_state_id"])
         if value is None:

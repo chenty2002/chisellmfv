@@ -62,6 +62,18 @@ def merge_semantic_index(
                     errors.append("source_anchor_mismatch")
         confirmed = not errors
         row = dict(candidate)
+        anchor = dict(row.get("source_anchor", {}))
+        source_relative = anchor.get("path")
+        if isinstance(source_relative, str):
+            source_path = (project.project_root / source_relative).resolve()
+            try:
+                source_path.relative_to(project.project_root)
+            except ValueError as exc:
+                raise SemanticIndexError("source anchor escapes the project root") from exc
+            if not source_path.is_file():
+                raise SemanticIndexError("source anchor does not name a project file")
+            anchor["source_sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            row["source_anchor"] = anchor
         row.update(
             {
                 "owner_module": top if fact is not None else candidate.get("owner_module"),

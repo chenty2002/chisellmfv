@@ -172,13 +172,44 @@ def _context_has_locator(context: str, source_path: str, line: int) -> bool:
     basename = Path(source_path).name
     if basename not in context:
         return False
-    return bool(
-        re.search(
-            rf"(?:{re.escape(basename)}:|,\s*:){line}(?::|:\{{)",
-            context,
-        )
-    )
+    # CIRCT carries every shared predicate subexpression locator into later
+    # verification statements.  The statement's own Scala line is the last
+    # (and therefore greatest) locator in the generated overlay, whose
+    # properties are rendered in source order.  Selecting only that primary
+    # locator prevents an earlier cover from matching every later cover that
+    # reuses its expression cone.
+    full = [
+        int(value)
+        for value in re.findall(rf"{re.escape(basename)}:([0-9]+)(?::|:\{{)", context)
+    ]
+    shorthand = [
+        int(value)
+        for value in re.findall(r",\s*:([0-9]+)(?::|:\{)", context)
+    ]
+    locators = full + shorthand
+    return bool(locators) and max(locators) == line
 
 
 def _statement_context(lines: list[str], index: int) -> str:
-    return "".join(lines[index : min(len(lines), index + 4)])
+    chunks = []
+    property_seen = False
+    for line in lines[index:]:
+        chunks.append(line)
+        if re.search(r"\b(?:assert|cover)\s+property\b", line):
+            property_seen = True
+        # Ordinary SystemVerilog labels such as ``default:`` and procedural
+        # block labels share the same lexical shape as an emitted property
+        # label.  Their first statement terminator must stop the lookahead;
+        # otherwise a later assertion in the module can be attributed to the
+        # unrelated label.
+        if ";" in line:
+            break
+        if not property_seen and re.match(
+            r"\s*(?:end(?:case|module|generate)?|else)\b", line
+        ):
+            break
+        if not property_seen and len(chunks) >= 8:
+            break
+        if property_seen and len(chunks) >= 128:
+            raise PropertyIdentityError("emitted property statement is not terminated")
+    return "".join(chunks)

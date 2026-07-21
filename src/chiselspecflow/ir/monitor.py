@@ -54,7 +54,7 @@ def validate_monitor(
         raise MonitorValidationError("unknown_obligation", str(value["obligation_id"]))
     archetype_id = value["archetype_id"]
     archetype = archetypes.get(archetype_id)
-    if archetype is None or archetype_id not in {"direct_relation.v1", "previous_value.v1"}:
+    if archetype is None:
         raise MonitorValidationError("unsupported_archetype", str(archetype_id))
     if value["archetype_sha256"] != archetype.get("sha256"):
         raise MonitorValidationError("archetype_hash_mismatch", str(archetype_id))
@@ -83,10 +83,7 @@ def validate_monitor(
     states = value["state"]
     if not isinstance(states, list):
         raise MonitorValidationError("malformed_state", "state must be a list")
-    if archetype_id == "direct_relation.v1" and states:
-        raise MonitorValidationError("archetype_state_mismatch", "direct_relation has no state")
-    if archetype_id == "previous_value.v1" and not states:
-        raise MonitorValidationError("archetype_state_mismatch", "previous_value requires state")
+    _validate_archetype_state_contract(archetype_id, archetype, states)
     state_types: Dict[str, Mapping[str, Any]] = {}
     for index, state in enumerate(states):
         if not isinstance(state, Mapping) or set(state) != _STATE_FIELDS:
@@ -145,6 +142,63 @@ def validate_monitor(
     value["properties"] = normalized_properties
     value["schema_version"] = MONITOR_SCHEMA_VERSION
     return value
+
+
+def _validate_archetype_state_contract(
+    archetype_id: str,
+    archetype: Mapping[str, Any],
+    states: list[Any],
+) -> None:
+    """Enforce the reviewed archetype's bounded state shape.
+
+    The compiler is intentionally generic over state IDs.  Repository assets,
+    rather than Python conditionals keyed by asset name, declare how much state
+    a semantic shape needs.  ``required_type_kinds`` means at least one state
+    row of every listed type; it does not grant a raw-code escape hatch.
+    """
+
+    contract = archetype.get("state_contract")
+    if not isinstance(contract, Mapping) or set(contract) != {
+        "minimum_count",
+        "maximum_count",
+        "required_type_kinds",
+    }:
+        raise MonitorValidationError(
+            "malformed_archetype", f"{archetype_id} has no exact state contract"
+        )
+    minimum = contract["minimum_count"]
+    maximum = contract["maximum_count"]
+    required = contract["required_type_kinds"]
+    if (
+        not isinstance(minimum, int)
+        or isinstance(minimum, bool)
+        or minimum < 0
+        or not isinstance(maximum, int)
+        or isinstance(maximum, bool)
+        or maximum < minimum
+        or not isinstance(required, list)
+        or any(kind not in {"Bool", "UInt", "SInt"} for kind in required)
+        or len(set(required)) != len(required)
+    ):
+        raise MonitorValidationError(
+            "malformed_archetype", f"{archetype_id} state contract is invalid"
+        )
+    if not minimum <= len(states) <= maximum:
+        raise MonitorValidationError(
+            "archetype_state_mismatch",
+            f"{archetype_id} requires {minimum}..{maximum} state rows",
+        )
+    actual_kinds = {
+        state.get("type", {}).get("kind")
+        for state in states
+        if isinstance(state, Mapping) and isinstance(state.get("type"), Mapping)
+    }
+    missing = sorted(set(required) - actual_kinds)
+    if missing:
+        raise MonitorValidationError(
+            "archetype_state_mismatch",
+            f"{archetype_id} lacks required state types {missing}",
+        )
 
 
 def expected_property_label(source_property_id: str, role: str) -> str:

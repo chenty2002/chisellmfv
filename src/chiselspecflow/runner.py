@@ -12,6 +12,7 @@ from src.core.artifact_contract import (
     write_stage_outcome,
 )
 
+from .applicability import classify_package_applicability
 from .assets import load_run_local_package
 from .backend import JasperGoldBackend
 from .config import SpecFlowRunConfig
@@ -62,6 +63,8 @@ class CompileVerifyStage:
             "project_contract_sha256",
             "specification_sha256",
             "public_spec_package_sha256",
+            "property_decomposition_sha256",
+            "authoring_scope_sha256",
             "model_view_manifest_sha256",
         ):
             if package["input_hashes"].get(key) != manifest["input_hashes"].get(key):
@@ -70,6 +73,26 @@ class CompileVerifyStage:
                 )
         if not replay and package["configuration_id"] != manifest["configuration_id"]:
             raise SpecFlowRunnerError("verification package configuration does not match run")
+        applicability = classify_package_applicability(
+            package,
+            _read_json(package_workspace.indexes_dir / "chisel_semantic_index.json"),
+            _read_json(workspace.indexes_dir / "chisel_semantic_index.json"),
+            manifest["configuration_id"],
+        )
+        if applicability["classification"] == "not_applicable":
+            reasons = sorted(
+                {
+                    reason
+                    for row in applicability["binding_rows"]
+                    for reason in row["reasons"]
+                }
+            )
+            raise SpecFlowRunnerError(
+                "verification package is not applicable to target configuration: "
+                + ",".join(reasons)
+            )
+        applicability_path = stage2 / "package_applicability.json"
+        write_json(applicability_path, applicability)
         verification_package_ref = {
             "schema_version": "verification_package_ref.v1",
             "mode": "frozen_replay" if replay else "authored_run",
@@ -80,6 +103,8 @@ class CompileVerifyStage:
             "review_record_sha256": package["review"]["review_record_sha256"],
             "source_configuration_id": package["configuration_id"],
             "target_configuration_id": manifest["configuration_id"],
+            "applicability": applicability["classification"],
+            "applicability_sha256": file_sha256(applicability_path),
         }
         write_json(stage2 / "verification_package_ref.json", verification_package_ref)
 
@@ -262,6 +287,8 @@ def _validate_run_integrity(
         "configuration_sha256": workspace.inputs_dir / "configuration.json",
         "specification_sha256": workspace.inputs_dir / "specification.md",
         "public_spec_package_sha256": workspace.inputs_dir / "public_spec_package.json",
+        "property_decomposition_sha256": workspace.inputs_dir / "property_decomposition.json",
+        "authoring_scope_sha256": workspace.inputs_dir / "authoring_scope.json",
         "model_view_manifest_sha256": workspace.inputs_dir / "model_view_manifest.json",
     }
     for key, path in input_paths.items():

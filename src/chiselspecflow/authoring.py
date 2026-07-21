@@ -30,6 +30,7 @@ from .ir.monitor import MonitorValidationError, validate_monitor
 from .ir.obligation import ObligationValidationError, validate_obligation
 from .ir.semantic import validate_semantic_index
 from .stages import get_stage_spec
+from .property_decomposition import validate_property_decomposition
 from .workspace import SpecFlowWorkspace
 
 
@@ -72,6 +73,16 @@ def run_asset_authoring(
         _read_json(workspace.indexes_dir / "chisel_semantic_index.json")
     )
     public_spec = _read_json(workspace.inputs_dir / "public_spec_package.json")
+    decomposition = validate_property_decomposition(
+        _read_json(workspace.inputs_dir / "property_decomposition.json"), public_spec
+    )
+    authoring_scope = _read_json(workspace.inputs_dir / "authoring_scope.json")
+    if (
+        authoring_scope.get("schema_version") != "specflow_authoring_scope.v1"
+        or authoring_scope.get("specification_id") != public_spec["specification_id"]
+        or authoring_scope.get("spec_sha256") != public_spec["spec_sha256"]
+    ):
+        raise AuthoringError("authoring_scope_invalid", "public task scope identity mismatch")
     project = _read_json(workspace.inputs_dir / "project_contract.json")
     configuration = _read_json(workspace.inputs_dir / "configuration.json")
     revision_context = _load_revision_context(workspace, round_id)
@@ -91,7 +102,7 @@ def run_asset_authoring(
     }
     clause_slices = _clause_slices(
         workspace.inputs_dir / "specification.md",
-        public_spec["normative_clause_ids"],
+        authoring_scope["clause_ids"],
     )
     stage_inputs = {
         "schema_version": STAGE_INPUTS_SCHEMA_VERSION,
@@ -113,6 +124,7 @@ def run_asset_authoring(
             "spec_sha256": public_spec["spec_sha256"],
             "clauses": clause_slices,
         },
+        "authoring_scope": authoring_scope,
         "semantic_objects": confirmed,
         "asset_library": assets.snapshot(),
         "input_hashes": manifest["input_hashes"],
@@ -123,6 +135,7 @@ def run_asset_authoring(
     calls = 0
     call_refs: list[str] = []
     call_audit: list[Dict[str, Any]] = []
+    candidate_attempts: list[Dict[str, Any]] = []
 
     try:
         raw_obligations, used, refs = _request_candidates(
@@ -133,15 +146,24 @@ def run_asset_authoring(
                 object_types,
                 configuration["configuration_id"],
             ),
-            context={"stage_inputs": stage_inputs, "task": "author verification obligations"},
+            context={
+                "stage_inputs": stage_inputs,
+                "task": (
+                    "author exactly one obligation for each authoring_scope.primary_component_ids; "
+                    "component IDs with cover/state/assumption role hints are monitor evidence, not obligations"
+                ),
+            },
             validator=lambda rows: _validate_obligations(
                 rows,
                 object_types,
                 clause_slices,
                 public_spec["spec_sha256"],
                 configuration["configuration_id"],
+                set(authoring_scope["primary_component_ids"]),
+                authoring_scope["require_complete_primary_set"],
             ),
             audit_log=call_audit,
+            candidate_attempt_log=candidate_attempts,
         )
         calls += used
         call_refs += refs
@@ -172,6 +194,7 @@ def run_asset_authoring(
                 set(assets.api_adapters),
             ),
             audit_log=call_audit,
+            candidate_attempt_log=candidate_attempts,
         )
         calls += used
         call_refs += refs
@@ -185,14 +208,24 @@ def run_asset_authoring(
                 binding_ids,
                 object_types,
                 configuration["configuration_id"],
-                ("direct_relation.v1", "previous_value.v1"),
-                public_spec["expected_property_ids"],
+                assets.monitor_archetypes,
+                authoring_scope["component_ids"],
             ),
             context={
                 "task": "compose typed monitor IR from reviewed archetype IDs",
                 "obligations": raw_obligations,
                 "bindings": raw_bindings,
-                "archetypes": assets.snapshot()["monitor_archetypes"],
+                "archetypes": {
+                    asset_id: dict(asset)
+                    for asset_id, asset in assets.monitor_archetypes.items()
+                },
+                "component_role_hints": authoring_scope["component_role_hints"],
+                "typed_state_contract": {
+                    "init": "must have exactly the declared state type",
+                    "update": "must have exactly the declared state type",
+                    "clear": "must be Bool regardless of the declared state type",
+                    "property_expression_and_guard": "must both be Bool",
+                },
             },
             validator=lambda rows: _validate_monitors(
                 rows,
@@ -201,9 +234,12 @@ def run_asset_authoring(
                 binding_ids,
                 assets,
                 configuration["configuration_id"],
-                set(public_spec["expected_property_ids"]),
+                set(authoring_scope["component_ids"]),
+                authoring_scope["component_role_hints"],
+                authoring_scope["require_complete_primary_set"],
             ),
             audit_log=call_audit,
+            candidate_attempt_log=candidate_attempts,
         )
         calls += used
         call_refs += refs
@@ -218,6 +254,9 @@ def run_asset_authoring(
     except AuthoringError as exc:
         calls = len(call_audit)
         _write_jsonl(_model_log_path(workspace, round_id), call_audit)
+        _write_jsonl(
+            _candidate_attempt_log_path(workspace, round_id), candidate_attempts
+        )
         _write_json(
             stage_dir / "authoring_candidates.json",
             {
@@ -261,6 +300,7 @@ def run_asset_authoring(
     }
     calls = len(call_audit)
     _write_jsonl(_model_log_path(workspace, round_id), call_audit)
+    _write_jsonl(_candidate_attempt_log_path(workspace, round_id), candidate_attempts)
     _write_json(stage_dir / "authoring_candidates.json", candidates)
     delta = {
         "schema_version": CANDIDATE_ASSET_DELTA_SCHEMA_VERSION,
@@ -299,6 +339,7 @@ def _request_candidates(
     context: Mapping[str, Any],
     validator: Callable[[list[Mapping[str, Any]]], list[Dict[str, Any]]],
     audit_log: Optional[list[Dict[str, Any]]] = None,
+    candidate_attempt_log: Optional[list[Dict[str, Any]]] = None,
 ) -> tuple[list[Dict[str, Any]], int, list[str]]:
     messages = [
         {
@@ -326,6 +367,7 @@ def _request_candidates(
             max_tokens=4096,
             temperature=0.0,
             tool_choice="required",
+            enable_thinking=False,
             parallel_tool_calls=False,
             usage_metadata={"stage": "asset_authoring", "task_type": "candidate_authoring"},
         )
@@ -336,8 +378,22 @@ def _request_candidates(
             "expected_tool": expected_tool,
             "attempt": attempt + 1,
             "parallel_tool_calls": False,
+            "thinking_enabled": False,
             "response_type": response.get("type"),
+            "finish_reason": response.get("finish_reason"),
         }
+        if response.get("type") == "text":
+            response_text = str(response.get("content", ""))
+            audit["response_text_bytes"] = len(response_text.encode("utf-8"))
+            audit["response_text_sha256"] = hashlib.sha256(
+                response_text.encode("utf-8")
+            ).hexdigest()
+            parse_errors = response.get("tool_parse_errors")
+            if isinstance(parse_errors, list) and parse_errors:
+                audit["tool_parse_error_count"] = len(parse_errors)
+                audit["tool_parse_errors_sha256"] = canonical_sha256(
+                    {"errors": parse_errors}
+                )
         if audit_log is not None:
             audit_log.append(audit)
         calls = response.get("function_calls") if response.get("type") == "function_calls" else None
@@ -370,6 +426,22 @@ def _request_candidates(
             audit["outcome"] = "protocol_repair"
             audit["error"] = last_error
             continue
+        audit["submitted_candidate_count"] = len(arguments["candidates"])
+        audit["submitted_candidates_sha256"] = canonical_sha256(
+            {"candidates": arguments["candidates"]}
+        )
+        if candidate_attempt_log is not None:
+            candidate_attempt_log.append(
+                {
+                    "schema_version": "specflow_candidate_attempt.v1",
+                    "sequence": len(candidate_attempt_log) + 1,
+                    "expected_tool": expected_tool,
+                    "attempt": attempt + 1,
+                    "call_id": refs[-1],
+                    "candidates_sha256": audit["submitted_candidates_sha256"],
+                    "candidates": arguments["candidates"],
+                }
+            )
         if _contains_forbidden_authoring_content(arguments):
             last_error = "raw Scala, approval, and file-write fields are forbidden"
             audit["outcome"] = "protocol_repair"
@@ -393,6 +465,8 @@ def _validate_obligations(
     clauses: list[Mapping[str, Any]],
     spec_sha256: str,
     configuration_id: str,
+    primary_component_ids: set[str],
+    require_complete_primary_set: bool,
 ) -> list[Dict[str, Any]]:
     if not rows:
         raise AuthoringError("empty_candidates", "at least one obligation is required")
@@ -405,12 +479,19 @@ def _validate_obligations(
         if identity in ids:
             raise AuthoringError("duplicate_candidate_id", identity)
         ids.add(identity)
+        if require_complete_primary_set and identity not in primary_component_ids:
+            raise AuthoringError("unknown_primary_component", identity)
         clause = by_locator.get(value["clause_ref"]["locator"])
         if clause is None or value["clause_ref"]["spec_sha256"] != spec_sha256 or value["clause_ref"]["text_sha256"] != clause["text_sha256"]:
             raise AuthoringError("clause_hash_mismatch", identity)
         if value["configuration_domain"] != [configuration_id]:
             raise AuthoringError("configuration_not_applicable", identity)
         normalized.append(value)
+    if require_complete_primary_set and ids != primary_component_ids:
+        raise AuthoringError(
+            "incomplete_primary_component_set",
+            str(sorted(primary_component_ids - ids)),
+        )
     return normalized
 
 
@@ -445,6 +526,8 @@ def _validate_monitors(
     assets: AssetLibrary,
     configuration_id: str,
     allowed_property_ids: set[str],
+    role_hints: Mapping[str, str],
+    require_complete_property_set: bool,
 ) -> list[Dict[str, Any]]:
     if not rows:
         raise AuthoringError("empty_candidates", "at least one monitor is required")
@@ -467,6 +550,13 @@ def _validate_monitors(
         monitor_property_ids = {
             prop["source_property_id"] for prop in value["properties"]
         }
+        for prop in value["properties"]:
+            hinted = role_hints.get(prop["source_property_id"])
+            if hinted is not None and prop["role"] != hinted:
+                raise AuthoringError(
+                    "component_role_mismatch",
+                    f"{prop['source_property_id']} requires {hinted}",
+                )
         if not monitor_property_ids <= allowed_property_ids:
             raise AuthoringError(
                 "unknown_source_property_id",
@@ -479,6 +569,11 @@ def _validate_monitors(
             )
         source_property_ids |= monitor_property_ids
         normalized.append(value)
+    if require_complete_property_set and source_property_ids != allowed_property_ids:
+        raise AuthoringError(
+            "incomplete_component_set",
+            str(sorted(allowed_property_ids - source_property_ids)),
+        )
     return normalized
 
 
@@ -683,4 +778,15 @@ def _model_log_path(workspace: SpecFlowWorkspace, round_id: int) -> Path:
     """Keep the round-1 name stable while allowing immutable revision logs."""
 
     name = "model_calls.jsonl" if round_id == 1 else f"model_calls.round-{round_id:04d}.jsonl"
+    return workspace.logs_dir / name
+
+
+def _candidate_attempt_log_path(
+    workspace: SpecFlowWorkspace, round_id: int
+) -> Path:
+    name = (
+        "candidate_attempts.jsonl"
+        if round_id == 1
+        else f"candidate_attempts.round-{round_id:04d}.jsonl"
+    )
     return workspace.logs_dir / name

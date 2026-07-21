@@ -96,12 +96,27 @@ def binding_validation_errors(
     if expected_width != actual_type.get("width"):
         errors.append(_error("width_mismatch", f"expected {expected_width}, object is {actual_type.get('width')}"))
     if compatibility.get("ownership") != row.get("owner_module"):
-        errors.append(_error("owner_unreachable", str(compatibility.get("ownership"))))
+        errors.append(
+            _error(
+                "owner_unreachable",
+                f"submitted {compatibility.get('ownership')}, expected {row.get('owner_module')}",
+            )
+        )
     clock_reset = row.get("clock_reset", {})
     if compatibility.get("clock") != clock_reset.get("clock_domain"):
-        errors.append(_error("clock_domain_mismatch", str(compatibility.get("clock"))))
+        errors.append(
+            _error(
+                "clock_domain_mismatch",
+                f"submitted {compatibility.get('clock')}, expected {clock_reset.get('clock_domain')}",
+            )
+        )
     if compatibility.get("reset") != clock_reset.get("reset_domain"):
-        errors.append(_error("reset_semantics_mismatch", str(compatibility.get("reset"))))
+        errors.append(
+            _error(
+                "reset_semantics_mismatch",
+                f"submitted {compatibility.get('reset')}, expected {clock_reset.get('reset_domain')}",
+            )
+        )
     domain = candidate.get("configuration_domain")
     if (
         compatibility.get("configuration") != configuration_id

@@ -81,6 +81,7 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         required_predecessor="asset_authoring",
         completion_gate="exact_semantic_evidence",
         artifact_contract=(
+            "package_applicability.json",
             "verification_package_ref.json",
             "overlay_manifest.json",
             "source_assertion_delta.json",

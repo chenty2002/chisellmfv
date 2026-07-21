@@ -139,6 +139,12 @@ def lower_expression(
         arg = lower_expression(node["arg"], typed_bindings, states).source
         source = f"(PopCount({arg}) === 1.U)" if op == "onehot" else f"PopCount({arg})"
         return ChiselExpr(source, result)
+    if op == "bit_select":
+        arg = lower_expression(node["arg"], typed_bindings, states).source
+        return ChiselExpr(f"({arg})({node['index']})", result)
+    if op == "slice":
+        arg = lower_expression(node["arg"], typed_bindings, states).source
+        return ChiselExpr(f"({arg})({node['high']}, {node['low']})", result)
     if op == "bounded_counter_relation":
         state = states.get(node["counter_state_id"])
         if state is None:
@@ -155,19 +161,43 @@ def lower_monitor(
     monitor_ir: Mapping[str, Any],
     semantic_index: Mapping[str, Any],
     bindings: Mapping[str, Mapping[str, Any]],
+    *,
+    reset_source: str = "reset.asBool",
 ) -> OverlayUnit:
+    if not isinstance(reset_source, str) or not re.fullmatch(
+        r"!?[A-Za-z_][A-Za-z0-9_.]*", reset_source
+    ):
+        raise MonitorCompilerError("monitor reset source is not a bounded identifier")
     object_rows = {row["object_id"]: row for row in semantic_index["objects"]}
-    typed_objects = {
-        object_id: ChiselExpr(
-            "dut." + _scala_identifier(row["name"]),
-            _type_from_mapping(row["chisel_type"]),
-        )
-        for object_id, row in object_rows.items()
-        if row.get("fact_status") == "elaboration_confirmed"
-    }
     required_binding_ids = set(monitor_ir["binding_refs"])
     if not required_binding_ids <= set(bindings):
         raise MonitorCompilerError("monitor references a binding outside the package")
+    required_object_ids = {
+        bindings[binding_id]["object_id"] for binding_id in required_binding_ids
+    }
+    observer_lines = []
+    typed_objects = {}
+    for object_id, row in object_rows.items():
+        if row.get("fact_status") != "elaboration_confirmed":
+            continue
+        name = _scala_identifier(row["name"])
+        source = "dut." + name
+        if (
+            object_id in required_object_ids
+            and row.get("direction") == "internal"
+            and row.get("accessibility") == "wrapper"
+        ):
+            source = "csf_observe_" + name
+            observer_lines.append(
+                "val "
+                + source
+                + " = chisel3.util.experimental.BoringUtils.bore(dut."
+                + name
+                + ")"
+            )
+        typed_objects[object_id] = ChiselExpr(
+            source, _type_from_mapping(row["chisel_type"])
+        )
     for binding_id in required_binding_ids:
         object_id = bindings[binding_id]["object_id"]
         if object_id not in typed_objects:
@@ -182,14 +212,14 @@ def lower_monitor(
             "csf_" + _scala_identifier(state_id),
             _type_from_mapping(state["type"]),
         )
-    state_lines = []
+    state_lines = list(observer_lines)
     for state in monitor_ir["state"]:
         target = state_exprs[state["state_id"]]
         init = lower_expression(state["init"], typed_objects, state_exprs)
         update = lower_expression(state["update"], typed_objects, state_exprs)
         clear = lower_expression(state["clear"], typed_objects, state_exprs)
         state_lines.append(f"val {target.source} = RegInit({init.source})")
-        state_lines.append(f"when (reset.asBool || ({clear.source})) {{")
+        state_lines.append(f"when (({reset_source}) || ({clear.source})) {{")
         state_lines.append(f"  {target.source} := {init.source}")
         state_lines.append("} .otherwise {")
         state_lines.append(f"  {target.source} := {update.source}")
@@ -200,7 +230,7 @@ def lower_monitor(
         guard = lower_expression(prop["guard_ir"], typed_objects, state_exprs)
         guard_source = guard.source
         if monitor_ir.get("reset_policy") == "disable_while_reset":
-            guard_source = f"((!reset.asBool) && ({guard_source}))"
+            guard_source = f"((!({reset_source})) && ({guard_source}))"
         properties.append(
             {
                 "source_property_id": prop["source_property_id"],
@@ -333,10 +363,18 @@ def compile_reviewed_package(
     project = _read_json(workspace.inputs_dir / "project_contract.json")
     configuration = _read_json(workspace.inputs_dir / "configuration.json")
     bindings = {row["binding_id"]: row for row in package["bindings"]}
+    reset_source = _monitor_reset_source(project)
     units = []
     for monitor in package["monitors"]:
         validate_monitor_ir(monitor, semantic, assets)
-        units.append(lower_monitor(monitor, semantic, bindings))
+        units.append(
+            lower_monitor(
+                monitor,
+                semantic,
+                bindings,
+                reset_source=reset_source,
+            )
+        )
     adapters = {
         row["acquisition"]["adapter_id"]
         for row in package["bindings"]
@@ -442,6 +480,18 @@ def _render_constructor(template: str, parameters: Mapping[str, Any]) -> str:
     if "{" in rendered or "}" in rendered:
         raise MonitorCompilerError("constructor template contains unresolved syntax")
     return rendered
+
+
+def _monitor_reset_source(project_contract: Mapping[str, Any]) -> str:
+    formal = project_contract.get("formal")
+    if not isinstance(formal, Mapping):
+        raise MonitorCompilerError("project formal contract is missing")
+    reset = formal.get("reset")
+    active_high = formal.get("reset_active_high")
+    if not isinstance(reset, str) or not reset or not isinstance(active_high, bool):
+        raise MonitorCompilerError("project formal reset contract is malformed")
+    source = "reset.asBool" if reset == "reset" else _scala_identifier(reset)
+    return source if active_high else "!" + source
 
 
 def _scala_identifier(value: str) -> str:

@@ -19,6 +19,11 @@ from .config import (
     SpecFlowRunConfig,
 )
 from .stages import get_stage_spec, stage_contract_snapshot
+from .property_decomposition import (
+    build_authoring_scope,
+    build_identity_decomposition,
+    load_property_decomposition,
+)
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -181,6 +186,20 @@ class SpecFlowWorkspace:
             _copy_file(configuration.path, inputs / "configuration.json")
             _copy_file(self.config.specification, inputs / "specification.md")
             _write_json(inputs / "public_spec_package.json", public_spec_package)
+            decomposition_path = self.config.specification.parent / "property_decomposition.json"
+            decomposition = (
+                load_property_decomposition(decomposition_path, public_spec_package)
+                if decomposition_path.is_file()
+                else build_identity_decomposition(public_spec_package)
+            )
+            _write_json(inputs / "property_decomposition.json", decomposition)
+            authoring_scope = build_authoring_scope(
+                decomposition,
+                public_spec_package,
+                self.config.expected_property_ids,
+                self.config.component_ids,
+            )
+            _write_json(inputs / "authoring_scope.json", authoring_scope)
             model_view = _materialize_model_view(
                 project, project_copy, inputs / "model_sources"
             )
@@ -193,6 +212,10 @@ class SpecFlowWorkspace:
                 "public_spec_package_sha256": _file_sha256(
                     inputs / "public_spec_package.json"
                 ),
+                "property_decomposition_sha256": _file_sha256(
+                    inputs / "property_decomposition.json"
+                ),
+                "authoring_scope_sha256": _file_sha256(inputs / "authoring_scope.json"),
                 "model_view_manifest_sha256": _file_sha256(
                     inputs / "model_view_manifest.json"
                 ),
@@ -313,6 +336,18 @@ def _materialize_model_view(
     for relative in project.model_visible_files:
         source = project_copy / relative
         text = source.read_text(encoding="utf-8")
+        exclusions = [
+            row
+            for row in project.model_view["exclusions"]
+            if Path(row["path"]) == relative
+        ]
+        if exclusions:
+            source_lines = text.splitlines(keepends=True)
+            for exclusion in exclusions:
+                for line_index in range(exclusion["start_line"] - 1, exclusion["end_line"]):
+                    ending = "\n" if source_lines[line_index].endswith("\n") else ""
+                    source_lines[line_index] = ending
+            text = "".join(source_lines)
         match = _MODEL_LEAK_RE.search(text)
         if match is not None:
             raise ValueError(
@@ -324,15 +359,27 @@ def _materialize_model_view(
         source_ids.add(source_id)
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+        target.write_text(text, encoding="utf-8")
         files.append(
             {
                 "source_id": source_id,
                 "path": str(relative),
                 "sha256": _file_sha256(target),
                 "provenance": {
-                    "kind": "allowlisted_exact_copy",
+                    "kind": (
+                        "allowlisted_exact_copy"
+                        if not exclusions
+                        else "hash_bound_line_redaction"
+                    ),
                     "project_contract_sha256": _file_sha256(project.path),
+                    "source_sha256": _file_sha256(source),
+                    "excluded_line_ranges": [
+                        {
+                            "start_line": row["start_line"],
+                            "end_line": row["end_line"],
+                        }
+                        for row in exclusions
+                    ],
                 },
             }
         )

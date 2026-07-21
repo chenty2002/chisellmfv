@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 PROJECT_SCHEMA_VERSION = "specflow_project.v1"
 PUBLIC_SPEC_PACKAGE_SCHEMA_VERSION = "public_spec_package.v1"
+PROPERTY_DECOMPOSITION_SCHEMA_VERSION = "specflow_property_decomposition.v1"
 RUN_MANIFEST_SCHEMA_VERSION = "specflow_run_manifest.v1"
 MODEL_VIEW_MANIFEST_SCHEMA_VERSION = "model_view_manifest.v1"
 OBLIGATION_SCHEMA_VERSION = "verification_obligations.v1"
@@ -41,6 +43,7 @@ SCHEMA_VERSIONS: Mapping[str, str] = MappingProxyType(
     {
         "project": PROJECT_SCHEMA_VERSION,
         "public_spec_package": PUBLIC_SPEC_PACKAGE_SCHEMA_VERSION,
+        "property_decomposition": PROPERTY_DECOMPOSITION_SCHEMA_VERSION,
         "run_manifest": RUN_MANIFEST_SCHEMA_VERSION,
         "model_view_manifest": MODEL_VIEW_MANIFEST_SCHEMA_VERSION,
         "obligations": OBLIGATION_SCHEMA_VERSION,
@@ -79,6 +82,8 @@ class SpecFlowRunConfig:
     run_root: Path = Path("runs/specflow")
     copy_strategy: str = "isolated_copy"
     opaque_task_id: Optional[str] = None
+    expected_property_ids: Tuple[str, ...] = ()
+    component_ids: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -97,6 +102,23 @@ class SpecFlowRunConfig:
             not isinstance(self.opaque_task_id, str) or not self.opaque_task_id.strip()
         ):
             raise ValueError("opaque_task_id must be a non-empty string when supplied")
+        selected = tuple(self.expected_property_ids)
+        if (
+            len(set(selected)) != len(selected)
+            or any(not isinstance(row, str) or not _SAFE_ID_RE.fullmatch(row) for row in selected)
+        ):
+            raise ValueError("expected_property_ids must contain unique safe public IDs")
+        object.__setattr__(self, "expected_property_ids", selected)
+        selected_components = tuple(self.component_ids)
+        if (
+            len(set(selected_components)) != len(selected_components)
+            or any(
+                not isinstance(row, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", row)
+                for row in selected_components
+            )
+        ):
+            raise ValueError("component_ids must contain unique safe component IDs")
+        object.__setattr__(self, "component_ids", selected_components)
 
 
 class SpecFlowConfigError(ValueError):
@@ -112,6 +134,7 @@ class ProjectContract:
     source_roots: Tuple[Path, ...]
     model_visible_roots: Tuple[Path, ...]
     model_visible_files: Tuple[Path, ...]
+    model_view: Mapping[str, Any]
     build: Mapping[str, Any]
     generator: Mapping[str, Any]
     formal: Mapping[str, Any]
@@ -133,10 +156,13 @@ _PROJECT_FIELDS = {
     "source_roots",
     "model_visible_roots",
     "model_visible_files",
+    "model_view",
     "build",
     "generator",
     "formal",
 }
+_MODEL_VIEW_FIELDS = {"strategy", "exclusions"}
+_MODEL_VIEW_EXCLUSION_FIELDS = {"path", "source_sha256", "start_line", "end_line"}
 _BUILD_FIELDS = {
     "kind",
     "compile_argv",
@@ -199,6 +225,54 @@ def load_project_contract(path: Path) -> ProjectContract:
                 f"model-visible file is outside the visible roots: {relative}"
             )
 
+    model_view = _object(value["model_view"], "model_view")
+    _require_exact_fields(model_view, _MODEL_VIEW_FIELDS, "model_view")
+    strategy = model_view["strategy"]
+    if strategy not in {"exact_copy", "line_redaction"}:
+        raise SpecFlowConfigError("model_view.strategy is unsupported")
+    exclusions = model_view["exclusions"]
+    if not isinstance(exclusions, list):
+        raise SpecFlowConfigError("model_view.exclusions must be a list")
+    normalized_exclusions = []
+    occupied: Dict[Path, list[tuple[int, int]]] = {}
+    for index, exclusion in enumerate(exclusions):
+        exclusion = _object(exclusion, f"model_view.exclusions[{index}]")
+        _require_exact_fields(
+            exclusion,
+            _MODEL_VIEW_EXCLUSION_FIELDS,
+            f"model_view.exclusions[{index}]",
+        )
+        relative = _safe_relative(exclusion["path"], "model_view exclusion path")
+        if relative not in visible_files:
+            raise SpecFlowConfigError("model_view exclusion path is not model-visible")
+        source = project_root / relative
+        if exclusion["source_sha256"] != _file_sha256(source):
+            raise SpecFlowConfigError("model_view exclusion source hash mismatch")
+        start, end = exclusion["start_line"], exclusion["end_line"]
+        line_count = len(source.read_text(encoding="utf-8").splitlines())
+        if (
+            not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(end, int)
+            or isinstance(end, bool)
+            or start < 1
+            or end < start
+            or end > line_count
+        ):
+            raise SpecFlowConfigError("model_view exclusion line range is invalid")
+        if any(not (end < prior_start or start > prior_end) for prior_start, prior_end in occupied.setdefault(relative, [])):
+            raise SpecFlowConfigError("model_view exclusion line ranges overlap")
+        occupied[relative].append((start, end))
+        normalized_exclusions.append(dict(exclusion))
+    if strategy == "exact_copy" and normalized_exclusions:
+        raise SpecFlowConfigError("exact_copy model view cannot declare exclusions")
+    if strategy == "line_redaction" and not normalized_exclusions:
+        raise SpecFlowConfigError("line_redaction model view requires exclusions")
+    normalized_model_view = {
+        "strategy": strategy,
+        "exclusions": normalized_exclusions,
+    }
+
     build = _object(value["build"], "build")
     _require_exact_fields(build, _BUILD_FIELDS, "build")
     if build["kind"] != "sbt":
@@ -246,6 +320,7 @@ def load_project_contract(path: Path) -> ProjectContract:
         source_roots=source_roots,
         model_visible_roots=visible_roots,
         model_visible_files=visible_files,
+        model_view=MappingProxyType(normalized_model_view),
         build=MappingProxyType(dict(build)),
         generator=MappingProxyType(dict(generator)),
         formal=MappingProxyType(dict(formal)),
@@ -396,3 +471,7 @@ def _is_within(path: Path, root: Path) -> bool:
 def _require_within(path: Path, root: Path, label: str) -> None:
     if not _is_within(path, root):
         raise SpecFlowConfigError(f"{label} escapes its allowed root")
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()

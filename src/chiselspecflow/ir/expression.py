@@ -52,6 +52,8 @@ _ALLOWED_OPS = {
     "previous_value",
     "onehot",
     "popcount",
+    "bit_select",
+    "slice",
     "bounded_counter_relation",
 }
 
@@ -198,6 +200,34 @@ def _validate_node(
         else:
             result = ExpressionType("UInt", max(1, arg_type.width.bit_length()), False)
         return _checked_type(_with_type({"op": op, "arg": arg}, result), result, declared_result, path)
+
+    if op in {"bit_select", "slice"}:
+        fields = {"op", "arg", "index"} if op == "bit_select" else {"op", "arg", "high", "low"}
+        _exact(value, fields, path)
+        arg, arg_type = _validate_node(value["arg"], object_types, state_types, f"{path}.arg")
+        if arg_type.kind not in {"UInt", "SInt"}:
+            raise ExpressionValidationError("type_mismatch", f"{op} requires a bit vector")
+        if op == "bit_select":
+            index = value["index"]
+            if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < arg_type.width:
+                raise ExpressionValidationError("index_out_of_bounds", f"{path}.index")
+            normalized = {"op": op, "arg": arg, "index": index}
+            result = _BOOL
+        else:
+            high, low = value["high"], value["low"]
+            if (
+                not isinstance(high, int)
+                or isinstance(high, bool)
+                or not isinstance(low, int)
+                or isinstance(low, bool)
+                or low < 0
+                or high < low
+                or high >= arg_type.width
+            ):
+                raise ExpressionValidationError("index_out_of_bounds", f"{path}.high/low")
+            normalized = {"op": op, "arg": arg, "high": high, "low": low}
+            result = ExpressionType("UInt", high - low + 1, False)
+        return _checked_type(_with_type(normalized, result), result, declared_result, path)
 
     _exact(value, {"op", "counter_state_id", "relation", "bound"}, path)
     state_id = _identifier(value["counter_state_id"], f"{path}.counter_state_id")

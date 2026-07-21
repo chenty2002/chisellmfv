@@ -57,7 +57,8 @@ def elaborate_baseline(
     compile_result = _run(list(project.build["compile_argv"]), workspace_project)
     if compile_result.returncode != 0:
         raise BaselineElaborationError(
-            "counter clean compile failed:\n" + compile_result.stdout[-5000:]
+            f"{project.project_id} clean compile failed:\n"
+            + compile_result.stdout[-5000:]
         )
     generated_root = workspace_project / "specflow-generated"
     parameter_args = [
@@ -75,7 +76,7 @@ def elaborate_baseline(
     elaborate_result = _run(["sbt", "--error", run_main], workspace_project)
     if elaborate_result.returncode != 0:
         raise BaselineElaborationError(
-            "counter verification elaboration failed:\n"
+            f"{project.project_id} verification elaboration failed:\n"
             + elaborate_result.stdout[-5000:]
         )
 
@@ -88,22 +89,23 @@ def elaborate_baseline(
     files = []
     for sv_path in sv_files:
         text = sv_path.read_text(encoding="utf-8")
-        module_match = _MODULE_RE.search(text)
-        if module_match is None:
+        module_blocks = _module_blocks(text)
+        if not module_blocks:
             raise BaselineElaborationError(f"emitted file has no module: {sv_path}")
-        owner = module_match.group(1)
-        modules.append(owner)
         file_locators = _source_locators(text)
         locators.extend(file_locators)
-        objects.extend(_parse_ports(text, owner))
-        port_names = {row["name"] for row in objects if row["owner_module"] == owner}
-        for msb, lsb, name, comment in _INTERNAL_RE.findall(text):
-            if name not in port_names:
-                objects.append(
-                    _elaboration_object(
-                        owner, name, "internal", msb, lsb, _first_locator(comment)
+        for owner, block in module_blocks:
+            modules.append(owner)
+            module_objects = _parse_ports(block, owner)
+            objects.extend(module_objects)
+            port_names = {row["name"] for row in module_objects}
+            for msb, lsb, name, comment in _INTERNAL_RE.findall(block):
+                if name not in port_names:
+                    objects.append(
+                        _elaboration_object(
+                            owner, name, "internal", msb, lsb, _first_locator(comment)
+                        )
                     )
-                )
         files.append(
             {
                 "path": str(sv_path.relative_to(workspace_project)),
@@ -180,6 +182,8 @@ def elaborate_verification_overlay(
     sv_files = sorted(path.resolve() for path in generated_root.rglob("*.sv"))
     if not sv_files:
         raise VerificationElaborationError("verification overlay emitted no SystemVerilog")
+    for path in sv_files:
+        _remove_circt_resource_file_list(path)
     source_delta = _read_json(source_assertion_delta_path)
     overlay_manifest = _read_json(overlay_manifest_path)
     identities = label_emitted_properties(
@@ -215,6 +219,26 @@ def elaborate_verification_overlay(
     return certificate
 
 
+def _remove_circt_resource_file_list(path: Path) -> None:
+    """Remove CIRCT's embedded ``.f`` payload from a concatenated SV file.
+
+    Recent firtool output can append a delimited copy of
+    ``firrtl_black_box_resource_files.f`` after the final module.  That payload
+    is useful to downstream build systems but is not SystemVerilog; older
+    JasperGold releases parse the bare resource names as HDL and fail before
+    elaboration.  The inline BlackBox modules precede this marker, so retaining
+    the prefix is the exact single-file design consumed by Stage 2.
+    """
+
+    text = Path(path).read_text(encoding="utf-8")
+    marker = re.search(
+        r'(?m)^// ----- 8< ----- FILE "firrtl_black_box_resource_files\.f" ----- 8< -----\s*$',
+        text,
+    )
+    if marker is not None:
+        Path(path).write_text(text[: marker.start()].rstrip() + "\n", encoding="utf-8")
+
+
 def _run(argv: List[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         argv,
@@ -243,6 +267,26 @@ def _source_locators(text: str) -> List[Dict[str, Any]]:
                 continue
             seen.add(key)
             rows.append({"path": path, "line": int(line), "column": int(column)})
+    return rows
+
+
+def _module_blocks(text: str) -> List[tuple[str, str]]:
+    """Return every emitted module block, including files with inline BlackBoxes."""
+
+    matches = list(_MODULE_RE.finditer(text))
+    rows = []
+    for index, match in enumerate(matches):
+        end = text.find("endmodule", match.end())
+        if end < 0:
+            raise BaselineElaborationError(
+                f"emitted module has no endmodule: {match.group(1)}"
+            )
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        if end >= next_start:
+            raise BaselineElaborationError(
+                f"emitted module blocks overlap: {match.group(1)}"
+            )
+        rows.append((match.group(1), text[match.start() : end + len("endmodule")]))
     return rows
 
 

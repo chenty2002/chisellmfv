@@ -65,6 +65,8 @@ def main_specflow(args):
             configuration=Path(args.config).resolve(),
             run_root=run_root,
             opaque_task_id=args.task_id,
+            expected_property_ids=tuple(args.expected_property_id or ()),
+            component_ids=tuple(args.component_id or ()),
         )
         workspace = prepare_iteration1_workspace(
             config,
@@ -904,6 +906,14 @@ def parse_args(argv=None):
         '--suite-ledger', default='benchmark/synth/SPECIFICATIONS.sha256'
     )
     specflow_start.add_argument('--task-id', default=None)
+    specflow_start.add_argument(
+        '--expected-property-id', action='append', default=None,
+        help='bound this authoring run to one or more reviewed public property rows',
+    )
+    specflow_start.add_argument(
+        '--component-id', action='append', default=None,
+        help='bound a property-scoped run to reviewed primary component groups',
+    )
     specflow_start.add_argument('--max-tokens', type=int, default=None)
     specflow_review = specflow_subparsers.add_parser(
         'review', help='install one external hash-bound Codex/human review record'

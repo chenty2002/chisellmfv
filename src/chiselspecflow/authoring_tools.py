@@ -62,6 +62,13 @@ def binding_tools(
     adapter_ids: Iterable[str],
 ) -> list[Dict[str, Any]]:
     object_ids = tuple(row["object_id"] for row in semantic_objects)
+    owners = tuple(sorted({row["owner_module"] for row in semantic_objects}))
+    clocks = tuple(
+        sorted({row["clock_reset"]["clock_domain"] for row in semantic_objects})
+    )
+    resets = tuple(
+        sorted({row["clock_reset"]["reset_domain"] for row in semantic_objects})
+    )
     candidate = _strict_object(
         {
             "binding_id": _string(),
@@ -74,9 +81,9 @@ def binding_tools(
                 {
                     "type": _enum(("Bool", "UInt", "SInt")),
                     "width": {"type": "integer", "minimum": 1},
-                    "ownership": _string(),
-                    "clock": _string(),
-                    "reset": _string(),
+                    "ownership": _enum(owners),
+                    "clock": _enum(clocks),
+                    "reset": _enum(resets),
                     "configuration": {"type": "string", "const": configuration_id},
                 }
             ),
@@ -100,7 +107,7 @@ def monitor_tools(
     binding_ids: Iterable[str],
     object_ids: Iterable[str],
     configuration_id: str,
-    archetype_ids: Iterable[str],
+    archetypes: Mapping[str, Mapping[str, Any]],
     source_property_ids: Iterable[str] | None = None,
 ) -> list[Dict[str, Any]]:
     expression = _expression_schema(tuple(object_ids), allow_state=True)
@@ -123,27 +130,41 @@ def monitor_tools(
             "guard_ir": expression,
         }
     )
-    candidate = _strict_object(
-        {
-            "monitor_id": _string(),
-            "obligation_id": _enum(obligation_ids),
-            "archetype_id": _enum(archetype_ids),
-            "archetype_sha256": _sha256(),
-            "binding_refs": {"type": "array", "minItems": 1, "items": _enum(binding_ids)},
-            "state": {"type": "array", "items": state},
-            "properties": {"type": "array", "minItems": 1, "items": prop},
-            "reset_policy": {"type": "string", "const": "disable_while_reset"},
-            "overlay": _strict_object(
+    variants = []
+    for archetype_id, archetype in sorted(archetypes.items()):
+        contract = archetype["state_contract"]
+        variants.append(
+            _strict_object(
                 {
-                    "strategy": {"type": "string", "const": "wrapper"},
-                    "wrapper_top": {"type": "string", "const": "SpecFlowOverlay"},
-                    "host_scope": {"type": "string", "const": "SpecFlowOverlay"},
+                    "monitor_id": _string(),
+                    "obligation_id": _enum(obligation_ids),
+                    "archetype_id": {"type": "string", "const": archetype_id},
+                    "archetype_sha256": {
+                        "type": "string",
+                        "const": archetype["sha256"],
+                    },
+                    "binding_refs": {"type": "array", "minItems": 1, "items": _enum(binding_ids)},
+                    "state": {
+                        "type": "array",
+                        "minItems": contract["minimum_count"],
+                        "maxItems": contract["maximum_count"],
+                        "items": state,
+                    },
+                    "properties": {"type": "array", "minItems": 1, "items": prop},
+                    "reset_policy": {"type": "string", "const": "disable_while_reset"},
+                    "overlay": _strict_object(
+                        {
+                            "strategy": {"type": "string", "const": "wrapper"},
+                            "wrapper_top": {"type": "string", "const": "SpecFlowOverlay"},
+                            "host_scope": {"type": "string", "const": "SpecFlowOverlay"},
+                        }
+                    ),
+                    "required_observations": {"type": "array", "minItems": 1, "items": _enum(binding_ids)},
+                    "configuration_domain": {"type": "array", "minItems": 1, "maxItems": 1, "items": {"type": "string", "const": configuration_id}},
                 }
-            ),
-            "required_observations": {"type": "array", "minItems": 1, "items": _enum(binding_ids)},
-            "configuration_domain": {"type": "array", "minItems": 1, "maxItems": 1, "items": {"type": "string", "const": configuration_id}},
-        }
-    )
+            )
+        )
+    candidate = {"anyOf": variants}
     return [_tool("submit_monitor_candidates", candidate), _ambiguity_tool(obligation_ids)]
 
 
@@ -190,6 +211,8 @@ def _expression_schema(object_ids: tuple[str, ...], allow_state: bool = False) -
         _strict_object({"op": _enum(("eq", "neq", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge", "add", "sub")), "lhs": ref, "rhs": ref}),
         _strict_object({"op": {"type": "string", "const": "mux"}, "condition": ref, "when_true": ref, "when_false": ref}),
         _strict_object({"op": _enum(("onehot", "popcount")), "arg": ref}),
+        _strict_object({"op": {"type": "string", "const": "bit_select"}, "arg": ref, "index": {"type": "integer", "minimum": 0}}),
+        _strict_object({"op": {"type": "string", "const": "slice"}, "arg": ref, "high": {"type": "integer", "minimum": 0}, "low": {"type": "integer", "minimum": 0}}),
     ]
     if allow_state:
         variants.extend(
