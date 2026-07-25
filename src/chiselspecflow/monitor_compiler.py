@@ -163,6 +163,7 @@ def lower_monitor(
     bindings: Mapping[str, Mapping[str, Any]],
     *,
     reset_source: str = "reset.asBool",
+    adapter: Optional[Mapping[str, Any]] = None,
 ) -> OverlayUnit:
     if not isinstance(reset_source, str) or not re.fullmatch(
         r"!?[A-Za-z_][A-Za-z0-9_.]*", reset_source
@@ -184,15 +185,19 @@ def lower_monitor(
         source = "dut." + name
         if (
             object_id in required_object_ids
-            and row.get("direction") == "internal"
             and row.get("accessibility") == "wrapper"
         ):
+            access_path = _observer_access_path(
+                row, semantic_index, adapter or {}
+            )
             source = "csf_observe_" + name
+            if row.get("owner_module") != semantic_index.get("top"):
+                source += "_" + object_id[-8:]
             observer_lines.append(
                 "val "
                 + source
                 + " = chisel3.util.experimental.BoringUtils.bore(dut."
-                + name
+                + access_path
                 + ")"
             )
         typed_objects[object_id] = ChiselExpr(
@@ -268,6 +273,8 @@ def render_overlay(
     lines = ["package chisellmfv.generated", "", *imports, "", "final class SpecFlowOverlay extends Module {", f"  val dut = Module({constructor})"]
     confirmed = [row for row in semantic_index["objects"] if row.get("fact_status") == "elaboration_confirmed"]
     for row in sorted(confirmed, key=lambda item: item["name"]):
+        if row.get("owner_module") != semantic_index.get("top"):
+            continue
         direction = row.get("direction")
         if direction not in {"input", "output"}:
             continue
@@ -364,17 +371,6 @@ def compile_reviewed_package(
     configuration = _read_json(workspace.inputs_dir / "configuration.json")
     bindings = {row["binding_id"]: row for row in package["bindings"]}
     reset_source = _monitor_reset_source(project)
-    units = []
-    for monitor in package["monitors"]:
-        validate_monitor_ir(monitor, semantic, assets)
-        units.append(
-            lower_monitor(
-                monitor,
-                semantic,
-                bindings,
-                reset_source=reset_source,
-            )
-        )
     adapters = {
         row["acquisition"]["adapter_id"]
         for row in package["bindings"]
@@ -385,6 +381,18 @@ def compile_reviewed_package(
     adapter = assets.api_adapters.get(adapter_id)
     if adapter is None:
         raise MonitorCompilerError(f"reviewed API adapter is missing: {adapter_id}")
+    units = []
+    for monitor in package["monitors"]:
+        validate_monitor_ir(monitor, semantic, assets)
+        units.append(
+            lower_monitor(
+                monitor,
+                semantic,
+                bindings,
+                reset_source=reset_source,
+                adapter=adapter,
+            )
+        )
     rendered = render_overlay(units, project, configuration, semantic, adapter)
     source_root = workspace.project_workspace / project["build"]["overlay_source_root"]
     source_path = source_root / "SpecFlowOverlay.scala"
@@ -448,6 +456,36 @@ def _object_types(index: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
         for row in index.get("objects", [])
         if row.get("fact_status") == "elaboration_confirmed"
     }
+
+
+def _observer_access_path(
+    row: Mapping[str, Any],
+    semantic_index: Mapping[str, Any],
+    adapter: Mapping[str, Any],
+) -> str:
+    if row.get("owner_module") == semantic_index.get("top"):
+        return _scala_identifier(str(row["name"]))
+    observers = adapter.get("hierarchical_observers", ())
+    matches = [
+        item
+        for item in observers
+        if isinstance(item, Mapping)
+        and item.get("owner_module") == row.get("owner_module")
+        and item.get("name") == row.get("name")
+        and item.get("source_path") == row.get("source_anchor", {}).get("path")
+        and item.get("source_line") == row.get("source_anchor", {}).get("line_start")
+    ]
+    if len(matches) != 1:
+        raise MonitorCompilerError(
+            "nested observer lacks one exact reviewed adapter path"
+        )
+    path = str(matches[0].get("access_path", ""))
+    if any(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) is None
+        for part in path.split(".")
+    ):
+        raise MonitorCompilerError("nested observer adapter path is unsafe")
+    return path
 
 
 def _result_type(node: Mapping[str, Any]) -> ExpressionType:

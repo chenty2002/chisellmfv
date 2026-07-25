@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from .config import SEMANTIC_INDEX_SCHEMA_VERSION, GeneratorConfiguration, ProjectContract
 
@@ -20,6 +21,7 @@ def merge_semantic_index(
     project: ProjectContract,
     configuration: GeneratorConfiguration,
     output_path: Optional[Path] = None,
+    hierarchical_observers: Sequence[Mapping[str, Any]] = (),
 ) -> Dict[str, Any]:
     if source_index.get("schema_version") != "scala_source_index.v1":
         raise SemanticIndexError("unsupported source index")
@@ -33,11 +35,46 @@ def merge_semantic_index(
         for row in baseline.get("objects", [])
         if isinstance(row, dict)
     }
+    allowed_hierarchical = _validate_hierarchical_observers(
+        hierarchical_observers
+    )
+    elaborated_by_locator: Dict[Tuple[str, int, str], list[Mapping[str, Any]]] = {}
+    for row in baseline.get("objects", []):
+        if not isinstance(row, Mapping):
+            continue
+        locator = row.get("source_locator")
+        if not isinstance(locator, Mapping):
+            continue
+        path = locator.get("path")
+        line = locator.get("line")
+        name = row.get("name")
+        if isinstance(path, str) and isinstance(line, int) and isinstance(name, str):
+            elaborated_by_locator.setdefault((path, line, name), []).append(row)
     rows = []
     for candidate in source_index.get("objects", []):
         name = candidate.get("name")
         source_type = candidate.get("chisel_type", {})
         fact = elaborated.get((top, name))
+        nested = False
+        candidate_anchor = candidate.get("source_anchor", {})
+        observer_key = (
+            candidate.get("owner_module"),
+            name,
+            candidate_anchor.get("path"),
+            candidate_anchor.get("line_start"),
+        )
+        if fact is None and observer_key in allowed_hierarchical:
+            matches = []
+            for (path, line, fact_name), located in elaborated_by_locator.items():
+                if (
+                    fact_name == name
+                    and line == candidate_anchor.get("line_start")
+                    and str(candidate_anchor.get("path", "")).endswith(path)
+                ):
+                    matches.extend(located)
+            if len(matches) == 1:
+                fact = matches[0]
+                nested = True
         errors = []
         if not candidate.get("owner_module"):
             errors.append("unknown_owner")
@@ -76,7 +113,16 @@ def merge_semantic_index(
             row["source_anchor"] = anchor
         row.update(
             {
-                "owner_module": top if fact is not None else candidate.get("owner_module"),
+                "owner_module": (
+                    candidate.get("owner_module")
+                    if nested
+                    else top
+                    if fact is not None
+                    else candidate.get("owner_module")
+                ),
+                "accessibility": (
+                    "wrapper" if nested else candidate.get("accessibility")
+                ),
                 "clock_reset": {
                     "clock_domain": project.formal["clock"],
                     "reset_domain": project.formal["reset"],
@@ -117,6 +163,54 @@ def merge_semantic_index(
             json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
     return value
+
+
+def _validate_hierarchical_observers(
+    rows: Sequence[Mapping[str, Any]],
+) -> set[Tuple[Any, Any, Any, Any]]:
+    required = {
+        "owner_module",
+        "name",
+        "source_path",
+        "source_line",
+        "access_path",
+        "trace_path",
+    }
+    result = set()
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != required:
+            raise SemanticIndexError("hierarchical observer has invalid fields")
+        if not all(
+            isinstance(row[field], str) and row[field]
+            for field in (
+                "owner_module",
+                "name",
+                "source_path",
+                "access_path",
+                "trace_path",
+            )
+        ):
+            raise SemanticIndexError("hierarchical observer has invalid text")
+        if not isinstance(row["source_line"], int) or row["source_line"] < 1:
+            raise SemanticIndexError("hierarchical observer has invalid source line")
+        for field in ("access_path", "trace_path"):
+            if any(
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) is None
+                for part in row[field].split(".")
+            ):
+                raise SemanticIndexError(
+                    f"hierarchical observer has unsafe {field}"
+                )
+        key = (
+            row["owner_module"],
+            row["name"],
+            row["source_path"],
+            row["source_line"],
+        )
+        if key in result:
+            raise SemanticIndexError("duplicate hierarchical observer")
+        result.add(key)
+    return result
 
 
 def require_confirmed_object(index: Mapping[str, Any], name: str) -> Mapping[str, Any]:

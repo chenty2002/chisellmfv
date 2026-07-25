@@ -93,6 +93,11 @@ class JasperGoldBackend:
                     returncode=returncode,
                     timed_out=timed_out,
                     log_text=output,
+                    bounded_iterations=(
+                        int(formal["primary_max_trace_length"])
+                        if formal.get("proof_mode") == "bounded"
+                        else None
+                    ),
                 )
             )
         trace_rows = []
@@ -188,10 +193,18 @@ def build_verify_tcl(
     for operation in operation_plan["operations"]:
         property_id = operation["emitted_property_id"]
         filename = "traces/" + _safe_filename(operation["operation_id"]) + ".vcd"
+        bounded_suffix = ""
+        if (
+            operation["role"] == "primary_assertion"
+            and formal.get("proof_mode") == "bounded"
+        ):
+            bounded_suffix = (
+                " -iter " + str(formal["primary_max_trace_length"])
+            )
         lines.extend(
             [
                 f'puts "SPECFLOW_PROPERTY_BEGIN {property_id}"',
-                f"set specflow_outcome [prove -property {_tcl_quote(property_id)}]",
+                f"set specflow_outcome [prove -property {_tcl_quote(property_id)}{bounded_suffix}]",
                 "report",
             ]
         )
@@ -228,11 +241,21 @@ def _account_operation(
     returncode: Optional[int],
     timed_out: bool,
     log_text: str,
+    bounded_iterations: Optional[int] = None,
 ) -> Dict[str, Any]:
     raw = str((observed or {}).get("status", "")).lower()
     primary = operation["role"] == "primary_assertion"
-    if primary and raw in {"proven", "bounded_proven"}:
+    if primary and raw == "proven":
         status, reason = "proven", "tool_reported_proven"
+    elif primary and raw == "bounded_proven":
+        status, reason = "proven", "tool_reported_bounded_proven"
+    elif (
+        primary
+        and raw == "undetermined"
+        and bounded_iterations is not None
+        and _completed_bounded_search(observed, bounded_iterations, log_text)
+    ):
+        status, reason = "proven", "tool_completed_bounded_search"
     elif not primary and raw == "covered":
         status, reason = "covered", "tool_reported_covered"
     elif raw == "unreachable":
@@ -263,6 +286,18 @@ def _account_operation(
         "runtime_s": observed.get("runtime_s") if observed else None,
         "trace_path": str(trace) if trace else None,
     }
+
+
+def _completed_bounded_search(
+    observed: Mapping[str, Any], bounded_iterations: int, log_text: str
+) -> bool:
+    bound_match = re.match(r"\s*(\d+)", str(observed.get("bound", "")))
+    if bound_match is None or int(bound_match.group(1)) <= bounded_iterations:
+        return False
+    return (
+        f"Reached length limit ({bounded_iterations})" in log_text
+        and re.search(r"(?m)^max_trace_length\s*$", log_text) is not None
+    )
 
 
 def _trace_for_operation(trace_dir: Path, operation_id: str) -> Optional[Path]:

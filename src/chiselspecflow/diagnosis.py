@@ -395,6 +395,7 @@ def _request_diagnosis_candidate(
             "ranked_source_candidates": {
                 "type": "array",
                 "minItems": 1 if track_d else 0,
+                **({} if track_d else {"maxItems": 0}),
                 "items": ranking_item,
             },
         }
@@ -411,7 +412,14 @@ def _request_diagnosis_candidate(
         }
     ]
     context = {
-        "task": "classify exact projected formal evidence",
+        "task": (
+            "classify exact projected formal evidence; "
+            + (
+                "submit at least one ranked source candidate"
+                if track_d
+                else "ranked_source_candidates must be an empty array outside Track D"
+            )
+        ),
         "projection": projection,
         "allowed_evidence_refs": evidence_refs,
         "track_d": track_d,

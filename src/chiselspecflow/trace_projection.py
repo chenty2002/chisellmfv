@@ -18,6 +18,7 @@ from typing import Any, Dict, Mapping, Optional
 
 from src.core.artifact_contract import file_sha256
 
+from .assets import load_reviewed_assets
 from .ir.expression import normalized_root
 
 
@@ -43,6 +44,7 @@ def project_stage2_evidence(
     stage2 = run_dir / "rounds" / f"{round_id:04d}" / "02_compile_verify"
     manifest = _read_json(run_dir / "manifest.json")
     semantic = _read_json(run_dir / "indexes" / "chisel_semantic_index.json")
+    project = _read_json(run_dir / "inputs" / "project_contract.json")
     package, package_path = _load_certified_package(stage2)
     certificate_path = stage2 / "elaboration_certificate.json"
     plan_path = stage2 / "verification_operation_plan.json"
@@ -71,6 +73,7 @@ def project_stage2_evidence(
         ),
         certificate_sha256=file_sha256(certificate_path),
         package_sha256=file_sha256(package_path),
+        formal_reset=str(project["formal"]["reset"]),
     )
     operations = {row["operation_id"]: row for row in plan["operations"]}
     results = {row["operation_id"]: row for row in result_map["operation_results"]}
@@ -225,6 +228,7 @@ def _build_observation_map(
     semantic_index_sha256: str,
     certificate_sha256: str,
     package_sha256: str,
+    formal_reset: str = "reset",
 ) -> Dict[str, Any]:
     objects = {row["object_id"]: row for row in semantic.get("objects", [])}
     bindings = []
@@ -238,12 +242,18 @@ def _build_observation_map(
             raise TraceProjectionError("multiple bindings alias one source object")
         seen_objects.add(object_id)
         emitted_signal = f"{wrapper_top}.{row['name']}"
-        if row.get("direction") == "internal" and row.get("accessibility") == "wrapper":
+        if row.get("accessibility") == "wrapper":
             # Wrapper-accessible internals are acquired with BoringUtils for
             # property compilation, while formal traces retain the exact DUT
             # register in the nested instance scope.  Join to that stable
             # semantic object rather than a CIRCT-generated bore wire name.
-            emitted_signal = f"{wrapper_top}.dut.{row['name']}"
+            if row.get("owner_module") == semantic.get("top"):
+                emitted_signal = f"{wrapper_top}.dut.{row['name']}"
+            else:
+                emitted_signal = (
+                    f"{wrapper_top}.dut."
+                    + _nested_trace_path(binding, row)
+                )
         bindings.append(
             {
                 "binding_id": binding["binding_id"],
@@ -281,8 +291,42 @@ def _build_observation_map(
         "bindings": bindings,
         "monitor_states": sorted(states, key=lambda row: row["state_id"]),
         "clock_signal": f"{wrapper_top}.clock",
-        "reset_signal": f"{wrapper_top}.reset",
+        "reset_signal": f"{wrapper_top}.{formal_reset}",
     }
+
+
+def _nested_trace_path(
+    binding: Mapping[str, Any], row: Mapping[str, Any]
+) -> str:
+    acquisition = binding.get("acquisition")
+    adapter_id = (
+        acquisition.get("adapter_id")
+        if isinstance(acquisition, Mapping)
+        else None
+    )
+    adapter = load_reviewed_assets().api_adapters.get(adapter_id)
+    if adapter is None:
+        raise TraceProjectionError("nested observer adapter is not reviewed")
+    matches = [
+        item
+        for item in adapter.get("hierarchical_observers", ())
+        if isinstance(item, Mapping)
+        and item.get("owner_module") == row.get("owner_module")
+        and item.get("name") == row.get("name")
+        and item.get("source_path") == row.get("source_anchor", {}).get("path")
+        and item.get("source_line") == row.get("source_anchor", {}).get("line_start")
+    ]
+    if len(matches) != 1:
+        raise TraceProjectionError(
+            "nested observer lacks one exact reviewed trace path"
+        )
+    path = str(matches[0].get("trace_path", ""))
+    if any(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) is None
+        for part in path.split(".")
+    ):
+        raise TraceProjectionError("nested observer trace path is unsafe")
+    return path
 
 
 def _project_trace(

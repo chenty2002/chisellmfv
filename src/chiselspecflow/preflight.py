@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+from .assets import load_reviewed_assets
 from .config import (
     SpecFlowRunConfig,
     load_generator_configuration,
@@ -51,12 +52,21 @@ def prepare_iteration1_workspace(
         baseline_path,
     )
     semantic_path = workspace.indexes_dir / "chisel_semantic_index.json"
+    matching_adapters = [
+        row
+        for row in load_reviewed_assets().api_adapters.values()
+        if row.get("project_id") == project.project_id
+        and row.get("strategy") == "wrapper"
+    ]
+    if len(matching_adapters) != 1:
+        raise ValueError("project requires one exact reviewed wrapper adapter")
     merge_semantic_index(
         source_index,
         baseline,
         project,
         configuration,
         semantic_path,
+        matching_adapters[0].get("hierarchical_observers", ()),
     )
     workspace.record_indexes(
         {

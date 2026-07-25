@@ -178,7 +178,8 @@ _GENERATOR_FIELDS = {
     "configuration_schema",
     "parameter_schema",
 }
-_FORMAL_FIELDS = {"clock", "reset", "reset_active_high", "backend"}
+_FORMAL_REQUIRED_FIELDS = {"clock", "reset", "reset_active_high", "backend"}
+_FORMAL_OPTIONAL_FIELDS = {"proof_mode", "primary_max_trace_length"}
 _CONFIG_FIELDS = {"schema_version", "configuration_id", "parameters"}
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -304,13 +305,33 @@ def load_project_contract(path: Path) -> ProjectContract:
         _validate_parameter_rule(rule, name)
 
     formal = _object(value["formal"], "formal")
-    _require_exact_fields(formal, _FORMAL_FIELDS, "formal")
+    if (
+        not _FORMAL_REQUIRED_FIELDS <= set(formal)
+        or set(formal) - _FORMAL_REQUIRED_FIELDS - _FORMAL_OPTIONAL_FIELDS
+    ):
+        raise SpecFlowConfigError("formal has invalid fields")
     _nonempty_string(formal["clock"], "formal.clock")
     _nonempty_string(formal["reset"], "formal.reset")
     if not isinstance(formal["reset_active_high"], bool):
         raise SpecFlowConfigError("formal.reset_active_high must be boolean")
     if formal["backend"] != "jaspergold":
         raise SpecFlowConfigError("Iteration 1 supports only the jaspergold backend")
+    proof_fields = _FORMAL_OPTIONAL_FIELDS & set(formal)
+    if proof_fields and proof_fields != _FORMAL_OPTIONAL_FIELDS:
+        raise SpecFlowConfigError(
+            "formal bounded proof requires proof_mode and primary_max_trace_length"
+        )
+    if proof_fields:
+        if formal["proof_mode"] != "bounded":
+            raise SpecFlowConfigError("formal.proof_mode supports only bounded")
+        if (
+            isinstance(formal["primary_max_trace_length"], bool)
+            or not isinstance(formal["primary_max_trace_length"], int)
+            or formal["primary_max_trace_length"] < 1
+        ):
+            raise SpecFlowConfigError(
+                "formal.primary_max_trace_length must be a positive integer"
+            )
 
     return ProjectContract(
         path=path,
