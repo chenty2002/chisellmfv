@@ -35,7 +35,10 @@ PROPERTY_RESULT_MAP_SCHEMA_VERSION = "property_result_map.v5"
 SEMANTIC_EVIDENCE_SCHEMA_VERSION = "semantic_evidence.v3"
 TRACE_MANIFEST_SCHEMA_VERSION = "trace_manifest.v1"
 EVIDENCE_PROJECTION_SCHEMA_VERSION = "evidence_projection.v1"
-DIAGNOSIS_CANDIDATE_SCHEMA_VERSION = "diagnosis_candidate.v1"
+CAUSAL_GRAPH_MANIFEST_SCHEMA_VERSION = "causal_graph_manifest.v1"
+CAUSAL_SOURCE_PROJECTION_SCHEMA_VERSION = "causal_source_projection.v1"
+DIAGNOSIS_TRANSCRIPT_SCHEMA_VERSION = "diagnosis_transcript_manifest.v1"
+DIAGNOSIS_CANDIDATE_SCHEMA_VERSION = "diagnosis_candidate.v2"
 FINAL_VERDICT_SCHEMA_VERSION = "final_verdict.v1"
 REVISION_REQUEST_SCHEMA_VERSION = "revision_request.v1"
 
@@ -65,6 +68,9 @@ SCHEMA_VERSIONS: Mapping[str, str] = MappingProxyType(
         "semantic_evidence": SEMANTIC_EVIDENCE_SCHEMA_VERSION,
         "trace_manifest": TRACE_MANIFEST_SCHEMA_VERSION,
         "evidence_projection": EVIDENCE_PROJECTION_SCHEMA_VERSION,
+        "causal_graph_manifest": CAUSAL_GRAPH_MANIFEST_SCHEMA_VERSION,
+        "causal_source_projection": CAUSAL_SOURCE_PROJECTION_SCHEMA_VERSION,
+        "diagnosis_transcript": DIAGNOSIS_TRANSCRIPT_SCHEMA_VERSION,
         "diagnosis_candidate": DIAGNOSIS_CANDIDATE_SCHEMA_VERSION,
         "final_verdict": FINAL_VERDICT_SCHEMA_VERSION,
         "revision_request": REVISION_REQUEST_SCHEMA_VERSION,
@@ -138,6 +144,7 @@ class ProjectContract:
     build: Mapping[str, Any]
     generator: Mapping[str, Any]
     formal: Mapping[str, Any]
+    diagnosis: Mapping[str, Any]
     raw: Mapping[str, Any]
 
 
@@ -160,6 +167,7 @@ _PROJECT_FIELDS = {
     "build",
     "generator",
     "formal",
+    "diagnosis",
 }
 _MODEL_VIEW_FIELDS = {"strategy", "exclusions"}
 _MODEL_VIEW_EXCLUSION_FIELDS = {"path", "source_sha256", "start_line", "end_line"}
@@ -180,6 +188,17 @@ _GENERATOR_FIELDS = {
 }
 _FORMAL_REQUIRED_FIELDS = {"clock", "reset", "reset_active_high", "backend"}
 _FORMAL_OPTIONAL_FIELDS = {"proof_mode", "primary_max_trace_length"}
+_DIAGNOSIS_FIELDS = {
+    "causal_backend",
+    "causal_policy",
+    "clock_domain",
+    "max_depth",
+    "max_nodes",
+    "random_seed",
+    "max_model_calls",
+    "max_evidence_queries",
+    "max_source_context_lines",
+}
 _CONFIG_FIELDS = {"schema_version", "configuration_id", "parameters"}
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -333,6 +352,15 @@ def load_project_contract(path: Path) -> ProjectContract:
                 "formal.primary_max_trace_length must be a positive integer"
             )
 
+    diagnosis = _object(value["diagnosis"], "diagnosis")
+    _require_exact_fields(diagnosis, _DIAGNOSIS_FIELDS, "diagnosis")
+    try:
+        from .causal_contract import effective_causal_config
+
+        normalized_diagnosis = effective_causal_config(diagnosis)
+    except ValueError as exc:
+        raise SpecFlowConfigError(str(exc)) from exc
+
     return ProjectContract(
         path=path,
         repository_root=repository_root,
@@ -345,6 +373,7 @@ def load_project_contract(path: Path) -> ProjectContract:
         build=MappingProxyType(dict(build)),
         generator=MappingProxyType(dict(generator)),
         formal=MappingProxyType(dict(formal)),
+        diagnosis=MappingProxyType(normalized_diagnosis),
         raw=MappingProxyType(dict(value)),
     )
 

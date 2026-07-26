@@ -290,6 +290,7 @@ def _validate_run_integrity(
         "property_decomposition_sha256": workspace.inputs_dir / "property_decomposition.json",
         "authoring_scope_sha256": workspace.inputs_dir / "authoring_scope.json",
         "model_view_manifest_sha256": workspace.inputs_dir / "model_view_manifest.json",
+        "diagnosis_config_sha256": workspace.inputs_dir / "diagnosis_config.json",
     }
     for key, path in input_paths.items():
         if not path.is_file() or file_sha256(path) != manifest.get("input_hashes", {}).get(key):

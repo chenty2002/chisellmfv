@@ -204,6 +204,7 @@ class SpecFlowWorkspace:
                 project, project_copy, inputs / "model_sources"
             )
             _write_json(inputs / "model_view_manifest.json", model_view)
+            _write_json(inputs / "diagnosis_config.json", dict(project.diagnosis))
 
             input_hashes = {
                 "project_contract_sha256": _file_sha256(inputs / "project_contract.json"),
@@ -218,6 +219,9 @@ class SpecFlowWorkspace:
                 "authoring_scope_sha256": _file_sha256(inputs / "authoring_scope.json"),
                 "model_view_manifest_sha256": _file_sha256(
                     inputs / "model_view_manifest.json"
+                ),
+                "diagnosis_config_sha256": _file_sha256(
+                    inputs / "diagnosis_config.json"
                 ),
             }
             _write_json(inputs / "input_hashes.json", input_hashes)
@@ -252,6 +256,10 @@ class SpecFlowWorkspace:
                     ],
                     "model_view_manifest_sha256": input_hashes[
                         "model_view_manifest_sha256"
+                    ],
+                    "diagnosis": dict(project.diagnosis),
+                    "diagnosis_config_sha256": input_hashes[
+                        "diagnosis_config_sha256"
                     ],
                     "public_spec_sha256": public_spec_package["spec_sha256"],
                     "suite_ledger_sha256": public_spec_package[

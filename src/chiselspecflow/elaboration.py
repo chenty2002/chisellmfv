@@ -195,11 +195,12 @@ def elaborate_verification_overlay(
         raise VerificationElaborationError("not every source property has an exact identity")
     generated_files = [
         {
+            "artifact_id": f"rtl_{index:04d}",
             "path": str(path),
             "sha256": file_sha256(path),
             "bytes": path.stat().st_size,
         }
-        for path in sv_files
+        for index, path in enumerate(sv_files, start=1)
     ]
     certificate = {
         "schema_version": "elaboration_certificate.v1",

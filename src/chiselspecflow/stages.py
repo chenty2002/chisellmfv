@@ -51,6 +51,7 @@ class StageSpec:
     required_predecessor: Optional[str]
     completion_gate: str
     artifact_contract: Tuple[str, ...]
+    allow_empty_artifacts: Tuple[str, ...] = ()
 
     @property
     def directory_name(self) -> str:
@@ -103,12 +104,23 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
         completion_gate="reviewed_final_verdict",
         artifact_contract=(
             "evidence_projection.json",
+            "causal_graph_manifest.json",
+            "causal_source_projection.json",
+            "causal_query_log.jsonl",
+            "model_calls.jsonl",
+            "candidate_attempts.jsonl",
+            "diagnosis_transcript_manifest.json",
             "diagnosis_candidate.json",
             "diagnosis_review.json",
             "source_ranking.json",
             "revision_request.json",
             "final_verdict.json",
             "counterexample_analysis.md",
+        ),
+        allow_empty_artifacts=(
+            "causal_query_log.jsonl",
+            "model_calls.jsonl",
+            "candidate_attempts.jsonl",
         ),
     ),
 )
@@ -136,6 +148,7 @@ def stage_contract_snapshot() -> Tuple[Dict[str, object], ...]:
             "required_predecessor": spec.required_predecessor,
             "completion_gate": spec.completion_gate,
             "artifact_contract": list(spec.artifact_contract),
+            "allow_empty_artifacts": list(spec.allow_empty_artifacts),
         }
         for spec in STAGE_SPECS
     )

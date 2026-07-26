@@ -15,8 +15,13 @@ from src.core.artifact_contract import (
 )
 from src.core.formal_operations import canonical_sha256
 
-from .stages import DIAGNOSIS_CLASSIFICATIONS, get_stage_spec
-from .trace_projection import project_stage2_evidence
+from .stages import get_stage_spec
+from .causal_backend import materialize_causal_evidence
+from .causal_loop import (
+    run_causal_evidence_loop,
+    write_not_required_loop_artifacts,
+)
+from .trace_projection import _load_certified_package, project_stage2_evidence
 from .workspace import SpecFlowRound
 
 
@@ -77,11 +82,25 @@ def run_diagnose(
         fst2vcd_argv=fst2vcd_argv,
     )
     _write_json(stage3 / "evidence_projection.json", projection)
+    causal_manifest, causal_source, causal_graphs = materialize_causal_evidence(
+        workspace,
+        round_id,
+        projection,
+        config=manifest.get("diagnosis"),
+    )
+    _write_json(stage3 / "causal_graph_manifest.json", causal_manifest)
+    _write_json(stage3 / "causal_source_projection.json", causal_source)
     result_map = _read_json(stage2 / "property_result_map.json")
     semantic_evidence = _read_json(stage2 / "semantic_evidence.json")
 
     if _is_accepted_without_diagnosis(result_map, semantic_evidence):
-        candidate = _not_required("diagnosis_candidate.v1", "all_primary_proven")
+        write_not_required_loop_artifacts(
+            stage3,
+            reason="all_primary_proven",
+            graph_manifest=causal_manifest,
+            source_projection=causal_source,
+        )
+        candidate = _not_required("diagnosis_candidate.v2", "all_primary_proven")
         review = _not_required("diagnosis_review.v1", "diagnosis_not_invoked")
         ranking = _not_required("source_ranking.v1", "track_d_not_required")
         revision = _not_required("revision_request.v1", "accepted")
@@ -106,8 +125,14 @@ def run_diagnose(
         )
 
     if not _requires_model(result_map):
+        write_not_required_loop_artifacts(
+            stage3,
+            reason="tool_or_identity_failure_is_deterministic",
+            graph_manifest=causal_manifest,
+            source_projection=causal_source,
+        )
         candidate = _not_required(
-            "diagnosis_candidate.v1", "tool_or_identity_failure_is_deterministic"
+            "diagnosis_candidate.v2", "tool_or_identity_failure_is_deterministic"
         )
         review = _not_required("diagnosis_review.v1", "diagnosis_not_invoked")
         ranking = _not_required("source_ranking.v1", "track_d_not_required")
@@ -134,9 +159,20 @@ def run_diagnose(
 
     if model is None:
         raise DiagnosisError("a diagnosis model is required for CEX evidence")
-    candidate, audit = _request_diagnosis_candidate(model, projection, track_d=track_d)
+    package, _package_path = _load_certified_package(stage2)
+    candidate, loop_counts = run_causal_evidence_loop(
+        model,
+        projection=projection,
+        graph_manifest=causal_manifest,
+        source_projection=causal_source,
+        graphs=causal_graphs,
+        reviewed_package=package,
+        frozen_clauses=_frozen_clause_context(workspace, projection),
+        project_root=workspace.project_workspace,
+        stage3=stage3,
+        track_d=track_d,
+    )
     _write_json(stage3 / "diagnosis_candidate.json", candidate)
-    _write_jsonl(stage3 / "model_calls.jsonl", audit)
     request = {
         "schema_version": "diagnosis_review_request.v1",
         "round_id": round_id,
@@ -173,7 +209,7 @@ def run_diagnose(
         round_id,
         stage2,
         stage3,
-        model_calls=len(audit),
+        model_calls=loop_counts["model_calls"],
         reviewed=False,
     )
     _write_json(stage3 / "final_verdict.json", interim)
@@ -186,7 +222,9 @@ def run_diagnose(
             "status": "awaiting_review",
             "error_kind": "diagnosis_review_required",
             "round_id": round_id,
-            "model_calls": len(audit),
+            "model_calls": loop_counts["model_calls"],
+            "evidence_queries": loop_counts["evidence_queries"],
+            "protocol_repairs": loop_counts["protocol_repairs"],
             "final_verdict": "inconclusive",
         },
         source_state=manifest,
@@ -328,238 +366,6 @@ def create_revision_round(run_dir: Path) -> Path:
     updated_manifest["review_state"] = "not_started"
     _write_json(workspace.manifest_path, updated_manifest)
     return child_path
-
-
-def _request_diagnosis_candidate(
-    model: DiagnosisModel,
-    projection: Mapping[str, Any],
-    *,
-    track_d: bool,
-) -> tuple[Dict[str, Any], list[Dict[str, Any]]]:
-    traces = [row for row in projection.get("traces", []) if row.get("operation_id")]
-    operation_ids = sorted({row["operation_id"] for row in traces})
-    cycles = sorted(
-        {row["failure_cycle"] for row in traces if row.get("failure_cycle") is not None}
-    )
-    object_ids = sorted(
-        {
-            obj["object_id"]
-            for row in traces
-            for obj in row.get("source_objects", [])
-        }
-    )
-    state_ids = sorted(
-        {
-            state["state_id"]
-            for row in traces
-            for state in row.get("monitor_states", [])
-        }
-    )
-    clauses = sorted(
-        {
-            row.get("spec_clause", {}).get("locator")
-            for row in traces
-            if row.get("spec_clause", {}).get("locator")
-        }
-    )
-    evidence_refs = _allowed_evidence_refs(traces)
-    if not operation_ids or not cycles or not object_ids or not clauses:
-        # The model may still classify incomplete evidence, but it must use stable
-        # placeholders that are already present in the projection.
-        operation_ids = operation_ids or ["projection:missing_operation"]
-        cycles = cycles or [-1]
-        object_ids = object_ids or ["projection:missing_object"]
-        clauses = clauses or ["projection:missing_clause"]
-        evidence_refs = evidence_refs or ["projection:incomplete"]
-    ranking_item = _strict_object(
-        {
-            "candidate_id": _string(),
-            "object_id": _enum(object_ids),
-            "rank_group": {"type": "integer", "minimum": 1},
-            "evidence_refs": _nonempty_enum_array(evidence_refs),
-        }
-    )
-    parameters = _strict_object(
-        {
-            "classification": _enum(sorted(DIAGNOSIS_CLASSIFICATIONS)),
-            "operation_id": _enum(operation_ids),
-            "failure_cycle": _enum(cycles),
-            "object_ids": _nonempty_enum_array(object_ids),
-            "monitor_state_ids": {
-                "type": "array",
-                "items": _enum(state_ids or ["not_required"]),
-            },
-            "spec_clause_locator": _enum(clauses),
-            "evidence_refs": _nonempty_enum_array(evidence_refs),
-            "summary": _string(),
-            "ranked_source_candidates": {
-                "type": "array",
-                "minItems": 1 if track_d else 0,
-                **({} if track_d else {"maxItems": 0}),
-                "items": ranking_item,
-            },
-        }
-    )
-    tools = [
-        {
-            "name": "submit_diagnosis_candidate",
-            "description": (
-                "Classify only the supplied deterministic evidence. Do not emit a final "
-                "verdict, patch, approval, or unlisted source location."
-            ),
-            "strict": True,
-            "parameters": parameters,
-        }
-    ]
-    context = {
-        "task": (
-            "classify exact projected formal evidence; "
-            + (
-                "submit at least one ranked source candidate"
-                if track_d
-                else "ranked_source_candidates must be an empty array outside Track D"
-            )
-        ),
-        "projection": projection,
-        "allowed_evidence_refs": evidence_refs,
-        "track_d": track_d,
-    }
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a bounded evidence classifier. Use exactly the required named "
-                "tool. The final verdict and review are outside your authority."
-            ),
-        },
-        {"role": "user", "content": json.dumps(context, sort_keys=True)},
-    ]
-    audit = []
-    last_error = ""
-    for attempt in range(2):
-        if attempt:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "One bounded protocol repair is allowed: " + last_error,
-                }
-            )
-        response = model.chat_with_tools(
-            messages=messages,
-            tools=tools,
-            max_tokens=4096,
-            temperature=0.0,
-            tool_choice="required",
-            parallel_tool_calls=False,
-            usage_metadata={"stage": "diagnose", "task_type": "evidence_diagnosis"},
-        )
-        row = {
-            "schema_version": "specflow_model_call.v1",
-            "sequence": attempt + 1,
-            "stage": "diagnose",
-            "expected_tool": "submit_diagnosis_candidate",
-            "attempt": attempt + 1,
-            "parallel_tool_calls": False,
-            "response_type": response.get("type"),
-        }
-        audit.append(row)
-        calls = response.get("function_calls") if response.get("type") == "function_calls" else None
-        if not isinstance(calls, list) or len(calls) != 1:
-            last_error = "exactly one diagnosis function call is required"
-            row.update({"outcome": "protocol_repair", "error": last_error})
-            continue
-        call = calls[0]
-        if call.get("name") != "submit_diagnosis_candidate":
-            last_error = "unexpected diagnosis tool"
-            row.update({"outcome": "protocol_repair", "error": last_error})
-            continue
-        arguments = call.get("arguments")
-        try:
-            candidate = _validate_candidate(
-                arguments,
-                operation_ids,
-                cycles,
-                object_ids,
-                state_ids,
-                clauses,
-                evidence_refs,
-                track_d=track_d,
-            )
-        except DiagnosisError as exc:
-            last_error = str(exc)
-            row.update({"outcome": "validation_repair", "error": last_error})
-            continue
-        candidate["model_call_ref"] = str(
-            call.get("id") or f"submit_diagnosis_candidate:{attempt + 1}"
-        )
-        body = dict(candidate)
-        candidate["candidate_id"] = "diag_" + canonical_sha256(body)[:24]
-        row.update(
-            {
-                "outcome": "accepted_candidate",
-                "call_id": candidate["model_call_ref"],
-                "classification": candidate["classification"],
-            }
-        )
-        return candidate, audit
-    raise DiagnosisError("diagnosis candidate repair exhausted: " + last_error)
-
-
-def _validate_candidate(
-    value: Any,
-    operation_ids: list[str],
-    cycles: list[int],
-    object_ids: list[str],
-    state_ids: list[str],
-    clauses: list[str],
-    evidence_refs: list[str],
-    *,
-    track_d: bool,
-) -> Dict[str, Any]:
-    fields = {
-        "classification",
-        "operation_id",
-        "failure_cycle",
-        "object_ids",
-        "monitor_state_ids",
-        "spec_clause_locator",
-        "evidence_refs",
-        "summary",
-        "ranked_source_candidates",
-    }
-    if not isinstance(value, Mapping) or set(value) != fields:
-        raise DiagnosisError("diagnosis candidate has an invalid exact schema")
-    candidate = dict(value)
-    if candidate["classification"] not in DIAGNOSIS_CLASSIFICATIONS:
-        raise DiagnosisError("unknown diagnosis classification")
-    if candidate["operation_id"] not in operation_ids:
-        raise DiagnosisError("diagnosis references an unknown operation")
-    if candidate["failure_cycle"] not in cycles:
-        raise DiagnosisError("diagnosis references an unknown failure cycle")
-    _validate_subset(candidate["object_ids"], object_ids, "object IDs", nonempty=True)
-    _validate_subset(candidate["monitor_state_ids"], state_ids, "monitor states")
-    if candidate["spec_clause_locator"] not in clauses:
-        raise DiagnosisError("diagnosis references an unknown spec clause")
-    _validate_subset(candidate["evidence_refs"], evidence_refs, "evidence refs", nonempty=True)
-    if not isinstance(candidate["summary"], str) or not candidate["summary"].strip():
-        raise DiagnosisError("diagnosis summary is required")
-    ranking = candidate["ranked_source_candidates"]
-    if not isinstance(ranking, list) or (track_d and not ranking) or (not track_d and ranking):
-        raise DiagnosisError("ranked source candidates do not match Track D mode")
-    seen = set()
-    for row in ranking:
-        if not isinstance(row, Mapping) or set(row) != {
-            "candidate_id", "object_id", "rank_group", "evidence_refs"
-        }:
-            raise DiagnosisError("ranked source candidate is malformed")
-        if row["candidate_id"] in seen or row["object_id"] not in object_ids:
-            raise DiagnosisError("ranked source candidate identity is invalid")
-        seen.add(row["candidate_id"])
-        if not isinstance(row["rank_group"], int) or isinstance(row["rank_group"], bool) or row["rank_group"] < 1:
-            raise DiagnosisError("rank group must be a positive integer")
-        _validate_subset(row["evidence_refs"], evidence_refs, "ranking evidence", nonempty=True)
-    candidate["schema_version"] = "diagnosis_candidate.v1"
-    return candidate
 
 
 def _validate_diagnosis_review(
@@ -824,36 +630,54 @@ def _requires_model(result_map: Mapping[str, Any]) -> bool:
     )
 
 
-def _allowed_evidence_refs(traces: list[Mapping[str, Any]]) -> list[str]:
-    refs = set()
-    for trace in traces:
-        operation = trace["operation_id"]
-        refs.add("operation:" + operation)
-        if trace.get("failure_cycle") is not None:
-            refs.add(f"trace_cycle:{operation}:{trace['failure_cycle']}")
-        locator = trace.get("spec_clause", {}).get("locator")
-        if locator:
-            refs.add("spec:" + locator)
-        for obj in trace.get("source_objects", []):
-            refs.add("object:" + obj["object_id"])
-            anchor = obj["source_anchor"]
-            refs.add(f"source:{anchor['path']}:{anchor['line_start']}")
-        for state in trace.get("monitor_states", []):
-            refs.add("state:" + state["state_id"])
-    return sorted(refs)
+def _frozen_clause_context(
+    workspace: Any, projection: Mapping[str, Any]
+) -> list[Dict[str, str]]:
+    """Recover only the hash-bound clause slices referenced by CEX evidence."""
 
-
-def _validate_subset(
-    value: Any,
-    allowed: list[str],
-    label: str,
-    *,
-    nonempty: bool = False,
-) -> None:
-    if not isinstance(value, list) or (nonempty and not value):
-        raise DiagnosisError(f"{label} must be a {'non-empty ' if nonempty else ''}list")
-    if len(value) != len(set(value)) or not set(value) <= set(allowed):
-        raise DiagnosisError(f"{label} contain duplicates or unknown identities")
+    clauses = {
+        str(trace["spec_clause"]["locator"]): str(
+            trace["spec_clause"]["text_sha256"]
+        )
+        for trace in projection.get("traces", [])
+        if isinstance(trace.get("spec_clause"), Mapping)
+        and trace["spec_clause"].get("locator")
+        and trace["spec_clause"].get("text_sha256")
+    }
+    lines = (workspace.inputs_dir / "specification.md").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    rows = []
+    for locator, expected_sha256 in sorted(clauses.items()):
+        matches = [
+            index
+            for index, line in enumerate(lines)
+            if re.search(rf"\b{re.escape(locator)}\b", line)
+        ]
+        if not matches:
+            raise DiagnosisError(f"frozen spec clause is missing: {locator}")
+        index = matches[0]
+        parts = [lines[index].strip()]
+        index += 1
+        while (
+            index < len(lines)
+            and lines[index].strip()
+            and not lines[index].lstrip().startswith(("- **", "| `"))
+        ):
+            parts.append(lines[index].strip())
+            index += 1
+        text = " ".join(parts)
+        actual = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if actual != expected_sha256:
+            raise DiagnosisError(f"frozen spec clause hash drifted: {locator}")
+        rows.append(
+            {
+                "locator": locator,
+                "text": text,
+                "text_sha256": actual,
+            }
+        )
+    return rows
 
 
 def _not_required(schema_version: str, reason: str) -> Dict[str, Any]:
@@ -874,27 +698,6 @@ def _tree_hash(root: Path) -> str:
         digest.update(b"\0")
         digest.update(bytes.fromhex(file_sha256(path)))
     return digest.hexdigest()
-
-
-def _strict_object(properties: Mapping[str, Any]) -> Dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": dict(properties),
-        "required": list(properties),
-        "additionalProperties": False,
-    }
-
-
-def _string() -> Dict[str, Any]:
-    return {"type": "string", "minLength": 1}
-
-
-def _enum(values: list[Any]) -> Dict[str, Any]:
-    return {"type": "string" if all(isinstance(row, str) for row in values) else "integer", "enum": values}
-
-
-def _nonempty_enum_array(values: list[str]) -> Dict[str, Any]:
-    return {"type": "array", "minItems": 1, "items": _enum(values)}
 
 
 def _read_json(path: Path) -> Dict[str, Any]:

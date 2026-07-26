@@ -37,6 +37,7 @@ def validate_stage_artifacts(
 
     stage_dir = Path(stage_dir)
     records: Dict[str, Dict[str, Any]] = {}
+    allow_empty = set(getattr(spec, "allow_empty_artifacts", ()))
     for relative in spec.artifact_contract:
         path = stage_dir / relative
         if not path.is_file():
@@ -44,7 +45,7 @@ def validate_stage_artifacts(
                 f"{spec.name} artifact contract is missing {relative}"
             )
         size = path.stat().st_size
-        if size <= 0:
+        if size <= 0 and relative not in allow_empty:
             raise StageArtifactError(
                 f"{spec.name} artifact contract contains empty {relative}"
             )
@@ -66,7 +67,7 @@ def validate_stage_artifacts(
                     for line in path.read_text(encoding="utf-8").splitlines()
                     if line.strip()
                 ]
-                if not lines:
+                if not lines and relative not in allow_empty:
                     raise ValueError("no records")
                 for line in lines:
                     if not isinstance(json.loads(line), dict):

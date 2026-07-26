@@ -125,6 +125,19 @@ def project_stage2_evidence(
                     "source_objects": [],
                     "monitor_states": [],
                     "spec_clause": obligation["clause_ref"],
+                    "causal_seed": {
+                        "status": "ambiguous",
+                        "operation_id": operation_id,
+                        "failure_cycle": None,
+                        "endpoint_candidates": [],
+                        "clock_signal": observation_map["clock_signal"],
+                        "errors": [
+                            {
+                                "code": "causal_seed_projection_failed",
+                                "detail": str(exc),
+                            }
+                        ],
+                    },
                     "errors": [projection_errors[-1]],
                 }
             )
@@ -450,6 +463,7 @@ def _project_trace(
                 "binding_id": binding_id,
                 "object_id": binding["object_id"],
                 "name": row["name"],
+                "emitted_signal": binding["emitted_signal"],
                 "source_anchor": row["source_anchor"],
                 "evidence_ref": f"cycles/{failure_cycle}/objects/{binding['object_id']}",
             }
@@ -469,6 +483,13 @@ def _project_trace(
     unknown_samples = any(
         error["code"] in {"missing_observation", "unknown_sample_value"}
         for error in errors
+    )
+    causal_seed = _derive_causal_seed(
+        operation_id=operation["operation_id"],
+        failure_cycle=failure_cycle,
+        primary=primary,
+        source_objects=source_objects,
+        clock_signal=observation_map["clock_signal"],
     )
     return {
         "operation_id": operation["operation_id"],
@@ -493,8 +514,94 @@ def _project_trace(
         "source_objects": source_objects,
         "monitor_states": monitor_states,
         "spec_clause": obligation["clause_ref"],
+        "causal_seed": causal_seed,
         "errors": errors,
     }
+
+
+def _derive_causal_seed(
+    *,
+    operation_id: str,
+    failure_cycle: Optional[int],
+    primary: Mapping[str, Any],
+    source_objects: list[Mapping[str, Any]],
+    clock_signal: str,
+) -> Dict[str, Any]:
+    """Derive endpoint objects only from the failed typed expression.
+
+    This deliberately does not inspect signal spelling.  Every endpoint must
+    join an object reference in the reviewed expression to exactly one
+    reviewed binding and its deterministic emitted signal.
+    """
+
+    expression_object_ids = sorted(
+        _expression_object_ids(normalized_root(primary["expression_ir"]))
+    )
+    by_object: Dict[str, list[Mapping[str, Any]]] = {}
+    for row in source_objects:
+        by_object.setdefault(str(row["object_id"]), []).append(row)
+    candidates = []
+    errors = []
+    for object_id in expression_object_ids:
+        matches = by_object.get(object_id, [])
+        if len(matches) != 1:
+            errors.append(
+                {
+                    "code": "causal_endpoint_join_ambiguous",
+                    "detail": object_id,
+                }
+            )
+            continue
+        row = matches[0]
+        candidates.append(
+            {
+                "object_id": object_id,
+                "binding_id": row["binding_id"],
+                "emitted_signal": row["emitted_signal"],
+                "selection_reason": "failed_expression_observer",
+            }
+        )
+    if failure_cycle is None:
+        errors.append(
+            {
+                "code": "causal_failure_cycle_missing",
+                "detail": operation_id,
+            }
+        )
+    if not expression_object_ids:
+        errors.append(
+            {
+                "code": "causal_expression_has_no_object_endpoint",
+                "detail": operation_id,
+            }
+        )
+    return {
+        "status": "ready" if not errors and candidates else "ambiguous",
+        "operation_id": operation_id,
+        "failure_cycle": failure_cycle,
+        "endpoint_candidates": candidates,
+        "clock_signal": clock_signal,
+        "errors": errors,
+    }
+
+
+def _expression_object_ids(value: Any) -> set[str]:
+    if isinstance(value, Mapping):
+        found = (
+            {str(value["object_id"])}
+            if value.get("op") == "object_ref"
+            and isinstance(value.get("object_id"), str)
+            else set()
+        )
+        for item in value.values():
+            found.update(_expression_object_ids(item))
+        return found
+    if isinstance(value, list):
+        found: set[str] = set()
+        for item in value:
+            found.update(_expression_object_ids(item))
+        return found
+    return set()
 
 
 def _reconstruct_monitor_transitions(
