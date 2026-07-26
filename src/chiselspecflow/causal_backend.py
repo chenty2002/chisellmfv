@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from src.core.artifact_contract import file_sha256
@@ -47,6 +48,11 @@ def materialize_causal_evidence(
     certificate = _read_json(certificate_path)
     trace_manifest = _read_json(trace_manifest_path)
     semantic = _read_json(semantic_path)
+    semantic_by_id = {
+        str(row["object_id"]): row
+        for row in semantic.get("objects", [])
+        if isinstance(row, Mapping) and row.get("object_id")
+    }
     projection_identity = projection.get("identity", {})
     observation_identity = projection.get("observation_map", {})
     if (
@@ -252,6 +258,13 @@ def materialize_causal_evidence(
                 or file_sha256(trace_path) != trace_row.get("sha256")
             ):
                 raise CausalBackendError("causal trace hash drifted")
+            endpoint_signal = str(endpoint["emitted_signal"])
+            if graph_builder is None:
+                endpoint_signal = _resolve_fst_endpoint(
+                    trace_path,
+                    endpoint_signal,
+                    semantic_by_id.get(str(endpoint["object_id"]), {}),
+                )
             request = make_request_v2(
                 trace={
                     "path": str(trace_path),
@@ -261,7 +274,7 @@ def materialize_causal_evidence(
                 },
                 rtl_files=[dict(row) for row in rtl_rows],
                 clock_signal=seed["clock_signal"],
-                endpoint_signal=endpoint["emitted_signal"],
+                endpoint_signal=endpoint_signal,
                 endpoint_cycle=seed["failure_cycle"],
                 max_depth=config_row["max_depth"],
                 max_nodes=config_row["max_nodes"],
@@ -354,6 +367,65 @@ def materialize_causal_evidence(
             "no_causal_graph",
         )
     return manifest, source, graphs_by_id
+
+
+def _resolve_fst_endpoint(
+    trace_path: Path,
+    emitted_signal: str,
+    semantic_object: Mapping[str, Any],
+) -> str:
+    """Resolve only the FST display suffix for one hash-bound typed object."""
+
+    try:
+        import pylibfst
+    except Exception as exc:
+        raise CausalBackendError("pylibfst is unavailable for endpoint identity") from exc
+    fst = pylibfst.lib.fstReaderOpen(str(trace_path).encode("UTF-8"))
+    if fst == pylibfst.ffi.NULL:
+        raise CausalBackendError("cannot open the certified FST for endpoint identity")
+    try:
+        _scopes, signals = pylibfst.get_scopes_signals2(fst)
+        rows = [
+            (str(name), int(signal.length))
+            for name, signal in signals.by_name.items()
+        ]
+    finally:
+        pylibfst.lib.fstReaderClose(fst)
+    expected_width = (
+        semantic_object.get("chisel_type", {}).get("width")
+        if isinstance(semantic_object.get("chisel_type"), Mapping)
+        else None
+    )
+    return _resolve_fst_display_name(emitted_signal, rows, expected_width)
+
+
+def _resolve_fst_display_name(
+    emitted_signal: str,
+    waveform_signals: list[tuple[str, int]],
+    expected_width: Any,
+) -> str:
+    """Join a typed emitted name to its unique exact FST packed-range spelling."""
+
+    exact = [name for name, _width in waveform_signals if name == emitted_signal]
+    if len(exact) == 1:
+        return exact[0]
+    if (
+        isinstance(expected_width, bool)
+        or not isinstance(expected_width, int)
+        or expected_width < 1
+    ):
+        raise CausalBackendError("typed endpoint width is unavailable")
+    packed = re.compile(rf"^{re.escape(emitted_signal)} \[[0-9]+:[0-9]+\]$")
+    matches = [
+        name
+        for name, width in waveform_signals
+        if width == expected_width and packed.fullmatch(name)
+    ]
+    if len(matches) != 1:
+        raise CausalBackendError(
+            "typed endpoint does not have one exact FST display identity"
+        )
+    return matches[0]
 
 
 def load_bound_graphs(

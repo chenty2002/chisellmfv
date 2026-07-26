@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 from typing import Any, Dict, Mapping, Optional, Protocol, Sequence
 
 from src.core.artifact_contract import file_sha256
@@ -139,6 +140,8 @@ def run_causal_evidence_loop(
             "evidence_queries_remaining": MAX_EVIDENCE_QUERIES - query_calls,
             "protocol_repairs_remaining": MAX_PROTOCOL_REPAIRS - repairs,
         }
+        usage_before = _model_usage_snapshot(model)
+        call_started = time.perf_counter()
         try:
             response = model.chat_with_tools(
                 messages=messages,
@@ -153,6 +156,7 @@ def run_causal_evidence_loop(
                 },
             )
         except Exception as exc:
+            wall_time_s = time.perf_counter() - call_started
             model_calls += 1
             model_rows.append(
                 {
@@ -170,11 +174,16 @@ def run_causal_evidence_loop(
                     "budget_after": _budget_after(
                         model_calls, query_calls, repairs
                     ),
+                    "wall_time_s": round(wall_time_s, 6),
+                    "token_usage": _model_usage_delta(
+                        usage_before, _model_usage_snapshot(model)
+                    ),
                 }
             )
             termination_reason = "model_call_failed"
             break
         model_calls += 1
+        wall_time_s = time.perf_counter() - call_started
         sequence = model_calls
         model_row = {
             "schema_version": "specflow_model_call.v1",
@@ -189,6 +198,10 @@ def run_causal_evidence_loop(
                 response.get("type")
                 if isinstance(response, Mapping)
                 else type(response).__name__
+            ),
+            "wall_time_s": round(wall_time_s, 6),
+            "token_usage": _model_usage_delta(
+                usage_before, _model_usage_snapshot(model)
             ),
         }
         calls = (
@@ -1083,6 +1096,18 @@ def _write_loop_audit(
             "evidence_queries": len(query_rows),
             "candidate_attempts": len(attempt_rows),
         },
+        "metrics": {
+            "model_wall_time_s": round(
+                sum(float(row.get("wall_time_s", 0.0)) for row in model_rows), 6
+            ),
+            "prompt_tokens": _sum_usage(model_rows, "prompt_tokens"),
+            "completion_tokens": _sum_usage(model_rows, "completion_tokens"),
+            "total_tokens": _sum_usage(model_rows, "total_tokens"),
+            "token_accounting_complete": all(
+                row.get("token_usage", {}).get("status") == "available"
+                for row in model_rows
+            ),
+        },
         "reason": reason,
     }
     _write_json(stage3 / "diagnosis_transcript_manifest.json", manifest)
@@ -1096,6 +1121,47 @@ def _contains_absolute_path(value: Any) -> bool:
     if isinstance(value, list):
         return any(_contains_absolute_path(row) for row in value)
     return False
+
+
+def _model_usage_snapshot(model: Any) -> Optional[Dict[str, int]]:
+    getter = getattr(model, "get_token_usage", None)
+    if not callable(getter):
+        return None
+    try:
+        usage = getter()
+    except Exception:
+        return None
+    if not isinstance(usage, Mapping):
+        return None
+    return {
+        "prompt_tokens": int(usage.get("llm_prompt_tokens", 0)),
+        "completion_tokens": int(usage.get("llm_completion_tokens", 0)),
+        "total_tokens": int(usage.get("llm_total_tokens", 0)),
+    }
+
+
+def _model_usage_delta(
+    before: Optional[Mapping[str, int]],
+    after: Optional[Mapping[str, int]],
+) -> Dict[str, Any]:
+    if before is None or after is None:
+        return {"status": "unavailable"}
+    return {
+        "status": "available",
+        **{
+            key: max(0, int(after.get(key, 0)) - int(before.get(key, 0)))
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        },
+    }
+
+
+def _sum_usage(rows: Sequence[Mapping[str, Any]], key: str) -> Optional[int]:
+    values = [
+        row.get("token_usage", {}).get(key)
+        for row in rows
+        if row.get("token_usage", {}).get("status") == "available"
+    ]
+    return sum(int(value) for value in values) if len(values) == len(rows) else None
 
 
 def _contains_unsafe_free_text(value: str) -> bool:

@@ -39,6 +39,8 @@ CAUSAL_GRAPH_MANIFEST_SCHEMA_VERSION = "causal_graph_manifest.v1"
 CAUSAL_SOURCE_PROJECTION_SCHEMA_VERSION = "causal_source_projection.v1"
 DIAGNOSIS_TRANSCRIPT_SCHEMA_VERSION = "diagnosis_transcript_manifest.v1"
 DIAGNOSIS_CANDIDATE_SCHEMA_VERSION = "diagnosis_candidate.v2"
+DIAGNOSIS_REVIEW_REQUEST_SCHEMA_VERSION = "diagnosis_review_request.v2"
+ROOT_CAUSE_RESULT_SCHEMA_VERSION = "root_cause_result.v1"
 FINAL_VERDICT_SCHEMA_VERSION = "final_verdict.v1"
 REVISION_REQUEST_SCHEMA_VERSION = "revision_request.v1"
 
@@ -72,6 +74,8 @@ SCHEMA_VERSIONS: Mapping[str, str] = MappingProxyType(
         "causal_source_projection": CAUSAL_SOURCE_PROJECTION_SCHEMA_VERSION,
         "diagnosis_transcript": DIAGNOSIS_TRANSCRIPT_SCHEMA_VERSION,
         "diagnosis_candidate": DIAGNOSIS_CANDIDATE_SCHEMA_VERSION,
+        "diagnosis_review_request": DIAGNOSIS_REVIEW_REQUEST_SCHEMA_VERSION,
+        "root_cause_result": ROOT_CAUSE_RESULT_SCHEMA_VERSION,
         "final_verdict": FINAL_VERDICT_SCHEMA_VERSION,
         "revision_request": REVISION_REQUEST_SCHEMA_VERSION,
     }
