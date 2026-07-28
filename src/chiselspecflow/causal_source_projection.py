@@ -194,7 +194,23 @@ def _project_edge(
     semantic_rows: Sequence[Mapping[str, Any]],
     project_root: Path,
 ) -> Dict[str, Any]:
-    evidence = edge.get("rtl_evidence", {})
+    evidence = edge.get("rtl_evidence")
+    if not isinstance(evidence, Mapping):
+        return {
+            "edge_id": edge["edge_id"],
+            "rtl_anchor": {
+                "artifact_id": None,
+                "line_start": None,
+                "line_end": None,
+                "snippet_sha256": None,
+            },
+            "projection_status": "rtl_only",
+            "source_candidate_id": None,
+            "chisel_source_anchor": None,
+            "semantic_object_ids": [],
+            "evidence_refs": [f"causal_edge:{edge['edge_id']}"],
+            "errors": [],
+        }
     artifact_id = evidence.get("artifact_id")
     rtl = rtl_by_id.get(str(artifact_id))
     base = {
@@ -236,7 +252,10 @@ def _project_edge(
         or end > len(lines)
     ):
         return {**base, "projection_status": "rtl_only"}
-    locators = _locators("\n".join(lines[start - 1 : end]), project_root)
+    # FIRRTL/CIRCT locator comments normally precede the generated statement.
+    locators = _locators(
+        "\n".join(lines[max(0, start - 4) : end]), project_root
+    )
     exact_matches = []
     for relative, line in locators:
         matches = [

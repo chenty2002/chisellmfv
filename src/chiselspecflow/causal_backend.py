@@ -1,7 +1,8 @@
-"""Model-free SpecFlow adapter for VerilogCausalAnalysis V2."""
+"""Model-free SpecFlow adapter for VerilogCausalAnalysis V2/V3."""
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 from pathlib import Path
 import re
@@ -212,8 +213,11 @@ def materialize_causal_evidence(
 
     try:
         from verilog_causal_analysis import (
-            build_causal_graph_v2,
             make_request_v2,
+            make_request_v3,
+            prepare_causal_analysis,
+            prepare_causal_session_v3,
+            validate_semantic_graph_v3,
             validate_graph_v2,
         )
     except Exception as exc:
@@ -234,11 +238,12 @@ def materialize_causal_evidence(
         )
         return validate_causal_graph_manifest(manifest), source, {}
 
-    builder = graph_builder or build_causal_graph_v2
     graphs_by_id: Dict[str, Dict[str, Any]] = {}
     graph_rows = []
     graph_dir = stage3 / "causal_graphs"
     graph_dir.mkdir(parents=True, exist_ok=True)
+    prepared_stack = ExitStack()
+    prepared_by_identity: Dict[tuple[Any, ...], Any] = {}
     for trace, trace_row, seed, endpoint in requests:
         operation_id = str(trace["operation_id"])
         if trace_row.get("format") != "fst":
@@ -265,28 +270,124 @@ def materialize_causal_evidence(
                     endpoint_signal,
                     semantic_by_id.get(str(endpoint["object_id"]), {}),
                 )
-            request = make_request_v2(
-                trace={
-                    "path": str(trace_path),
-                    "format": "fst",
-                    "sha256": trace_row["sha256"],
-                    "bytes": trace_row["bytes"],
-                },
-                rtl_files=[dict(row) for row in rtl_rows],
-                clock_signal=seed["clock_signal"],
-                endpoint_signal=endpoint_signal,
-                endpoint_cycle=seed["failure_cycle"],
-                max_depth=config_row["max_depth"],
-                max_nodes=config_row["max_nodes"],
-                random_seed=config_row["random_seed"],
-                strict=True,
+            use_v3 = (
+                config_row["causal_backend"]
+                == "verilog_causal_analysis.v3"
             )
-            graph = validate_graph_v2(builder(request))
+            if use_v3:
+                request = make_request_v3(
+                    trace={
+                        "artifact_id": f"trace_{canonical_sha256(operation_id)[:16]}",
+                        "path": str(trace_path),
+                        "format": "fst",
+                        "sha256": trace_row["sha256"],
+                        "bytes": trace_row["bytes"],
+                    },
+                    rtl_files=[dict(row) for row in rtl_rows],
+                    semantic_profile={
+                        "name": "chisel",
+                        "version": "chisel-semantic-profile.v1",
+                        "features": [
+                            "instance_graph",
+                            "compiler_net_normalization",
+                            "register_transition",
+                            "aggregate",
+                            "handshake",
+                            "pipeline",
+                            "temporal_interval",
+                            "waitfor",
+                            "source_provenance",
+                        ],
+                    },
+                    clock={"signal": seed["clock_signal"], "edge": "rising"},
+                    endpoint={
+                        "signal": endpoint_signal,
+                        "cycle": seed["failure_cycle"],
+                        "projection": None,
+                    },
+                    semantic_inputs=[],
+                    bounds={
+                        "max_signal_nodes": config_row["max_nodes"],
+                        "max_semantic_nodes": config_row["max_nodes"],
+                        "max_edges": config_row["max_nodes"] * 4,
+                        "max_seed_count": 8,
+                        "max_intervals_per_signal": 64,
+                        "max_temporal_samples": 64000,
+                        "max_waitfor_nodes": 120,
+                        "max_waitfor_edges": 240,
+                        "max_scc_candidates": 8,
+                    },
+                    random_seed=config_row["random_seed"],
+                    strict=True,
+                )
+            else:
+                request = make_request_v2(
+                    trace={
+                        "path": str(trace_path),
+                        "format": "fst",
+                        "sha256": trace_row["sha256"],
+                        "bytes": trace_row["bytes"],
+                    },
+                    rtl_files=[dict(row) for row in rtl_rows],
+                    clock_signal=seed["clock_signal"],
+                    endpoint_signal=endpoint_signal,
+                    endpoint_cycle=seed["failure_cycle"],
+                    max_depth=config_row["max_depth"],
+                    max_nodes=config_row["max_nodes"],
+                    random_seed=config_row["random_seed"],
+                    strict=True,
+                )
+            if graph_builder is not None:
+                built = graph_builder(request)
+                graph = (
+                    validate_semantic_graph_v3(built)
+                    if use_v3
+                    else validate_graph_v2(built)
+                )
+            else:
+                prepared_identity = (
+                    config_row["causal_backend"],
+                    request.trace.path,
+                    request.trace.sha256,
+                    request.trace.bytes,
+                    tuple(
+                        (
+                            artifact.artifact_id,
+                            artifact.path,
+                            artifact.sha256,
+                            artifact.bytes,
+                        )
+                        for artifact in request.rtl_files
+                    ),
+                    (
+                        request.clock_signal
+                        if not use_v3
+                        else request.clock_signal
+                    ),
+                    request.strict,
+                )
+                prepared = prepared_by_identity.get(prepared_identity)
+                if prepared is None:
+                    prepared = prepared_stack.enter_context(
+                        prepare_causal_session_v3(request)
+                        if use_v3
+                        else prepare_causal_analysis(request)
+                    )
+                    prepared_by_identity[prepared_identity] = prepared
+                built = prepared.build(request)
+                graph = (
+                    validate_semantic_graph_v3(built)
+                    if use_v3
+                    else validate_graph_v2(built)
+                )
             identity = graph["identity"]
             if (
                 identity["request_sha256"] != request.request_sha256
                 or identity["trace_sha256"] != request.trace.sha256
-                or identity["random_seed"] != request.random_seed
+                or (
+                    not use_v3
+                    and identity["random_seed"] != request.random_seed
+                )
             ):
                 raise CausalBackendError(
                     "causal graph identity does not match its exact request"
@@ -319,6 +420,7 @@ def materialize_causal_evidence(
                     "endpoint_object_id": endpoint["object_id"],
                 }
             )
+    prepared_stack.close()
     graph_rows.sort(
         key=lambda row: (
             row["operation_id"],

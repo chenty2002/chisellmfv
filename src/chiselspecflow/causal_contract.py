@@ -11,6 +11,8 @@ from src.core.formal_operations import canonical_sha256
 
 
 CAUSAL_GRAPH_MANIFEST_SCHEMA = "causal_graph_manifest.v1"
+CAUSAL_GRAPH_V2_SCHEMA = "verilog_causal_graph.v2"
+CAUSAL_GRAPH_V3_SCHEMA = "verilog_causal_semantic_graph.v1"
 CAUSAL_SOURCE_PROJECTION_SCHEMA = "causal_source_projection.v1"
 DIAGNOSIS_CANDIDATE_SCHEMA = "diagnosis_candidate.v2"
 DIAGNOSIS_TRANSCRIPT_SCHEMA = "diagnosis_transcript_manifest.v1"
@@ -53,13 +55,122 @@ class CausalContractError(ValueError):
     """Raised when a SpecFlow V6 causal artifact is not exact."""
 
 
+def causal_graph_schema(value: Mapping[str, Any]) -> str:
+    """Return one explicitly supported graph schema without field inference."""
+
+    schema = value.get("schema_version")
+    if schema not in {CAUSAL_GRAPH_V2_SCHEMA, CAUSAL_GRAPH_V3_SCHEMA}:
+        raise CausalContractError("unsupported causal graph schema")
+    return str(schema)
+
+
+def causal_graph_stable_ids(
+    value: Mapping[str, Any],
+) -> tuple[set[str], set[str]]:
+    """Extract the materialized stable node/edge domain for one graph."""
+
+    schema = causal_graph_schema(value)
+    if schema == CAUSAL_GRAPH_V2_SCHEMA:
+        rows = value.get("nodes", [])
+        if not isinstance(rows, list):
+            raise CausalContractError("causal graph identity rows are invalid")
+        node_rows = [(row, "node_id") for row in rows]
+    else:
+        signal_rows = value.get("signal_nodes", [])
+        semantic_rows = value.get("semantic_nodes", [])
+        if not isinstance(signal_rows, list) or not isinstance(
+            semantic_rows, list
+        ):
+            raise CausalContractError("V3 causal graph node rows are invalid")
+        node_rows = [
+            *((row, "node_id") for row in signal_rows),
+            *((row, "semantic_id") for row in semantic_rows),
+        ]
+    edge_rows = value.get("edges", [])
+    if not isinstance(node_rows, list) or not isinstance(edge_rows, list):
+        raise CausalContractError("causal graph identity rows are invalid")
+
+    node_ids: set[str] = set()
+    semantic_ids: set[str] = set()
+    for row, identity_field in node_rows:
+        if (
+            not isinstance(row, Mapping)
+            or not isinstance(row.get(identity_field), str)
+            or not row[identity_field]
+            or (
+                schema == CAUSAL_GRAPH_V3_SCHEMA
+                and identity_field == "node_id"
+                and "semantic_id" in row
+            )
+            or (
+                schema == CAUSAL_GRAPH_V3_SCHEMA
+                and identity_field == "semantic_id"
+                and "node_id" in row
+            )
+        ):
+            raise CausalContractError("causal graph node row is invalid")
+        identity = str(row[identity_field])
+        if identity in node_ids:
+            raise CausalContractError(
+                "causal graph contains an unknown or duplicate node ID class"
+            )
+        node_ids.add(identity)
+        if identity_field == "semantic_id":
+            semantic_ids.add(identity)
+
+    if schema == CAUSAL_GRAPH_V3_SCHEMA:
+        for row in value.get("root_candidates", []):
+            path = row.get("semantic_path") if isinstance(row, Mapping) else None
+            if (
+                not isinstance(row, Mapping)
+                or row.get("semantic_id") not in semantic_ids
+                or not isinstance(path, list)
+                or any(item not in semantic_ids for item in path)
+            ):
+                raise CausalContractError(
+                    "V3 root candidate references an unknown semantic ID"
+                )
+
+    edge_ids: set[str] = set()
+    endpoint_fields = (
+        "src_node_id",
+        "dst_node_id",
+        "src_semantic_id",
+        "dst_semantic_id",
+    )
+    for row in edge_rows:
+        if (
+            not isinstance(row, Mapping)
+            or not isinstance(row.get("edge_id"), str)
+            or not row["edge_id"]
+            or row["edge_id"] in edge_ids
+        ):
+            raise CausalContractError(
+                "causal graph contains an invalid or duplicate edge ID"
+            )
+        referenced = [
+            str(row[field])
+            for field in endpoint_fields
+            if field in row
+        ]
+        if referenced and any(item not in node_ids for item in referenced):
+            raise CausalContractError(
+                "causal graph edge references an unknown stable ID"
+            )
+        edge_ids.add(str(row["edge_id"]))
+    return node_ids, edge_ids
+
+
 def effective_causal_config(
     value: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     config = dict(DEFAULT_CAUSAL_CONFIG if value is None else value)
     if set(config) != set(DEFAULT_CAUSAL_CONFIG):
         raise CausalContractError("diagnosis causal config has invalid exact fields")
-    if config["causal_backend"] != "verilog_causal_analysis.v2":
+    if config["causal_backend"] not in {
+        "verilog_causal_analysis.v2",
+        "verilog_causal_analysis.v3",
+    }:
         raise CausalContractError("unsupported causal backend")
     if config["causal_policy"] not in CAUSAL_POLICIES:
         raise CausalContractError("unsupported causal policy")

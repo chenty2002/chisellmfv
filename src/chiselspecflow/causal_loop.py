@@ -10,7 +10,14 @@ from typing import Any, Dict, Mapping, Optional, Protocol, Sequence
 from src.core.artifact_contract import file_sha256
 from src.core.formal_operations import canonical_sha256
 
-from .causal_contract import stable_candidate_id
+from .causal_contract import (
+    CAUSAL_GRAPH_V2_SCHEMA,
+    CAUSAL_GRAPH_V3_SCHEMA,
+    CausalContractError,
+    causal_graph_schema,
+    causal_graph_stable_ids,
+    stable_candidate_id,
+)
 from .causal_tools import (
     READ_TOOL_NAMES,
     TERMINATION_TOOL_NAMES,
@@ -54,6 +61,28 @@ def run_causal_evidence_loop(
     overviews = _graph_overviews(graphs)
     visibility = new_visibility(graphs, overviews)
     domain = _diagnosis_domain(projection)
+    if any(
+        overview.get("status") == "unsupported"
+        for overview in overviews.values()
+    ):
+        candidate = deterministic_inconclusive_candidate(
+            domain, reason="unsupported_causal_graph_schema"
+        )
+        _write_loop_audit(
+            stage3,
+            model_rows=[],
+            query_rows=[],
+            attempt_rows=[],
+            status="deterministic_inconclusive",
+            graph_manifest=graph_manifest,
+            source_projection=source_projection,
+            reason="unsupported_causal_graph_schema",
+        )
+        return candidate, {
+            "model_calls": 0,
+            "evidence_queries": 0,
+            "protocol_repairs": 0,
+        }
     _bind_causal_domain(
         domain,
         graph_manifest=graph_manifest,
@@ -884,12 +913,12 @@ def _bind_causal_domain(
     for graph_id, graph in graphs.items():
         if graph.get("graph_id") != graph_id:
             raise CausalLoopError("loaded causal graph identity is inconsistent")
-        node_ids_by_graph[graph_id] = sorted(
-            str(row["node_id"]) for row in graph.get("nodes", [])
-        )
-        edge_ids_by_graph[graph_id] = sorted(
-            str(row["edge_id"]) for row in graph.get("edges", [])
-        )
+        try:
+            node_ids, edge_ids = causal_graph_stable_ids(graph)
+        except CausalContractError as exc:
+            raise CausalLoopError(str(exc)) from exc
+        node_ids_by_graph[graph_id] = sorted(node_ids)
+        edge_ids_by_graph[graph_id] = sorted(edge_ids)
     source_graph_ids = {}
     for row in source_projection.get("source_candidates", []):
         if (
@@ -955,14 +984,42 @@ def _graph_overviews(
 ) -> Dict[str, Dict[str, Any]]:
     if not graphs:
         return {}
-    try:
-        from verilog_causal_analysis import get_overview
-    except Exception as exc:
-        raise CausalLoopError("causal overview backend is unavailable") from exc
-    return {
-        graph_id: get_overview(graph, top_k=min(10, max(1, len(graph["nodes"]))))
-        for graph_id, graph in sorted(graphs.items())
-    }
+    rows = {}
+    for graph_id, graph in sorted(graphs.items()):
+        try:
+            schema = causal_graph_schema(graph)
+            causal_graph_stable_ids(graph)
+        except CausalContractError as exc:
+            rows[graph_id] = {
+                "schema_version": "causal_overview_unavailable.v1",
+                "graph_id": graph_id,
+                "status": "unsupported",
+                "error": str(exc),
+            }
+            continue
+        if schema == CAUSAL_GRAPH_V2_SCHEMA:
+            try:
+                from verilog_causal_analysis import get_overview
+            except Exception as exc:
+                raise CausalLoopError(
+                    "causal overview backend is unavailable"
+                ) from exc
+            rows[graph_id] = get_overview(
+                graph, top_k=min(10, max(1, len(graph["nodes"])))
+            )
+        elif schema == CAUSAL_GRAPH_V3_SCHEMA:
+            try:
+                from verilog_causal_analysis import get_semantic_overview
+            except Exception:
+                rows[graph_id] = {
+                    "schema_version": "causal_overview_unavailable.v1",
+                    "graph_id": graph_id,
+                    "status": "unsupported",
+                    "error": "V3 causal overview support is unavailable",
+                }
+            else:
+                rows[graph_id] = get_semantic_overview(graph, top_k=10)
+    return rows
 
 
 def _current_evidence_refs(
@@ -1035,6 +1092,11 @@ def _result_item_counts(value: Mapping[str, Any]) -> Dict[str, int]:
             "nodes",
             "edges",
             "paths",
+            "results",
+            "intervals",
+            "events",
+            "members",
+            "occupancy",
             "source_projection",
             "source_candidates",
         )
