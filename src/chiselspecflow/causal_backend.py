@@ -10,6 +10,8 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 from src.core.artifact_contract import file_sha256
 from src.core.formal_operations import canonical_sha256
+from .ir.expression import normalized_root
+from .trace_projection import _load_certified_package
 
 from .causal_contract import (
     effective_causal_config,
@@ -67,6 +69,12 @@ def materialize_causal_evidence(
         raise CausalBackendError(
             "causal adapter input identity drifted after evidence projection"
         )
+    if config_row["causal_backend"] == "verilog_causal_analysis.v3":
+        v3_identity = _validate_v3_projection_identity(
+            stage2, projection_identity
+        )
+    else:
+        v3_identity = {}
     analyzer = _analyzer_identity()
     rtl_rows = certificate.get("generated_files")
     rtl_set_sha256 = _rtl_set_identity(rtl_rows)
@@ -76,6 +84,7 @@ def materialize_causal_evidence(
         "trace_manifest_sha256": file_sha256(trace_manifest_path),
         "semantic_index_sha256": file_sha256(semantic_path),
         "generated_rtl_set_sha256": rtl_set_sha256,
+        **v3_identity,
     }
     base_manifest = {
         "schema_version": "causal_graph_manifest.v1",
@@ -240,6 +249,8 @@ def materialize_causal_evidence(
 
     graphs_by_id: Dict[str, Dict[str, Any]] = {}
     graph_rows = []
+    request_identities = []
+    semantic_input_identities = []
     graph_dir = stage3 / "causal_graphs"
     graph_dir.mkdir(parents=True, exist_ok=True)
     prepared_stack = ExitStack()
@@ -275,50 +286,24 @@ def materialize_causal_evidence(
                 == "verilog_causal_analysis.v3"
             )
             if use_v3:
-                request = make_request_v3(
-                    trace={
-                        "artifact_id": f"trace_{canonical_sha256(operation_id)[:16]}",
-                        "path": str(trace_path),
-                        "format": "fst",
-                        "sha256": trace_row["sha256"],
-                        "bytes": trace_row["bytes"],
-                    },
-                    rtl_files=[dict(row) for row in rtl_rows],
-                    semantic_profile={
-                        "name": "chisel",
-                        "version": "chisel-semantic-profile.v1",
-                        "features": [
-                            "instance_graph",
-                            "compiler_net_normalization",
-                            "register_transition",
-                            "aggregate",
-                            "handshake",
-                            "pipeline",
-                            "temporal_interval",
-                            "waitfor",
-                            "source_provenance",
-                        ],
-                    },
-                    clock={"signal": seed["clock_signal"], "edge": "rising"},
-                    endpoint={
-                        "signal": endpoint_signal,
-                        "cycle": seed["failure_cycle"],
-                        "projection": None,
-                    },
-                    semantic_inputs=[],
-                    bounds={
-                        "max_signal_nodes": config_row["max_nodes"],
-                        "max_semantic_nodes": config_row["max_nodes"],
-                        "max_edges": config_row["max_nodes"] * 4,
-                        "max_seed_count": 8,
-                        "max_intervals_per_signal": 64,
-                        "max_temporal_samples": 64000,
-                        "max_waitfor_nodes": 120,
-                        "max_waitfor_edges": 240,
-                        "max_scc_candidates": 8,
-                    },
-                    random_seed=config_row["random_seed"],
-                    strict=True,
+                formal_clock = observation_identity.get("clock_signal")
+                if (
+                    formal_clock is not None
+                    and seed["clock_signal"] != formal_clock
+                ):
+                    raise CausalBackendError(
+                        "causal endpoint does not use the primary formal clock"
+                    )
+                request = _make_v3_request(
+                    make_request_v3,
+                    operation_id=operation_id,
+                    trace_path=trace_path,
+                    trace_row=trace_row,
+                    rtl_rows=rtl_rows,
+                    endpoint_signal=endpoint_signal,
+                    endpoint_cycle=seed["failure_cycle"],
+                    clock_signal=seed["clock_signal"],
+                    config=config_row,
                 )
             else:
                 request = make_request_v2(
@@ -338,6 +323,11 @@ def materialize_causal_evidence(
                     strict=True,
                 )
             if graph_builder is not None:
+                if use_v3:
+                    request_identities.append(request.identity_dict())
+                    semantic_input_identities.extend(
+                        item.identity_dict() for item in request.semantic_inputs
+                    )
                 built = graph_builder(request)
                 graph = (
                     validate_semantic_graph_v3(built)
@@ -374,6 +364,43 @@ def materialize_causal_evidence(
                         else prepare_causal_analysis(request)
                     )
                     prepared_by_identity[prepared_identity] = prepared
+                if (
+                    use_v3
+                    and not prepared.instance_graph.get_rtl_context(
+                        endpoint_signal
+                    ).get("found")
+                ):
+                    projection_input, projection_row = (
+                        _materialize_assertion_endpoint_projection(
+                            stage2=stage2,
+                            stage3=stage3,
+                            trace=trace,
+                            trace_row=trace_row,
+                            endpoint=endpoint,
+                            endpoint_signal=endpoint_signal,
+                            endpoint_cycle=seed["failure_cycle"],
+                            clock_signal=seed["clock_signal"],
+                            rtl_set_sha256=rtl_set_sha256,
+                        )
+                    )
+                    request = _make_v3_request(
+                        make_request_v3,
+                        operation_id=operation_id,
+                        trace_path=trace_path,
+                        trace_row=trace_row,
+                        rtl_rows=rtl_rows,
+                        endpoint_signal=endpoint_signal,
+                        endpoint_cycle=seed["failure_cycle"],
+                        clock_signal=seed["clock_signal"],
+                        config=config_row,
+                        projection=projection_row,
+                        semantic_inputs=[projection_input],
+                    )
+                if use_v3:
+                    request_identities.append(request.identity_dict())
+                    semantic_input_identities.extend(
+                        item.identity_dict() for item in request.semantic_inputs
+                    )
                 built = prepared.build(request)
                 graph = (
                     validate_semantic_graph_v3(built)
@@ -421,6 +448,23 @@ def materialize_causal_evidence(
                 }
             )
     prepared_stack.close()
+    manifest_inputs = dict(inputs)
+    if request_identities:
+        manifest_inputs["v3_request_set_sha256"] = canonical_sha256(
+            sorted(
+                request_identities,
+                key=lambda row: canonical_sha256(row),
+            )
+        )
+        manifest_inputs["semantic_input_set_sha256"] = canonical_sha256(
+            sorted(
+                {
+                    canonical_sha256(row): row
+                    for row in semantic_input_identities
+                }.values(),
+                key=lambda row: canonical_sha256(row),
+            )
+        )
     graph_rows.sort(
         key=lambda row: (
             row["operation_id"],
@@ -444,6 +488,7 @@ def materialize_causal_evidence(
     manifest = validate_causal_graph_manifest(
         {
             **base_manifest,
+            "inputs": manifest_inputs,
             "status": manifest_status,
             "graphs": graph_rows,
             "errors": errors,
@@ -469,6 +514,270 @@ def materialize_causal_evidence(
             "no_causal_graph",
         )
     return manifest, source, graphs_by_id
+
+
+_V3_FEATURES = [
+    "instance_graph",
+    "compiler_net_normalization",
+    "register_transition",
+    "aggregate",
+    "handshake",
+    "pipeline",
+    "temporal_interval",
+    "waitfor",
+    "source_provenance",
+]
+
+
+def _make_v3_request(
+    make_request: Callable[..., Any],
+    *,
+    operation_id: str,
+    trace_path: Path,
+    trace_row: Mapping[str, Any],
+    rtl_rows: Any,
+    endpoint_signal: str,
+    endpoint_cycle: int,
+    clock_signal: str,
+    config: Mapping[str, Any],
+    projection: Optional[Mapping[str, Any]] = None,
+    semantic_inputs: Optional[list[Mapping[str, Any]]] = None,
+) -> Any:
+    features = list(_V3_FEATURES)
+    if projection is not None:
+        features.append("endpoint_projection")
+    return make_request(
+        trace={
+            "artifact_id": f"trace_{canonical_sha256(operation_id)[:16]}",
+            "path": str(trace_path),
+            "format": "fst",
+            "sha256": trace_row["sha256"],
+            "bytes": trace_row["bytes"],
+        },
+        rtl_files=[dict(row) for row in rtl_rows],
+        semantic_profile={
+            "name": "chisel",
+            "version": "chisel-semantic-profile.v1",
+            "features": features,
+        },
+        clock={"signal": clock_signal, "edge": "rising"},
+        endpoint={
+            "signal": endpoint_signal,
+            "cycle": endpoint_cycle,
+            "projection": dict(projection) if projection is not None else None,
+        },
+        semantic_inputs=[
+            dict(row) for row in (semantic_inputs or [])
+        ],
+        bounds={
+            "max_signal_nodes": config["max_nodes"],
+            "max_semantic_nodes": config["max_nodes"],
+            "max_edges": config["max_nodes"] * 4,
+            "max_seed_count": 8,
+            "max_intervals_per_signal": 64,
+            "max_temporal_samples": 64000,
+            "max_waitfor_nodes": 120,
+            "max_waitfor_edges": 240,
+            "max_scc_candidates": 8,
+        },
+        random_seed=config["random_seed"],
+        strict=True,
+    )
+
+
+def _validate_v3_projection_identity(
+    stage2: Path, identity: Mapping[str, Any]
+) -> Dict[str, str]:
+    try:
+        package, package_path = _load_certified_package(stage2)
+    except Exception as exc:
+        raise CausalBackendError(
+            "V3 causal projection package identity drifted"
+        ) from exc
+    del package
+    paths = {
+        "verification_package_sha256": package_path,
+        "operation_plan_sha256": stage2 / "verification_operation_plan.json",
+        "property_result_map_sha256": stage2 / "property_result_map.json",
+    }
+    resolved: Dict[str, str] = {}
+    for field, path in paths.items():
+        expected = identity.get(field)
+        if (
+            not isinstance(expected, str)
+            or not path.is_file()
+            or file_sha256(path) != expected
+        ):
+            raise CausalBackendError(
+                "V3 causal projection input identity drifted"
+            )
+        resolved[field] = expected
+    return resolved
+
+
+def _materialize_assertion_endpoint_projection(
+    *,
+    stage2: Path,
+    stage3: Path,
+    trace: Mapping[str, Any],
+    trace_row: Mapping[str, Any],
+    endpoint: Mapping[str, Any],
+    endpoint_signal: str,
+    endpoint_cycle: int,
+    clock_signal: str,
+    rtl_set_sha256: str,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Materialize one exact reviewed-monitor projection without name fallback."""
+
+    package, _package_path = _load_certified_package(stage2)
+    plan = _read_json(stage2 / "verification_operation_plan.json")
+    operations = [
+        row
+        for row in plan.get("operations", [])
+        if isinstance(row, Mapping)
+        and row.get("operation_id") == trace.get("operation_id")
+        and row.get("emitted_property_id") == trace.get("emitted_property_id")
+        and row.get("role") == "primary_assertion"
+    ]
+    if len(operations) != 1:
+        raise CausalBackendError(
+            "assertion projection operation join is missing or ambiguous"
+        )
+    operation = operations[0]
+    monitors = [
+        row
+        for row in package.get("monitors", [])
+        if isinstance(row, Mapping)
+        and row.get("obligation_id") == operation.get("obligation_id")
+    ]
+    if len(monitors) != 1:
+        raise CausalBackendError(
+            "assertion projection monitor join is missing or ambiguous"
+        )
+    primary_rows = [
+        row
+        for row in monitors[0].get("properties", [])
+        if isinstance(row, Mapping)
+        and row.get("source_property_id") == operation.get("source_property_id")
+        and row.get("role") == "primary_assertion"
+    ]
+    if len(primary_rows) != 1:
+        raise CausalBackendError(
+            "assertion projection predicate join is missing or ambiguous"
+        )
+    object_ids: set[str] = set()
+    state_ids: set[str] = set()
+    primary = primary_rows[0]
+    for field in ("expression_ir", "guard_ir"):
+        _collect_predicate_references(
+            normalized_root(primary[field]), object_ids, state_ids
+        )
+    object_members = _exact_projection_members(
+        trace.get("source_objects", []),
+        identity_field="object_id",
+        identities=object_ids,
+    )
+    state_members = _exact_projection_members(
+        trace.get("monitor_states", []),
+        identity_field="state_id",
+        identities=state_ids,
+    )
+    predicate_members = sorted(set(object_members + state_members))
+    if not predicate_members:
+        raise CausalBackendError(
+            "assertion projection has no exact predicate member"
+        )
+    if (
+        endpoint.get("object_id") not in object_ids
+        or endpoint_cycle != trace.get("failure_cycle")
+    ):
+        raise CausalBackendError(
+            "assertion projection endpoint identity is not in the reviewed predicate"
+        )
+    artifact_id = (
+        "assertion_projection_"
+        + canonical_sha256(
+            {
+                "operation_id": operation["operation_id"],
+                "endpoint_signal": endpoint_signal,
+                "endpoint_cycle": endpoint_cycle,
+                "predicate_members": predicate_members,
+                "rtl_set_sha256": rtl_set_sha256,
+                "trace_sha256": trace_row["sha256"],
+            }
+        )[:20]
+    )
+    artifact = {
+        "schema_version": "assertion_endpoint_projection.v1",
+        "endpoint_signal": endpoint_signal,
+        "endpoint_cycle": endpoint_cycle,
+        "clock_signal": clock_signal,
+        "predicate_members": predicate_members,
+        "rtl_set_sha256": rtl_set_sha256,
+        "trace_sha256": trace_row["sha256"],
+    }
+    input_dir = stage3 / "causal_inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    path = input_dir / f"{artifact_id}.json"
+    _write_json(path, artifact)
+    return (
+        {
+            "artifact_id": artifact_id,
+            "kind": "assertion_endpoint_projection",
+            "path": str(path.resolve()),
+            "sha256": file_sha256(path),
+            "bytes": path.stat().st_size,
+        },
+        {
+            "mode": "controller_supplied_exact",
+            "predicate_members": predicate_members,
+            "evidence_ref": artifact_id,
+        },
+    )
+
+
+def _collect_predicate_references(
+    value: Any, object_ids: set[str], state_ids: set[str]
+) -> None:
+    if isinstance(value, Mapping):
+        if value.get("op") == "object_ref" and isinstance(
+            value.get("object_id"), str
+        ):
+            object_ids.add(str(value["object_id"]))
+        if isinstance(value.get("state_id"), str):
+            state_ids.add(str(value["state_id"]))
+        for item in value.values():
+            _collect_predicate_references(item, object_ids, state_ids)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_predicate_references(item, object_ids, state_ids)
+
+
+def _exact_projection_members(
+    rows: Any,
+    *,
+    identity_field: str,
+    identities: set[str],
+) -> list[str]:
+    members = []
+    if not isinstance(rows, list):
+        raise CausalBackendError("assertion projection member rows are invalid")
+    for identity in sorted(identities):
+        matches = [
+            row
+            for row in rows
+            if isinstance(row, Mapping) and row.get(identity_field) == identity
+        ]
+        if (
+            len(matches) != 1
+            or not isinstance(matches[0].get("emitted_signal"), str)
+            or not matches[0]["emitted_signal"]
+        ):
+            raise CausalBackendError(
+                "assertion projection predicate member is missing or ambiguous"
+            )
+        members.append(str(matches[0]["emitted_signal"]))
+    return members
 
 
 def _resolve_fst_endpoint(
