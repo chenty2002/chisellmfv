@@ -61,6 +61,25 @@ def run_causal_evidence_loop(
     overviews = _graph_overviews(graphs)
     visibility = new_visibility(graphs, overviews)
     domain = _diagnosis_domain(projection)
+    if not graphs and graph_manifest.get("status") == "incomplete":
+        candidate = deterministic_inconclusive_candidate(
+            domain, reason="causal_graph_unavailable"
+        )
+        _write_loop_audit(
+            stage3,
+            model_rows=[],
+            query_rows=[],
+            attempt_rows=[],
+            status="deterministic_inconclusive",
+            graph_manifest=graph_manifest,
+            source_projection=source_projection,
+            reason="causal_graph_unavailable",
+        )
+        return candidate, {
+            "model_calls": 0,
+            "evidence_queries": 0,
+            "protocol_repairs": 0,
+        }
     if any(
         overview.get("status") == "unsupported"
         for overview in overviews.values()

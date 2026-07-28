@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 from typing import Any, Dict, Optional
 
 from src.core.artifact_contract import (
@@ -51,6 +52,13 @@ class CompileVerifyStage:
         stage1 = package_workspace.stage_dir(package_round, "asset_authoring")
         if validate_completed_stage(stage1, get_stage_spec("asset_authoring")) is None:
             raise SpecFlowRunnerError("asset_authoring completion or hashes are invalid")
+        if replay:
+            _preserve_frozen_package_evidence(
+                workspace=workspace,
+                round_id=round_id,
+                package_workspace=package_workspace,
+                package_round=package_round,
+            )
         stage2 = workspace.stage_dir(round_id, "compile_verify")
         if any(stage2.iterdir()):
             raise SpecFlowRunnerError("compile_verify stage directory is immutable once written")
@@ -209,6 +217,59 @@ def load_existing_workspace(run_dir: Path) -> SpecFlowWorkspace:
         run_root=run_dir.parent,
     )
     return SpecFlowWorkspace(run_dir, config)
+
+
+def _preserve_frozen_package_evidence(
+    *,
+    workspace: SpecFlowWorkspace,
+    round_id: int,
+    package_workspace: SpecFlowWorkspace,
+    package_round: int,
+) -> None:
+    """Preserve the reviewed package authority inside a replay run.
+
+    A frozen replay intentionally makes no Stage-1 model calls and does not
+    claim a second authoring completion.  It still needs a durable local copy
+    of the exact reviewed package and review record so a later evidence audit
+    does not depend only on an external source-run path.
+    """
+
+    source_stage1 = package_workspace.stage_dir(package_round, "asset_authoring")
+    target_stage1 = workspace.stage_dir(round_id, "asset_authoring")
+    if any(target_stage1.iterdir()):
+        raise SpecFlowRunnerError(
+            "frozen replay asset_authoring evidence directory is not empty"
+        )
+    source_package = source_stage1 / "verification_package.json"
+    source_review = source_stage1 / "review_record.json"
+    if not source_package.is_file() or not source_review.is_file():
+        raise SpecFlowRunnerError(
+            "frozen replay source lacks package or review evidence"
+        )
+    package_sha256 = file_sha256(source_package)
+    review_sha256 = file_sha256(source_review)
+    package = _read_json(source_package)
+    if package.get("review", {}).get("review_record_sha256") != review_sha256:
+        raise SpecFlowRunnerError("frozen replay review/package identity mismatch")
+
+    target_package = target_stage1 / "verification_package.json"
+    target_review = target_stage1 / "review_record.json"
+    shutil.copyfile(source_package, target_package)
+    shutil.copyfile(source_review, target_review)
+    write_json(
+        target_stage1 / "frozen_package_provenance.json",
+        {
+            "schema_version": "frozen_package_provenance.v1",
+            "status": "preserved",
+            "authority": "source_run_external_review",
+            "model_calls": 0,
+            "source_run": str(package_workspace.run_dir),
+            "source_round": package_round,
+            "package_id": package["package_id"],
+            "verification_package_sha256": package_sha256,
+            "review_record_sha256": review_sha256,
+        },
+    )
 
 
 def _update_round_state(
