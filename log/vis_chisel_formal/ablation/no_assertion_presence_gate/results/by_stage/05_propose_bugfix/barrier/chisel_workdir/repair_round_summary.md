@@ -1,5 +1,0 @@
-**Round 1/3**: DUT bug fix for `barrier.count_bound` (and the 3 other failing properties).  
-**Root cause**: At L2 transition (barrier arrival point), `count` was unconditionally incremented (`count := count + 1.U`) without checking whether both threads had already arrived. When `self` switched away from a thread at L3 with count=2 before it could transition to L4, the other thread entering L2 would over-increment count to 3, violating the `count <= 2.U` invariant.  
-**Fix**: Changed line 41 from `count := count + 1.U` to `when(count < 2.U) { count := count + 1.U }`, guarding the increment so count never exceeds 2 (the maximum for a two-thread barrier). The thread still advances to L3 unconditionally.  
-**Expected effect**: Prevents count from exceeding 2, which also unblocks the L3→L4 transition when both threads have arrived, fixing `barrier_cross`, `barrier_releases`, and `rel_set_at_L4` as a side effect.  
-**Assertion labels preserved**: `count_bound`, `barrier_cross`, `barrier_releases`, `rel_set_at_L4` — all unchanged.
