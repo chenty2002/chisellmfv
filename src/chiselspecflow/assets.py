@@ -35,7 +35,7 @@ class AssetLibrary:
             ]
 
         return {
-            "schema_version": "specflow_asset_library.v1",
+            "schema_version": "specflow_asset_library",
             "obligation_schemas": rows(self.obligation_schemas),
             "monitor_archetypes": rows(self.monitor_archetypes),
             "api_adapters": rows(self.api_adapters),
@@ -86,7 +86,7 @@ def load_run_local_package(path: Path) -> Dict[str, Any]:
         "monitors",
         "review",
     }
-    if set(value) != required or value.get("schema_version") != "verification_package.v1":
+    if set(value) != required or value.get("schema_version") != "verification_package":
         raise AssetError("run-local verification package has an invalid exact schema")
     if not all(isinstance(value.get(name), list) and value[name] for name in ("obligations", "bindings", "monitors")):
         raise AssetError("verification package must contain reviewed IR rows")
@@ -138,7 +138,7 @@ def promote_run_local_asset(
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary.replace(destination)
     review_value = {
-        "schema_version": "specflow_repository_asset_review.v1",
+        "schema_version": "specflow_repository_asset_review",
         "reviewer": reviewer,
         "decision": "approved",
         "reviewed_at": review_record.get("reviewed_at"),
@@ -168,7 +168,7 @@ def _load_kind(
         value = _read_json(path)
         if set(value) != {"schema_version", "asset_kind", "asset_id", "payload"}:
             raise AssetError(f"reviewed asset fields differ: {path}")
-        if value["schema_version"] != "specflow_repository_asset.v1" or value["asset_kind"] != expected_kind:
+        if value["schema_version"] != "specflow_repository_asset" or value["asset_kind"] != expected_kind:
             raise AssetError(f"reviewed asset kind/schema mismatch: {path}")
         relative = str(path.relative_to(root))
         digest = file_sha256(path)
@@ -209,7 +209,7 @@ def _load_repository_reviews(root: Path) -> Dict[str, str]:
         }:
             raise AssetError(f"repository asset review fields differ: {path}")
         if (
-            value["schema_version"] != "specflow_repository_asset_review.v1"
+            value["schema_version"] != "specflow_repository_asset_review"
             or value["reviewer"] != "codex"
             or value["decision"] != "approved"
             or not value["evidence_refs"]

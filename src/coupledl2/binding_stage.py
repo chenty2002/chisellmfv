@@ -1,4 +1,4 @@
-"""Constrained two-call Stage 2 property binding orchestration."""
+"""Single-call Stage 2 property binding orchestration."""
 
 from __future__ import annotations
 
@@ -12,11 +12,8 @@ from typing import Any, Dict, Optional
 
 from .assertion_renderer import RenderResult, render_property_source
 from .binding_contract import (
-    REPAIRABLE_ERROR_KINDS,
     BindingContractError,
-    apply_binding_patch,
     binding_manifest_tool,
-    binding_patch_tool,
     validate_binding_manifest,
 )
 from .rtl_property_labeler import RTLProperty, label_rtl_properties
@@ -24,7 +21,6 @@ from .workspace import StageContext, build_protocol_evidence, initialize_stage_c
 from .stages import get_stage_spec
 from ..core.artifact_contract import (
     file_sha256,
-    validate_completed_stage,
     write_stage_outcome,
 )
 from .property_compiler import (
@@ -71,10 +67,6 @@ class BindingStage:
         self.model_calls = 0
 
     def run(self) -> Dict[str, Any]:
-        completed = self._load_completed_binding()
-        if completed is not None:
-            self._event("binding_stage_reused", {"rtl_property_count": completed["rtl_property_count"]})
-            return {"success": True, "stage_result": completed}
         target = (
             self.workspace.case_workspace
             / self.catalog.profile["target"]["relative_path"]
@@ -89,32 +81,13 @@ class BindingStage:
         self._snapshot_source(target, "before")
         manifest: Optional[Dict[str, Any]] = None
         try:
-            manifest = self._load_reusable_manifest()
-            if manifest is None:
-                raw_manifest = self._request(
-                    "submit_binding_manifest",
+            raw_manifest = self._request(
+                "submit_binding_manifest",
                 binding_manifest_tool(self.catalog),
                 self._binding_messages(),
                 max_tokens=2048,
-                allow_protocol_retry=True,
-                )
-                try:
-                    manifest = validate_binding_manifest(raw_manifest, self.catalog)
-                except BindingContractError as exc:
-                    if exc.error_kind not in REPAIRABLE_ERROR_KINDS:
-                        raise
-                    raw_patch = self._request(
-                        "submit_binding_patch",
-                        binding_patch_tool(
-                            self.catalog,
-                            _repair_instance_id(raw_manifest, exc),
-                        ),
-                        self._patch_messages(raw_manifest, exc),
-                        max_tokens=1024,
-                    )
-                    manifest = apply_binding_patch(raw_manifest, raw_patch, self.catalog)
-            else:
-                self._event("binding_manifest_reused", {})
+            )
+            manifest = validate_binding_manifest(raw_manifest, self.catalog)
 
             _write_json(self.stage_dir / "binding_manifest.json", manifest)
             render = render_property_source(target, manifest, self.catalog)
@@ -129,13 +102,12 @@ class BindingStage:
                 raise CompilationGateError(
                     "successful build did not declare the exact top module"
                 )
-            generated = [
-                Path(path)
-                for path in (
-                    build.get("generated_files")
-                    or self.backend.discover_generated_verilog_files()
+            generated_files = build.get("generated_files")
+            if not isinstance(generated_files, list) or not generated_files:
+                raise CompilationGateError(
+                    "successful build did not declare generated_files"
                 )
-            ]
+            generated = [Path(path) for path in generated_files]
             rtl_properties = label_rtl_properties(
                 generated,
                 manifest,
@@ -149,7 +121,7 @@ class BindingStage:
                 top_module=build["top_module"],
             )
             result = {
-                "schema_version": "stage_result.v2",
+                "schema_version": "stage_result",
                 "stage": "bind_properties",
                 "success": True,
                 "termination_reason": "property_binding_completed",
@@ -170,7 +142,7 @@ class BindingStage:
                 path.write_bytes(data)
             self._restore_generated(generated_before)
             result = {
-                "schema_version": "stage_result.v2",
+                "schema_version": "stage_result",
                 "stage": "bind_properties",
                 "success": False,
                 "termination_reason": "binding_stage_failed",
@@ -186,65 +158,6 @@ class BindingStage:
             self._event("binding_stage_failed", {"error_kind": type(exc).__name__})
             return {"success": False, "stage_result": result}
 
-    def _load_reusable_manifest(self) -> Optional[Dict[str, Any]]:
-        """Reuse a validated model selection when retrying deterministic gates."""
-        path = self.stage_dir / "binding_manifest.json"
-        if not path.is_file():
-            return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            return validate_binding_manifest(payload, self.catalog)
-        except (OSError, json.JSONDecodeError, BindingContractError):
-            return None
-
-    def _load_completed_binding(self) -> Optional[Dict[str, Any]]:
-        """Reuse only the same hashed StageSpec contract used by fresh completion."""
-        completed = validate_completed_stage(
-            self.stage_dir, get_stage_spec("bind_properties")
-        )
-        if completed is None:
-            return None
-        manifest = self._load_reusable_manifest()
-        if manifest is None:
-            return None
-        try:
-            package = json.loads(
-                (self.stage_dir / "property_package.json").read_text(encoding="utf-8")
-            )
-            delta = json.loads(
-                (self.stage_dir / "assertion_delta.json").read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError):
-            return None
-        labels = [
-            item.get("rtl_label")
-            for item in delta.get("rtl_properties", [])
-            if isinstance(item.get("rtl_label"), str)
-        ]
-        if not labels or len(labels) != len(set(labels)):
-            return None
-        generated_text = "\n".join(
-            path.read_text(encoding="utf-8", errors="ignore")
-            for path in self.backend.discover_generated_verilog_files()
-            if path.is_file()
-        )
-        if any(
-            len(re.findall(
-                rf"(?<![A-Za-z0-9_]){re.escape(label)}(?![A-Za-z0-9_])",
-                generated_text,
-            )) != 1
-            for label in labels
-        ):
-            return None
-        package_labels = {
-            item.get("rtl_label")
-            for prop in package.get("traceability", {}).get("properties", [])
-            for item in prop.get("rtl_properties", [])
-        }
-        if package_labels != set(labels):
-            return None
-        return completed
-
     def _request(
         self,
         expected_name: str,
@@ -252,51 +165,34 @@ class BindingStage:
         messages: list[Dict[str, Any]],
         *,
         max_tokens: int,
-        allow_protocol_retry: bool = False,
     ) -> Dict[str, Any]:
-        request_messages = list(messages)
-        attempts = 2 if allow_protocol_retry else 1
-        for attempt in range(attempts):
-            self.model_calls += 1
-            response = self.llm_client.chat_with_tools(
-                messages=request_messages,
-                tools=[tool],
-                tool_choice={
-                    "type": "function",
-                    "function": {"name": expected_name},
-                },
-                max_tokens=max_tokens,
-                temperature=0,
-                enable_thinking=False,
-                parallel_tool_calls=False,
-                stage="bind_properties",
-                usage_metadata={"stage": "bind_properties"},
-            )
-            calls = response.get("function_calls") if isinstance(response, dict) else None
-            if (
-                isinstance(response, dict)
-                and response.get("type") == "function_calls"
-                and isinstance(calls, list)
-                and len(calls) == 1
-                and calls[0].get("name") == expected_name
-                and isinstance(calls[0].get("arguments"), dict)
-            ):
-                return calls[0]["arguments"]
-            if attempt + 1 < attempts:
-                request_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Tool protocol correction: call exactly {expected_name} "
-                            "once with a JSON object; do not return text."
-                        ),
-                    }
-                )
-                continue
-            raise BindingStageError(
-                "binding model returned plain text or malformed named tool output"
-            )
-        raise AssertionError("unreachable binding request state")
+        self.model_calls += 1
+        response = self.llm_client.chat_with_tools(
+            messages=messages,
+            tools=[tool],
+            tool_choice={
+                "type": "function",
+                "function": {"name": expected_name},
+            },
+            max_tokens=max_tokens,
+            temperature=0,
+            enable_thinking=False,
+            parallel_tool_calls=False,
+            usage_metadata={"stage": "bind_properties"},
+        )
+        calls = response.get("function_calls") if isinstance(response, dict) else None
+        if (
+            isinstance(response, dict)
+            and response.get("type") == "function_calls"
+            and isinstance(calls, list)
+            and len(calls) == 1
+            and calls[0].get("name") == expected_name
+            and isinstance(calls[0].get("arguments"), dict)
+        ):
+            return calls[0]["arguments"]
+        raise BindingStageError(
+            "binding model returned plain text or malformed named tool output"
+        )
 
     def _binding_messages(self) -> list[Dict[str, Any]]:
         payload = self.stage_context.stage_inputs
@@ -323,53 +219,11 @@ class BindingStage:
             },
         ]
 
-    def _patch_messages(
-        self,
-        manifest: Dict[str, Any],
-        error: BindingContractError,
-    ) -> list[Dict[str, Any]]:
-        instance_id = _repair_instance_id(manifest, error)
-        instance = next(
-            (
-                item for item in manifest.get("instances", [])
-                if isinstance(item, dict) and item.get("instance_id") == instance_id
-            ),
-            {},
-        )
-        safe_manifest = {
-            key: instance.get(key)
-            for key in (
-                "instance_id", "property_schema_id", "template_id",
-                "target", "bindings", "parameters", "base_label",
-            )
-        }
-        return [
-            {
-                "role": "system",
-                "content": (
-                    "Submit one minimal binding patch. Only replace an allowed "
-                    "binding, bounded parameter, or profile-allowed template."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "manifest": safe_manifest,
-                        "validation_error": error.to_dict(),
-                        "catalog": self.stage_context.stage_inputs["property_catalog"],
-                        "protocol_evidence": build_protocol_evidence(self.catalog),
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ]
-
     def _write_render_artifacts(self, result: RenderResult) -> None:
         _write_json(
             self.stage_dir / "render_result.json",
             {
-                "schema_version": "render_result.v1",
+                "schema_version": "render_result",
                 "target_path": _relative(result.target_path, self.workspace.run_dir),
                 "base_label": result.base_label,
                 "sha256_before": result.sha256_before,
@@ -431,7 +285,7 @@ class BindingStage:
                 trace_record["protocol_rule"] = protocol_rule
             trace_records.append(trace_record)
         traceability = {
-            "schema_version": "assertion_traceability.v1",
+            "schema_version": "assertion_traceability",
             "properties": trace_records,
         }
         baseline_path = (
@@ -483,7 +337,7 @@ class BindingStage:
             package_sha256="0" * 64,
         )
         property_package = {
-            "schema_version": "property_package.v2",
+            "schema_version": "property_package",
             "property_profile_id": self.catalog.profile["property_profile_id"],
             "binding_manifest": {
                 "path": "binding_manifest.json",
@@ -526,7 +380,7 @@ class BindingStage:
             "observation_map": build_unmaterialized_observation_map(
                 top_module=top_module,
                 package_sha256="0" * 64,
-                reason="elaboration-time observation mapping is deferred to Iteration 3",
+                reason="elaboration-time observation mapping is not part of binding",
             ),
             "traceability": traceability,
         }
@@ -535,7 +389,7 @@ class BindingStage:
         _write_json(
             self.stage_dir / "assertion_delta.json",
             {
-                "schema_version": "assertion_delta.v2",
+                "schema_version": "assertion_delta",
                 "property_profile_id": self.catalog.profile["property_profile_id"],
                 "instance_ids": [item["instance_id"] for item in manifest["instances"]],
                 "base_labels": [item["base_label"] for item in manifest["instances"]],
@@ -617,15 +471,3 @@ def _write_json(path: Path, value: Dict[str, Any]) -> None:
 
 def _file_sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def _repair_instance_id(
-    manifest: Dict[str, Any], error: BindingContractError
-) -> str:
-    match = re.search(r"\$\.instances\[(\d+)\]", error.field_path)
-    index = int(match.group(1)) if match else 0
-    instances = manifest.get("instances")
-    if not isinstance(instances, list) or index >= len(instances):
-        return ""
-    item = instances[index]
-    return str(item.get("instance_id", "")) if isinstance(item, dict) else ""

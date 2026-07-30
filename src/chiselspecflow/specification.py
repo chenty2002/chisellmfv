@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from .config import PUBLIC_SPEC_PACKAGE_SCHEMA_VERSION
+from .config import PUBLIC_SPEC_PACKAGE_SCHEMA
 
 
 class PublicSpecificationError(ValueError):
@@ -66,7 +66,7 @@ def validate_suite_ledger(ledger_path: Path) -> Dict[str, Any]:
             "suite ledger must freeze SPECIFICATIONS.md and exactly 11 public specs"
         )
     return {
-        "schema_version": "public_spec_suite_ledger.v1",
+        "schema_version": "public_spec_suite_ledger",
         "ledger_path": str(ledger_path.relative_to(repository_root)),
         "ledger_sha256": _file_sha256(ledger_path),
         "entries": entries,
@@ -128,7 +128,7 @@ def load_public_spec_package(spec_path: Path, ledger_path: Path) -> Dict[str, An
         raise PublicSpecificationError("public spec has no normative clauses or properties")
     family = spec_path.parents[1].name
     return {
-        "schema_version": PUBLIC_SPEC_PACKAGE_SCHEMA_VERSION,
+        "schema_version": PUBLIC_SPEC_PACKAGE_SCHEMA,
         "specification_id": specification_id,
         "version": version,
         "family": family,

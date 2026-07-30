@@ -57,42 +57,6 @@ def compatible_candidates(
     )
 
 
-def binding_policy(catalog: PropertyCatalog) -> Dict[str, Dict[str, Any]]:
-    policy: Dict[str, Dict[str, Any]] = {}
-    for template_id, template in sorted(catalog.templates.items()):
-        for role, slot in sorted(template["slots"].items()):
-            ids = [
-                item["candidate_id"]
-                for item in compatible_candidates(catalog, role, slot["type"])
-            ]
-            policy[f"{template_id}:{role}"] = {
-                "template_id": template_id,
-                "slot": role,
-                "mode": "model_select" if len(ids) >= 2 else "deterministic",
-                "candidate_ids": ids,
-            }
-    return policy
-
-
-def fill_singleton_bindings(
-    instance: Dict[str, Any],
-    catalog: PropertyCatalog,
-) -> Dict[str, Any]:
-    """Fill slots with one compatible candidate independently of model output."""
-    updated = dict(instance)
-    bindings = dict(instance.get("bindings") or {})
-    template = catalog.templates.get(str(instance.get("template_id")))
-    if template is None:
-        updated["bindings"] = bindings
-        return updated
-    for role, definition in template["slots"].items():
-        compatible = compatible_candidates(catalog, role, definition["type"])
-        if len(compatible) == 1:
-            bindings[role] = compatible[0]["candidate_id"]
-    updated["bindings"] = bindings
-    return updated
-
-
 def _adapt_index_candidate(
     raw: Dict[str, Any],
     slots: Dict[str, Dict[str, Any]],

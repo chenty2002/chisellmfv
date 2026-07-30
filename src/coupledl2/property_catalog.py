@@ -16,7 +16,7 @@ from .property_review import (
 from .property_ir import (
     PropertyIRError,
     observation_slots,
-    validate_property_schema_v3,
+    validate_property_schema as validate_property_ir,
 )
 
 
@@ -139,7 +139,7 @@ def list_property_profiles() -> List[str]:
 
 
 def load_all_property_schemas() -> Dict[str, Dict[str, Any]]:
-    """Load the complete V3 obligation corpus, including not-yet-profiled assets."""
+    """Load the complete  obligation corpus, including not-yet-profiled assets."""
     schemas: Dict[str, Dict[str, Any]] = {}
     for path in sorted((ASSET_ROOT / "schemas").glob("*.json")):
         payload = _read_json(path)
@@ -165,7 +165,7 @@ def load_all_assertion_templates() -> Dict[str, Dict[str, Any]]:
 
 
 def validate_obligation_corpus() -> Dict[str, Any]:
-    """Validate every V3 obligation against its repository lowering variants."""
+    """Validate every  obligation against its repository lowering variants."""
     schemas = load_all_property_schemas()
     templates = load_all_assertion_templates()
     for schema in schemas.values():
@@ -198,7 +198,7 @@ def validate_obligation_corpus() -> Dict[str, Any]:
             if set(schema["observable_contract"]["ghost_state"]) != set(evidence["states"]):
                 raise PropertyCatalogError("template state evidence does not match schema")
     return {
-        "schema_version": "obligation_corpus_validation.v1",
+        "schema_version": "obligation_corpus_validation",
         "obligation_count": len(schemas),
         "template_count": len(templates),
         "lowering_families": sorted(
@@ -211,7 +211,7 @@ def validate_obligation_corpus() -> Dict[str, Any]:
 def public_catalog(catalog: PropertyCatalog) -> Dict[str, Any]:
     """Return the model-visible catalog without template bodies or expressions."""
     return {
-        "schema_version": "property_catalog_view.v1",
+        "schema_version": "property_catalog_view",
         "property_profile_id": catalog.profile["property_profile_id"],
         "formal_contract_id": catalog.formal_contract_id,
         "schemas": list(catalog.schemas.values()),
@@ -306,7 +306,7 @@ def _exact_fields(value: Dict[str, Any], allowed: set[str], required: set[str], 
 
 def validate_property_schema(value: Dict[str, Any]) -> None:
     try:
-        validate_property_schema_v3(value)
+        validate_property_ir(value)
     except PropertyIRError as exc:
         raise PropertyCatalogError(str(exc)) from exc
 
@@ -327,7 +327,7 @@ def _validate_template(value: Dict[str, Any]) -> None:
         "allowed_profile_ids", "evidence_fragments",
     }
     _exact_fields(value, fields, required, "assertion_template")
-    if value["schema_version"] != "assertion_template.v1":
+    if value["schema_version"] != "assertion_template":
         raise PropertyCatalogError("unsupported assertion template version")
     if "requires_formal_mixin" in value and not isinstance(value["requires_formal_mixin"], bool):
         raise PropertyCatalogError("requires_formal_mixin must be boolean")
@@ -438,7 +438,7 @@ def _validate_profile(value: Dict[str, Any], requested_id: str) -> None:
     }
     required = fields - {"source_targets", "formal_contract_id", "gold_binding_id"}
     _exact_fields(value, fields, required, "property_profile")
-    if value["schema_version"] != "property_profile.v1":
+    if value["schema_version"] != "property_profile":
         raise PropertyCatalogError("unsupported property profile version")
     if value["property_profile_id"] != requested_id:
         raise PropertyCatalogError("property profile id does not match filename")
@@ -599,10 +599,9 @@ def _validate_gold_bindings(
 ) -> None:
     fields = {
         "schema_version", "gold_binding_id", "property_profile_id", "bindings",
-        "selection_trials",
     }
     _exact_fields(value, fields, fields, "gold_binding_list")
-    if value["schema_version"] != "gold_binding_list.v1":
+    if value["schema_version"] != "gold_binding_list":
         raise PropertyCatalogError("unsupported gold binding list version")
     if value["gold_binding_id"] != requested_id:
         raise PropertyCatalogError("gold binding id does not match filename")
@@ -638,32 +637,3 @@ def _validate_gold_bindings(
                 raise PropertyCatalogError("gold binding candidate is incompatible")
         if set(binding["parameters"]) != set(template["parameters"]):
             raise PropertyCatalogError("gold binding parameters do not match template")
-    trials = value["selection_trials"]
-    if not isinstance(trials, list):
-        raise PropertyCatalogError("gold binding selection trials must be a list")
-    for trial in trials:
-        _exact_fields(
-            trial,
-            {
-                "slot", "ranked_candidate_ids", "gold_candidate_id",
-                "review_intervened", "model", "evidence_ref", "reason",
-            },
-            {
-                "slot", "ranked_candidate_ids", "gold_candidate_id",
-                "review_intervened", "model", "evidence_ref", "reason",
-            },
-            "gold_binding_list.selection_trials[]",
-        )
-        ranked = trial["ranked_candidate_ids"]
-        if (
-            not isinstance(ranked, list)
-            or len(ranked) < 2
-            or len(set(ranked)) != len(ranked)
-            or trial["gold_candidate_id"] not in ranked
-            or not isinstance(trial["review_intervened"], bool)
-            or not all(
-                isinstance(trial[field], str) and trial[field]
-                for field in ("model", "evidence_ref", "reason")
-            )
-        ):
-            raise PropertyCatalogError("invalid gold binding selection trial")

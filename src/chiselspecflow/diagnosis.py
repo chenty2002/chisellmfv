@@ -1,76 +1,44 @@
-"""Conditional Stage-3 diagnosis, review, verdict, and revision-round gates."""
+"""Deterministic Stage-3 counterexample projection and source ranking."""
 
 from __future__ import annotations
 
-import hashlib
 import json
-import re
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Protocol
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from src.core.artifact_contract import (
     file_sha256,
     validate_completed_stage,
     write_stage_outcome,
 )
-from src.core.formal_operations import canonical_sha256
 
-from .stages import get_stage_spec
 from .causal_backend import materialize_causal_evidence
-from .causal_loop import (
-    run_causal_evidence_loop,
-    write_not_required_loop_artifacts,
-)
-from .trace_projection import _load_certified_package, project_stage2_evidence
-from .workspace import SpecFlowRound
-
-
-class DiagnosisModel(Protocol):
-    def chat_with_tools(self, **kwargs: Any) -> Dict[str, Any]: ...
+from .stages import get_stage_spec
+from .trace_projection import project_stage2_evidence
 
 
 class DiagnosisError(ValueError):
-    """Raised when Stage 3 cannot preserve its bounded evidence contract."""
-
-
-_REVIEW_FIELDS = {
-    "schema_version",
-    "reviewer",
-    "decision",
-    "reviewed_hashes",
-    "evidence_refs",
-    "reviewed_at",
-    "reason",
-}
-_REVISION_LAYERS = {
-    "obligation_error": "obligation",
-    "binding_error": "binding",
-    "monitor_error": "monitor",
-    "assumption_error": "assumption",
-}
-_WEAK_CAUSAL_EVIDENCE = {"structural_only", "unresolved"}
+    """Raised when exact Stage-2 evidence cannot be consumed."""
 
 
 def run_diagnose(
     run_dir: Path,
-    model: Optional[DiagnosisModel] = None,
     *,
-    track_d: bool = False,
     fst2vcd_argv: Optional[list[str]] = None,
 ) -> Dict[str, Any]:
-    """Run deterministic projection and invoke a model only for conditional cases."""
+    """Project exact CEX evidence and rank source candidates without a model."""
 
     from .runner import _validate_run_integrity, load_existing_workspace
 
     workspace = load_existing_workspace(run_dir)
     manifest = _read_json(workspace.manifest_path)
     _validate_run_integrity(workspace, manifest)
-    round_id = manifest["current_round"]
-    stage2 = workspace.stage_dir(round_id, "compile_verify")
-    stage2_result = validate_completed_stage(stage2, get_stage_spec("compile_verify"))
-    if stage2_result is None:
+    round_id = 1
+    stage2 = workspace.stage_dir("compile_verify")
+    if validate_completed_stage(stage2, get_stage_spec("compile_verify")) is None:
         raise DiagnosisError("compile_verify completion or hashes are invalid")
-    stage3 = workspace.stage_dir(round_id, "diagnose")
+
+    stage3 = workspace.stage_dir("diagnose")
     completed = validate_completed_stage(stage3, get_stage_spec("diagnose"))
     if completed is not None:
         return completed
@@ -83,710 +51,185 @@ def run_diagnose(
         fst2vcd_argv=fst2vcd_argv,
     )
     _write_json(stage3 / "evidence_projection.json", projection)
-    causal_manifest, causal_source, causal_graphs = materialize_causal_evidence(
+    graph_manifest, source_projection, graphs = materialize_causal_evidence(
         workspace,
         round_id,
         projection,
         config=manifest.get("diagnosis"),
     )
-    _write_json(stage3 / "causal_graph_manifest.json", causal_manifest)
-    _write_json(stage3 / "causal_source_projection.json", causal_source)
+    _write_json(stage3 / "causal_graph_manifest.json", graph_manifest)
+    _write_json(stage3 / "causal_source_projection.json", source_projection)
+
     result_map = _read_json(stage2 / "property_result_map.json")
     semantic_evidence = _read_json(stage2 / "semantic_evidence.json")
-
-    if _is_accepted_without_diagnosis(result_map, semantic_evidence):
-        write_not_required_loop_artifacts(
-            stage3,
-            reason="all_primary_proven",
-            graph_manifest=causal_manifest,
-            source_projection=causal_source,
-        )
-        candidate = _not_required("diagnosis_candidate.v2", "all_primary_proven")
-        review_request = _not_required(
-            "diagnosis_review_request.v2", "diagnosis_not_invoked"
-        )
-        review = _not_required("diagnosis_review.v1", "diagnosis_not_invoked")
-        root_cause = _not_required("root_cause_result.v1", "all_primary_proven")
-        ranking = _not_required("source_ranking.v1", "track_d_not_required")
-        revision = _not_required("revision_request.v1", "accepted")
-        verdict = _final_verdict(
-            "accepted",
-            "complete reviewed proof and evidence gates",
-            round_id,
-            stage2,
-            stage3,
-            model_calls=0,
-        )
-        return _complete_diagnosis(
-            workspace,
-            manifest,
-            round_id,
-            candidate,
-            review_request,
-            review,
-            root_cause,
-            ranking,
-            revision,
-            verdict,
-            model_calls=0,
-        )
-
-    if not _requires_model(result_map):
-        write_not_required_loop_artifacts(
-            stage3,
-            reason="tool_or_identity_failure_is_deterministic",
-            graph_manifest=causal_manifest,
-            source_projection=causal_source,
-        )
-        candidate = _not_required(
-            "diagnosis_candidate.v2", "tool_or_identity_failure_is_deterministic"
-        )
-        review_request = _not_required(
-            "diagnosis_review_request.v2", "diagnosis_not_invoked"
-        )
-        review = _not_required("diagnosis_review.v1", "diagnosis_not_invoked")
-        root_cause = {
-            "schema_version": "root_cause_result.v1",
-            "status": "inconclusive",
-            "round_id": round_id,
-            "operation_id": None,
-            "reviewed": False,
-            "causal_graph_ids": [],
-            "ranked_candidates": [],
-            "limitations": ["deterministic formal or identity evidence is incomplete"],
-        }
-        ranking = _not_required("source_ranking.v1", "track_d_not_required")
-        revision = _not_required("revision_request.v1", "no_typed_revision")
-        verdict = _final_verdict(
-            "inconclusive",
-            "Stage 2 did not produce complete proof or exact CEX evidence",
-            round_id,
-            stage2,
-            stage3,
-            model_calls=0,
-        )
-        return _complete_diagnosis(
-            workspace,
-            manifest,
-            round_id,
-            candidate,
-            review_request,
-            review,
-            root_cause,
-            ranking,
-            revision,
-            verdict,
-            model_calls=0,
-        )
-
-    if model is None:
-        raise DiagnosisError("a diagnosis model is required for CEX evidence")
-    package, _package_path = _load_certified_package(stage2)
-    candidate, loop_counts = run_causal_evidence_loop(
-        model,
-        projection=projection,
-        graph_manifest=causal_manifest,
-        source_projection=causal_source,
-        graphs=causal_graphs,
-        reviewed_package=package,
-        frozen_clauses=_frozen_clause_context(workspace, projection),
-        project_root=workspace.project_workspace,
-        stage3=stage3,
-        track_d=track_d,
-    )
-    _write_json(stage3 / "diagnosis_candidate.json", candidate)
-    request = _build_diagnosis_review_request(stage3, candidate, round_id)
-    _write_json(stage3 / "diagnosis_review_request.json", request)
-    _write_json(
-        stage3 / "diagnosis_review.json",
-        _not_required("diagnosis_review.v1", "awaiting_external_review"),
-    )
-    _write_json(
-        stage3 / "root_cause_result.json",
-        {
-            "schema_version": "root_cause_result.v1",
-            "status": "inconclusive",
-            "round_id": round_id,
-            "operation_id": candidate["operation_id"],
-            "reviewed": False,
-            "causal_graph_ids": list(candidate["causal_graph_ids"]),
-            "ranked_candidates": [],
-            "limitations": ["diagnosis candidate is awaiting external review"],
-        },
-    )
-    _write_json(
-        stage3 / "source_ranking.json",
-        _not_required("source_ranking.v1", "awaiting_external_review"),
-    )
-    _write_json(
-        stage3 / "revision_request.json",
-        _not_required("revision_request.v1", "diagnosis_unreviewed"),
-    )
-    interim = _final_verdict(
-        "inconclusive",
-        "diagnosis candidate is not externally reviewed",
-        round_id,
-        stage2,
-        stage3,
-        model_calls=loop_counts["model_calls"],
-        reviewed=False,
-    )
-    _write_json(stage3 / "final_verdict.json", interim)
-    _write_analysis(stage3, projection, candidate, None, interim)
-    outcome = write_stage_outcome(
-        stage3,
-        get_stage_spec("diagnose"),
-        {
-            "success": False,
-            "status": "awaiting_review",
-            "error_kind": "diagnosis_review_required",
-            "round_id": round_id,
-            "model_calls": loop_counts["model_calls"],
-            "evidence_queries": loop_counts["evidence_queries"],
-            "protocol_repairs": loop_counts["protocol_repairs"],
-            "final_verdict": "inconclusive",
-        },
-        source_state=manifest,
-    )
-    _set_round_state(workspace, round_id, "awaiting_diagnosis_review")
-    return outcome
-
-
-def build_diagnosis_review_template(
-    run_dir: Path, reviewer: str = "codex"
-) -> Dict[str, Any]:
-    """Return a rejected-by-default external review template."""
-
-    from .runner import load_existing_workspace
-
-    workspace = load_existing_workspace(run_dir)
-    manifest = _read_json(workspace.manifest_path)
-    stage3 = workspace.stage_dir(manifest["current_round"], "diagnose")
-    request = _read_json(stage3 / "diagnosis_review_request.json")
-    if request.get("schema_version") != "diagnosis_review_request.v2":
-        raise DiagnosisError("diagnosis review request is not V2")
-    return {
-        "schema_version": "diagnosis_review.v1",
-        "reviewer": reviewer,
-        "decision": "rejected",
-        "reviewed_hashes": list(request["reviewed_hashes_required"]),
-        "evidence_refs": [],
-        "reviewed_at": "",
-        "reason": "review the exact projected evidence and diagnosis classification",
-    }
-
-
-def install_diagnosis_review(run_dir: Path, review_record: Path) -> Dict[str, Any]:
-    """Install an external review and reduce the only authoritative verdict."""
-
-    from .runner import _validate_run_integrity, load_existing_workspace
-
-    workspace = load_existing_workspace(run_dir)
-    manifest = _read_json(workspace.manifest_path)
-    _validate_run_integrity(workspace, manifest)
-    round_id = manifest["current_round"]
-    stage2 = workspace.stage_dir(round_id, "compile_verify")
-    if validate_completed_stage(stage2, get_stage_spec("compile_verify")) is None:
-        raise DiagnosisError("compile_verify completion or hashes are invalid")
-    stage3 = workspace.stage_dir(round_id, "diagnose")
-    pending = _read_json(stage3 / "stage_result.json")
-    if pending.get("status") != "awaiting_review":
-        raise DiagnosisError("diagnose is not awaiting external review")
-    request = _read_json(stage3 / "diagnosis_review_request.json")
-    if request.get("schema_version") != "diagnosis_review_request.v2":
-        raise DiagnosisError("diagnosis review request is not V2")
-    record = _read_json(review_record)
-    _validate_diagnosis_review(record, request, stage3)
-    _write_json(stage3 / "diagnosis_review.json", record)
-    candidate = _read_json(stage3 / "diagnosis_candidate.json")
-    projection = _read_json(stage3 / "evidence_projection.json")
-    causal_manifest = _read_json(stage3 / "causal_graph_manifest.json")
-    source_projection = _read_json(stage3 / "causal_source_projection.json")
-    result_map = _read_json(stage2 / "property_result_map.json")
-    approved = record["decision"] == "approved"
-    classification = candidate["classification"] if approved else "inconclusive"
-    if (
-        approved
-        and classification == "design_violation"
-        and result_map.get("formal_outcome") == "cex"
-        and projection.get("status") == "complete"
-        and any(
-            row.get("failure_cycle") is not None and row.get("status") == "complete"
-            for row in projection.get("traces", [])
-        )
-    ):
-        verdict_name = "violated"
-        reason = "exact CEX projection and reviewed design-violation diagnosis"
-    else:
-        verdict_name = "inconclusive"
-        reason = (
-            "diagnosis review rejected the candidate"
-            if not approved
-            else "reviewed evidence does not satisfy the violated verdict gate"
-        )
-    revision = _build_revision_request(
-        candidate,
-        projection,
-        stage2,
-        stage3,
-        round_id,
-        approved=approved,
-    )
-    root_cause = _build_root_cause_result(
-        candidate,
-        causal_manifest,
+    root_cause, ranking = _rank_source_candidates(
+        graph_manifest,
         source_projection,
-        stage3,
-        round_id,
-        approved=approved,
+        graphs,
+        round_id=round_id,
     )
-    ranking = _build_source_ranking(root_cause)
-    verdict = _final_verdict(
-        verdict_name,
-        reason,
-        round_id,
-        stage2,
-        stage3,
-        model_calls=int(pending.get("model_calls", 0)),
-        reviewed=approved,
-        classification=classification,
+    verdict = _reduce_verdict(
+        result_map,
+        semantic_evidence,
+        projection,
+        round_id=round_id,
+        stage2=stage2,
+        stage3=stage3,
     )
     return _complete_diagnosis(
         workspace,
         manifest,
         round_id,
-        candidate,
-        request,
-        record,
+        projection,
         root_cause,
         ranking,
-        revision,
         verdict,
-        model_calls=int(pending.get("model_calls", 0)),
     )
 
 
-def create_revision_round(run_dir: Path) -> Path:
-    """Create the next immutable round from a reviewed typed revision request."""
-
-    from .runner import _validate_run_integrity, load_existing_workspace
-
-    workspace = load_existing_workspace(run_dir)
-    manifest = _read_json(workspace.manifest_path)
-    _validate_run_integrity(workspace, manifest)
-    parent = manifest["current_round"]
-    stage3 = workspace.stage_dir(parent, "diagnose")
-    if validate_completed_stage(stage3, get_stage_spec("diagnose")) is None:
-        raise DiagnosisError("diagnose completion or hashes are invalid")
-    revision_path = stage3 / "revision_request.json"
-    revision = _read_json(revision_path)
-    if (
-        revision.get("schema_version") != "revision_request.v1"
-        or revision.get("status") != "required"
-        or revision.get("parent_round") != parent
-    ):
-        raise DiagnosisError("no reviewed typed revision request is available")
-    before = _tree_hash(workspace.round_dir(parent))
-    child = SpecFlowRound(
-        parent + 1,
-        parent_round=parent,
-        revision_request_sha256=file_sha256(revision_path),
-    )
-    child_path = workspace.create_round(child)
-    if _tree_hash(workspace.round_dir(parent)) != before:
-        raise DiagnosisError("parent round changed while creating revision round")
-    round_manifest = _read_json(child_path / "round.json")
-    round_manifest["state"] = "index_ready"
-    _write_json(child_path / "round.json", round_manifest)
-    updated_manifest = _read_json(workspace.manifest_path)
-    updated_manifest["review_state"] = "not_started"
-    _write_json(workspace.manifest_path, updated_manifest)
-    return child_path
-
-
-def _build_diagnosis_review_request(
-    stage3: Path,
-    candidate: Mapping[str, Any],
-    round_id: int,
-) -> Dict[str, Any]:
-    """Bind every deterministic artifact that can authorize the review."""
-
-    required = [
-        "evidence_projection.json",
-        "causal_graph_manifest.json",
-        "causal_source_projection.json",
-        "causal_query_log.jsonl",
-        "diagnosis_transcript_manifest.json",
-        "diagnosis_candidate.json",
-    ]
-    manifest = _read_json(stage3 / "causal_graph_manifest.json")
-    cited_graphs = set(candidate.get("causal_graph_ids", []))
-    for row in manifest.get("graphs", []):
-        if row.get("graph_id") in cited_graphs:
-            required.append(str(row["path"]))
-    transcript = _read_json(stage3 / "diagnosis_transcript_manifest.json")
-    required.extend(
-        str(row["path"]) for row in transcript.get("query_results", [])
-    )
-    artifacts = []
-    for relative in sorted(set(required)):
-        path = Path(relative)
-        if path.is_absolute() or ".." in path.parts:
-            raise DiagnosisError("diagnosis review artifact path is unsafe")
-        resolved = stage3 / path
-        if not resolved.is_file():
-            raise DiagnosisError(f"diagnosis review artifact is missing: {relative}")
-        artifacts.append({"artifact": path.as_posix(), "sha256": file_sha256(resolved)})
-    return {
-        "schema_version": "diagnosis_review_request.v2",
-        "round_id": round_id,
-        "reviewed_hashes_required": artifacts,
-        "allowed_reviewers": ["codex", "human:<id>"],
-        "candidate_classification": candidate["classification"],
-        "classification_evidence_refs": list(candidate["evidence_refs"]),
-        "root_cause_checks": {
-            "causal_graph_ids": list(candidate["causal_graph_ids"]),
-            "causal_edge_ids": list(candidate["causal_edge_ids"]),
-            "ranked_source_candidate_ids": [
-                row["candidate_id"]
-                for row in candidate.get("ranked_source_candidates", [])
-            ],
-            "reject_weak_evidence_for_localization": sorted(
-                _WEAK_CAUSAL_EVIDENCE
-            ),
-            "require_exact_chisel_projection": True,
-        },
-        "evidence_refs_required": True,
-    }
-
-
-def _validate_diagnosis_review(
-    record: Mapping[str, Any],
-    request: Mapping[str, Any],
-    stage3: Path,
-) -> None:
-    if set(record) != _REVIEW_FIELDS or record.get("schema_version") != "diagnosis_review.v1":
-        raise DiagnosisError("diagnosis review has an invalid exact schema")
-    reviewer = record.get("reviewer")
-    if reviewer != "codex" and not (
-        isinstance(reviewer, str) and re.fullmatch(r"human:[A-Za-z0-9_.@-]+", reviewer)
-    ):
-        raise DiagnosisError("diagnosis reviewer must be codex or human:<id>")
-    if record.get("decision") not in {"approved", "rejected"}:
-        raise DiagnosisError("unknown diagnosis review decision")
-    if not isinstance(record.get("reviewed_at"), str) or not re.fullmatch(
-        r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:T[0-9:.+-]+Z?)?",
-        record["reviewed_at"],
-    ):
-        raise DiagnosisError("diagnosis reviewed_at must be an ISO date or timestamp")
-    if not isinstance(record.get("reason"), str) or not record["reason"].strip():
-        raise DiagnosisError("diagnosis review reason is required")
-    if not isinstance(record.get("evidence_refs"), list) or not record["evidence_refs"]:
-        raise DiagnosisError("diagnosis review evidence refs are required")
-    expected = {
-        row["artifact"]: row["sha256"]
-        for row in request.get("reviewed_hashes_required", [])
-    }
-    actual = {}
-    for row in record.get("reviewed_hashes", []):
-        if not isinstance(row, Mapping) or set(row) != {"artifact", "sha256"}:
-            raise DiagnosisError("diagnosis reviewed hash row is malformed")
-        if row["artifact"] in actual:
-            raise DiagnosisError("duplicate diagnosis reviewed artifact")
-        actual[row["artifact"]] = row["sha256"]
-    if actual != expected:
-        raise DiagnosisError("diagnosis review does not bind exact requested hashes")
-    for artifact, digest in actual.items():
-        relative = Path(artifact)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise DiagnosisError("diagnosis reviewed artifact path is unsafe")
-        if file_sha256(stage3 / relative) != digest:
-            raise DiagnosisError(f"diagnosis reviewed artifact drifted: {artifact}")
-
-
-def _build_root_cause_result(
-    candidate: Mapping[str, Any],
+def _rank_source_candidates(
     graph_manifest: Mapping[str, Any],
     source_projection: Mapping[str, Any],
-    stage3: Path,
-    round_id: int,
+    graphs: Mapping[str, Mapping[str, Any]] | Sequence[Mapping[str, Any]],
     *,
-    approved: bool,
-) -> Dict[str, Any]:
-    """Reduce reviewed exact graph and source evidence without trusting scores."""
+    round_id: int,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Rank exact source projections by deterministic causal-edge evidence."""
 
-    graph_rows = {
-        str(row["graph_id"]): row for row in graph_manifest.get("graphs", [])
+    graph_by_id = (
+        {str(key): value for key, value in graphs.items()}
+        if isinstance(graphs, Mapping)
+        else {str(row["graph_id"]): row for row in graphs}
+    )
+    manifest_graphs = {
+        str(row["graph_id"]): row
+        for row in graph_manifest.get("graphs", [])
+        if isinstance(row, Mapping) and row.get("graph_id")
     }
-    cited_graph_ids = list(candidate.get("causal_graph_ids", []))
-    base = {
-        "schema_version": "root_cause_result.v1",
-        "round_id": round_id,
-        "operation_id": candidate.get("operation_id"),
-        "reviewed": approved,
-        "causal_graph_ids": cited_graph_ids,
-        "ranked_candidates": [],
+    complete_graph_ids = {
+        graph_id
+        for graph_id, row in manifest_graphs.items()
+        if row.get("status") == "complete"
+        and graph_by_id.get(graph_id, {}).get("status") == "complete"
     }
-    if not approved:
-        return {
-            **base,
-            "status": "inconclusive",
-            "limitations": ["diagnosis review was rejected or absent"],
-        }
+    edge_by_id: Dict[str, Mapping[str, Any]] = {}
+    for graph_id in sorted(complete_graph_ids):
+        for edge in graph_by_id[graph_id].get("edges", []):
+            if isinstance(edge, Mapping) and edge.get("edge_id"):
+                edge_by_id[str(edge["edge_id"])] = edge
 
-    graph_edges: Dict[str, Dict[str, Any]] = {}
-    complete_graphs = set()
-    limitations = []
-    for graph_id in cited_graph_ids:
-        row = graph_rows.get(graph_id)
-        if row is None or row.get("status") != "complete":
-            limitations.append(f"causal graph is not complete: {graph_id}")
+    rows = []
+    for source in source_projection.get("source_candidates", []):
+        if (
+            not isinstance(source, Mapping)
+            or source.get("projection_status") != "exact"
+            or not set(source.get("graph_ids", [])) & complete_graph_ids
+        ):
             continue
-        relative = Path(str(row["path"]))
-        if relative.is_absolute() or ".." in relative.parts:
-            limitations.append(f"causal graph path is unsafe: {graph_id}")
-            continue
-        graph_path = stage3 / relative
-        if not graph_path.is_file() or file_sha256(graph_path) != row.get("sha256"):
-            limitations.append(f"causal graph identity drifted: {graph_id}")
-            continue
-        graph = _read_json(graph_path)
-        if graph.get("graph_id") != graph_id or graph.get("status") != "complete":
-            limitations.append(f"causal graph payload is incomplete: {graph_id}")
-            continue
-        complete_graphs.add(graph_id)
-        graph_edges.update(
-            {
-                str(edge["edge_id"]): edge
-                for edge in graph.get("edges", [])
-                if isinstance(edge, Mapping) and edge.get("edge_id")
-            }
+        edge_ids = sorted(
+            edge_id
+            for edge_id in set(source.get("causal_edge_ids", []))
+            if edge_id in edge_by_id
         )
-
-    source_candidates = {
-        str(row["candidate_id"]): row
-        for row in source_projection.get("source_candidates", [])
-        if isinstance(row, Mapping) and row.get("candidate_id")
-    }
-    cited_edges = set(candidate.get("causal_edge_ids", []))
-    localized = []
-    for ranking in candidate.get("ranked_source_candidates", []):
-        source = source_candidates.get(str(ranking["candidate_id"]))
-        if source is None or source.get("projection_status") != "exact":
-            limitations.append(
-                f"source projection is not exact: {ranking['candidate_id']}"
-            )
+        if not edge_ids:
             continue
-        source_graphs = set(source.get("graph_ids", []))
-        if not source_graphs & complete_graphs:
-            limitations.append(
-                f"source candidate has no complete cited graph: {ranking['candidate_id']}"
-            )
-            continue
-        edge_ids = sorted(set(source.get("causal_edge_ids", [])) & cited_edges)
-        strengths = sorted(
-            {
-                str(graph_edges[edge_id].get("evidence_strength"))
-                for edge_id in edge_ids
-                if edge_id in graph_edges
-            }
-        )
-        non_weak = [
-            strength
-            for strength in strengths
-            if strength not in _WEAK_CAUSAL_EVIDENCE
+        scores = [
+            float(edge_by_id[edge_id].get("contribution_score", 0.0) or 0.0)
+            for edge_id in edge_ids
         ]
-        if not edge_ids or not non_weak:
-            limitations.append(
-                f"source candidate has only weak causal evidence: {ranking['candidate_id']}"
-            )
-            continue
-        localized.append(
+        rows.append(
             {
-                "candidate_id": ranking["candidate_id"],
-                "rank_group": ranking["rank_group"],
+                "candidate_id": source["candidate_id"],
                 "projection_status": "exact",
                 "chisel_source_anchor": dict(source["chisel_source_anchor"]),
                 "causal_edge_ids": edge_ids,
-                "evidence_strengths": strengths,
-            }
-        )
-    localized.sort(key=lambda row: (row["rank_group"], row["candidate_id"]))
-    if localized:
-        return {
-            **base,
-            "status": "localized",
-            "ranked_candidates": localized,
-            "limitations": sorted(set(limitations)),
-        }
-    if complete_graphs and cited_edges:
-        has_exact_but_weak = any(
-            source.get("projection_status") == "exact"
-            and set(source.get("causal_edge_ids", [])) & cited_edges
-            for source in source_candidates.values()
-        )
-        if not has_exact_but_weak:
-            return {
-                **base,
-                "status": "rtl_only",
-                "limitations": sorted(
-                    set(limitations)
-                    | {"no exact reviewed Chisel source projection"}
+                "evidence_strengths": sorted(
+                    {
+                        str(edge_by_id[edge_id].get("evidence_strength", "unresolved"))
+                        for edge_id in edge_ids
+                    }
                 ),
+                "score": max(scores),
+                "supporting_edge_count": len(edge_ids),
             }
-    return {
-        **base,
-        "status": "inconclusive",
-        "limitations": sorted(
-            set(limitations) | {"causal evidence is insufficient for localization"}
-        ),
-    }
-
-
-def _complete_diagnosis(
-    workspace: Any,
-    manifest: Mapping[str, Any],
-    round_id: int,
-    candidate: Mapping[str, Any],
-    review_request: Mapping[str, Any],
-    review: Mapping[str, Any],
-    root_cause: Mapping[str, Any],
-    ranking: Mapping[str, Any],
-    revision: Mapping[str, Any],
-    verdict: Mapping[str, Any],
-    *,
-    model_calls: int,
-) -> Dict[str, Any]:
-    stage3 = workspace.stage_dir(round_id, "diagnose")
-    projection = _read_json(stage3 / "evidence_projection.json")
-    _write_json(stage3 / "diagnosis_candidate.json", candidate)
-    _write_json(stage3 / "diagnosis_review_request.json", review_request)
-    _write_json(stage3 / "diagnosis_review.json", review)
-    _write_json(stage3 / "root_cause_result.json", root_cause)
-    _write_json(stage3 / "source_ranking.json", ranking)
-    _write_json(stage3 / "revision_request.json", revision)
-    _write_json(stage3 / "final_verdict.json", verdict)
-    _write_analysis(stage3, projection, candidate, review, verdict)
-    result = write_stage_outcome(
-        stage3,
-        get_stage_spec("diagnose"),
-        {
-            "success": True,
-            "status": "completed",
-            "round_id": round_id,
-            "model_calls": model_calls,
-            "projection_status": projection["status"],
-            "final_verdict": verdict["verdict"],
-            "root_cause_status": root_cause["status"],
-            "revision_status": revision["status"],
-        },
-        source_state=dict(manifest),
+        )
+    rows.sort(
+        key=lambda row: (
+            -row["score"],
+            -row["supporting_edge_count"],
+            row["candidate_id"],
+        )
     )
-    final_result = {
-        "schema_version": "specflow_final_result.v1",
-        "project_id": manifest["project_id"],
-        "configuration_id": manifest["configuration_id"],
+    previous_key = None
+    rank = 0
+    for index, row in enumerate(rows, start=1):
+        key = (row["score"], row["supporting_edge_count"])
+        if key != previous_key:
+            rank = index
+            previous_key = key
+        row["rank"] = rank
+
+    status = (
+        "localized"
+        if rows
+        and graph_manifest.get("status") == "complete"
+        and source_projection.get("status") == "complete"
+        else "inconclusive"
+    )
+    limitations = []
+    if graph_manifest.get("status") != "complete":
+        limitations.append("causal graph is incomplete")
+    if source_projection.get("status") != "complete":
+        limitations.append("source projection is incomplete")
+    if not rows:
+        limitations.append("no exact source candidate has causal-edge support")
+    root_cause = {
+        "schema_version": "root_cause_result",
+        "status": status,
         "round_id": round_id,
-        "verdict": verdict["verdict"],
-        "final_verdict_ref": {
-            "path": str((stage3 / "final_verdict.json").relative_to(workspace.run_dir)),
-            "sha256": file_sha256(stage3 / "final_verdict.json"),
-        },
-        "root_cause_result_ref": {
-            "path": str(
-                (stage3 / "root_cause_result.json").relative_to(workspace.run_dir)
-            ),
-            "sha256": file_sha256(stage3 / "root_cause_result.json"),
-        },
-        "diagnose_stage_result_sha256": file_sha256(stage3 / "stage_result.json"),
+        "reviewed": False,
+        "formal_verdict": "not_established",
+        "causal_graph_ids": sorted(complete_graph_ids),
+        "ranked_candidates": rows,
+        "limitations": limitations,
     }
-    _write_json(workspace.final_result_path, final_result)
-    _set_round_state(workspace, round_id, "completed")
-    return result
+    ranking = {
+        "schema_version": "source_ranking",
+        "status": "candidate_ranking" if rows else "not_available",
+        "ordering": rows,
+        "tie_rule": "score_then_supporting_edge_count_then_candidate_id",
+    }
+    return root_cause, ranking
 
 
-def _build_revision_request(
-    candidate: Mapping[str, Any],
+def _reduce_verdict(
+    result_map: Mapping[str, Any],
+    semantic: Mapping[str, Any],
     projection: Mapping[str, Any],
-    stage2: Path,
-    stage3: Path,
-    round_id: int,
     *,
-    approved: bool,
-) -> Dict[str, Any]:
-    classification = candidate.get("classification")
-    layer = _REVISION_LAYERS.get(classification) if approved else None
-    if layer is None:
-        return _not_required("revision_request.v1", "no_reviewed_asset_error")
-    package_ref = _read_json(stage2 / "verification_package_ref.json")
-    return {
-        "schema_version": "revision_request.v1",
-        "status": "required",
-        "revision_layer": layer,
-        "old_asset_sha256": package_ref["sha256"],
-        "evidence_refs": list(candidate["evidence_refs"]),
-        "allowed_change_scope": [
-            f"round_local:{layer}",
-            "round_local:dependent_monitor_ir",
-        ],
-        "parent_round": round_id,
-        "forbidden_change_scope": [
-            "design_source",
-            "repository_property_assets",
-            "prior_round",
-        ],
-        "evidence_projection_sha256": canonical_sha256(projection),
-        "causal_evidence": {
-            "causal_graph_manifest_sha256": file_sha256(
-                stage3 / "causal_graph_manifest.json"
-            ),
-            "causal_source_projection_sha256": file_sha256(
-                stage3 / "causal_source_projection.json"
-            ),
-            "diagnosis_candidate_sha256": file_sha256(
-                stage3 / "diagnosis_candidate.json"
-            ),
-        },
-    }
-
-
-def _build_source_ranking(
-    root_cause: Mapping[str, Any],
-) -> Dict[str, Any]:
-    rows = root_cause.get("ranked_candidates", [])
-    if root_cause.get("status") != "localized" or not rows:
-        return _not_required("source_ranking.v1", "track_d_not_reviewed_or_disabled")
-    normalized = [dict(row) for row in rows]
-    for row in normalized:
-        row["tie_rule"] = "shared_rank_group_then_candidate_id"
-    normalized.sort(key=lambda row: (row["rank_group"], row["candidate_id"]))
-    return {
-        "schema_version": "source_ranking.v1",
-        "status": "reviewed",
-        "ordering": normalized,
-        "tie_rule": "shared_rank_group_then_candidate_id",
-    }
-
-
-def _final_verdict(
-    verdict: str,
-    reason: str,
     round_id: int,
     stage2: Path,
     stage3: Path,
-    *,
-    model_calls: int,
-    reviewed: bool = True,
-    classification: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if _is_accepted(result_map, semantic):
+        verdict = "accepted"
+        reason = "all primary operations are proven with complete semantic evidence"
+    elif (
+        result_map.get("execution_status") == "completed"
+        and result_map.get("formal_outcome") == "cex"
+        and projection.get("status") == "complete"
+    ):
+        verdict = "violated"
+        reason = "formal verification produced an exact counterexample"
+    else:
+        verdict = "inconclusive"
+        reason = "formal or projection evidence is incomplete"
     return {
-        "schema_version": "final_verdict.v1",
+        "schema_version": "final_verdict",
         "verdict": verdict,
         "reason": reason,
         "round_id": round_id,
-        "reviewed_diagnosis": reviewed,
-        "diagnosis_classification": classification,
-        "model_calls": model_calls,
+        "model_calls": 0,
         "evidence_refs": {
             "compile_verify_stage_result_sha256": file_sha256(
                 stage2 / "stage_result.json"
@@ -798,67 +241,91 @@ def _final_verdict(
     }
 
 
+def _complete_diagnosis(
+    workspace: Any,
+    manifest: Mapping[str, Any],
+    round_id: int,
+    projection: Mapping[str, Any],
+    root_cause: Mapping[str, Any],
+    ranking: Mapping[str, Any],
+    verdict: Mapping[str, Any],
+) -> Dict[str, Any]:
+    stage3 = workspace.stage_dir("diagnose")
+    _write_json(stage3 / "root_cause_result.json", root_cause)
+    _write_json(stage3 / "source_ranking.json", ranking)
+    _write_json(stage3 / "final_verdict.json", verdict)
+    _write_analysis(stage3, projection, root_cause, verdict)
+    result = write_stage_outcome(
+        stage3,
+        get_stage_spec("diagnose"),
+        {
+            "success": True,
+            "status": "completed",
+            "round_id": round_id,
+            "model_calls": 0,
+            "projection_status": projection.get("status"),
+            "final_verdict": verdict["verdict"],
+            "root_cause_status": root_cause["status"],
+        },
+        source_state=dict(manifest),
+    )
+    _write_json(
+        workspace.final_result_path,
+        {
+            "schema_version": "specflow_final_result",
+            "project_id": manifest["project_id"],
+            "configuration_id": manifest["configuration_id"],
+            "round_id": round_id,
+            "verdict": verdict["verdict"],
+            "final_verdict_ref": {
+                "path": str(
+                    (stage3 / "final_verdict.json").relative_to(workspace.run_dir)
+                ),
+                "sha256": file_sha256(stage3 / "final_verdict.json"),
+            },
+            "root_cause_result_ref": {
+                "path": str(
+                    (stage3 / "root_cause_result.json").relative_to(workspace.run_dir)
+                ),
+                "sha256": file_sha256(stage3 / "root_cause_result.json"),
+            },
+            "diagnose_stage_result_sha256": file_sha256(
+                stage3 / "stage_result.json"
+            ),
+        },
+    )
+    _set_run_completed(workspace)
+    return result
+
+
 def _write_analysis(
     stage3: Path,
     projection: Mapping[str, Any],
-    candidate: Mapping[str, Any],
-    review: Optional[Mapping[str, Any]],
+    root_cause: Mapping[str, Any],
     verdict: Mapping[str, Any],
 ) -> None:
-    root_cause = (
-        _read_json(stage3 / "root_cause_result.json")
-        if (stage3 / "root_cause_result.json").is_file()
-        else {"status": "inconclusive", "ranked_candidates": [], "limitations": []}
-    )
     lines = [
         "# SpecFlow Counterexample Analysis",
         "",
         f"- Projection status: `{projection.get('status')}`",
-        f"- Diagnosis status: `{candidate.get('status', 'candidate')}`",
-        f"- Classification: `{candidate.get('classification', 'not_required')}`",
-        f"- Review decision: `{(review or {}).get('decision', 'not_required')}`",
         f"- Final verdict: `{verdict.get('verdict')}`",
         f"- Root-cause status: `{root_cause.get('status')}`",
+        f"- Model calls: `0`",
     ]
-    strengths = sorted(
-        {
-            strength
-            for row in root_cause.get("ranked_candidates", [])
-            for strength in row.get("evidence_strengths", [])
-        }
-    )
-    if strengths:
-        lines.append(f"- Reviewed causal evidence strengths: `{', '.join(strengths)}`")
+    for row in root_cause.get("ranked_candidates", []):
+        anchor = row["chisel_source_anchor"]
+        lines.append(
+            f"- Rank {row['rank']}: `{anchor['path']}:{anchor['line_start']}` "
+            f"(score={row['score']:.3f}, edges={row['supporting_edge_count']})"
+        )
     for limitation in root_cause.get("limitations", []):
         lines.append(f"- Limitation: {limitation}")
-    for trace in projection.get("traces", []):
-        lines.extend(
-            [
-                "",
-                f"## Operation `{trace.get('operation_id')}`",
-                "",
-                f"- Spec clause: `{trace.get('spec_clause', {}).get('locator')}`",
-                f"- Failure cycle: `{trace.get('failure_cycle')}`",
-                f"- Failure time: `{trace.get('failure_time')}`",
-            ]
-        )
-        for obj in trace.get("source_objects", []):
-            anchor = obj["source_anchor"]
-            lines.append(
-                f"- Object `{obj['name']}` (`{obj['object_id']}`): "
-                f"`{anchor['path']}:{anchor['line_start']}`"
-            )
-        for state in trace.get("monitor_states", []):
-            lines.append(
-                f"- Monitor state `{state['state_id']}` at failure: "
-                f"`{state['failure_value']}`"
-            )
     (stage3 / "counterexample_analysis.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )
 
 
-def _is_accepted_without_diagnosis(
+def _is_accepted(
     result_map: Mapping[str, Any], semantic: Mapping[str, Any]
 ) -> bool:
     return (
@@ -872,112 +339,25 @@ def _is_accepted_without_diagnosis(
     )
 
 
-def _requires_model(result_map: Mapping[str, Any]) -> bool:
-    return (
-        result_map.get("execution_status") == "completed"
-        and result_map.get("formal_outcome") == "cex"
-        and any(
-            row.get("status") == "cex"
-            and row.get("observed_property_id")
-            and row.get("trace_path")
-            for row in result_map.get("operation_results", [])
-        )
-    )
-
-
-def _frozen_clause_context(
-    workspace: Any, projection: Mapping[str, Any]
-) -> list[Dict[str, str]]:
-    """Recover only the hash-bound clause slices referenced by CEX evidence."""
-
-    clauses = {
-        str(trace["spec_clause"]["locator"]): str(
-            trace["spec_clause"]["text_sha256"]
-        )
-        for trace in projection.get("traces", [])
-        if isinstance(trace.get("spec_clause"), Mapping)
-        and trace["spec_clause"].get("locator")
-        and trace["spec_clause"].get("text_sha256")
-    }
-    lines = (workspace.inputs_dir / "specification.md").read_text(
-        encoding="utf-8"
-    ).splitlines()
-    rows = []
-    for locator, expected_sha256 in sorted(clauses.items()):
-        matches = [
-            index
-            for index, line in enumerate(lines)
-            if re.search(rf"\b{re.escape(locator)}\b", line)
-        ]
-        if not matches:
-            raise DiagnosisError(f"frozen spec clause is missing: {locator}")
-        index = matches[0]
-        parts = [lines[index].strip()]
-        index += 1
-        while (
-            index < len(lines)
-            and lines[index].strip()
-            and not lines[index].lstrip().startswith(("- **", "| `"))
-        ):
-            parts.append(lines[index].strip())
-            index += 1
-        text = " ".join(parts)
-        actual = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        if actual != expected_sha256:
-            raise DiagnosisError(f"frozen spec clause hash drifted: {locator}")
-        rows.append(
-            {
-                "locator": locator,
-                "text": text,
-                "text_sha256": actual,
-            }
-        )
-    return rows
-
-
-def _not_required(schema_version: str, reason: str) -> Dict[str, Any]:
-    return {"schema_version": schema_version, "status": "not_required", "reason": reason}
-
-
-def _set_round_state(workspace: Any, round_id: int, state: str) -> None:
-    path = workspace.round_dir(round_id) / "round.json"
-    value = _read_json(path)
-    value["state"] = state
-    _write_json(path, value)
-
-
-def _tree_hash(root: Path) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(item for item in Path(root).rglob("*") if item.is_file()):
-        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(bytes.fromhex(file_sha256(path)))
-    return digest.hexdigest()
+def _set_run_completed(workspace: Any) -> None:
+    manifest = _read_json(workspace.manifest_path)
+    manifest["review_state"] = "completed"
+    _write_json(workspace.manifest_path, manifest)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise DiagnosisError(f"cannot read JSON object: {path}") from exc
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DiagnosisError(f"invalid JSON artifact: {path}") from exc
     if not isinstance(value, dict):
-        raise DiagnosisError(f"JSON object required: {path}")
+        raise DiagnosisError(f"JSON artifact must be an object: {path}")
     return value
 
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    temporary.replace(path)
-
-
-def _write_jsonl(path: Path, rows: list[Mapping[str, Any]]) -> None:
-    if path.exists():
-        raise DiagnosisError(f"model call log already exists: {path}")
     path.write_text(
-        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        json.dumps(dict(value), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )

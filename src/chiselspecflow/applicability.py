@@ -81,7 +81,7 @@ def classify_package_applicability(
         else "re_instantiated"
     )
     return {
-        "schema_version": "package_applicability.v1",
+        "schema_version": "package_applicability",
         "package_id": package.get("package_id"),
         "project_id": package.get("project_id"),
         "source_configuration_id": source_configuration_id,

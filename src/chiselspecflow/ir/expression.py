@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional
 
-from ..config import EXPRESSION_SCHEMA_VERSION
+from ..config import EXPRESSION_SCHEMA
 
 
 class ExpressionValidationError(ValueError):
@@ -72,7 +72,7 @@ def validate_expression(
     state_types = state_types or {}
     normalized, _ = _validate_node(expression, object_types, state_types, "expression")
     return {
-        "schema_version": EXPRESSION_SCHEMA_VERSION,
+        "schema_version": EXPRESSION_SCHEMA,
         "root": normalized,
     }
 
@@ -88,7 +88,7 @@ def infer_expression_type(
 
 
 def normalized_root(expression: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return the root from either a bare node or expression_ir.v1 wrapper."""
+    """Return the root from either a bare node or expression_ir wrapper."""
 
     return _unwrap(expression)
 
@@ -245,7 +245,7 @@ def _validate_node(
 def _unwrap(expression: Mapping[str, Any]) -> Mapping[str, Any]:
     if not isinstance(expression, Mapping):
         raise ExpressionValidationError("malformed_expression", "expression must be an object")
-    if expression.get("schema_version") == EXPRESSION_SCHEMA_VERSION:
+    if expression.get("schema_version") == EXPRESSION_SCHEMA:
         if set(expression) != {"schema_version", "root"}:
             raise ExpressionValidationError("unexpected_field", "expression wrapper has extra fields")
         return expression["root"]

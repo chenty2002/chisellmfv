@@ -96,7 +96,7 @@ def write_stage_outcome(
     stage_dir = Path(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
     normalized = dict(stage_result)
-    normalized.setdefault("schema_version", "stage_result.v2")
+    normalized.setdefault("schema_version", "stage_result")
     normalized["stage"] = spec.name
     success = normalized.get("success") is True
     artifact_records = validate_stage_artifacts(stage_dir, spec) if success else {}
@@ -105,7 +105,7 @@ def write_stage_outcome(
     _write_json(stage_dir / "stage_result.json", normalized)
 
     handoff: Dict[str, Any] = {
-        "schema_version": "stage_handoff.v2",
+        "schema_version": "stage_handoff",
         "stage": spec.name,
         "success": success,
         "stage_result": {
@@ -142,7 +142,7 @@ def validate_completed_stage(
         if (
             result.get("stage") != spec.name
             or result.get("success") is not True
-            or handoff.get("schema_version") != "stage_handoff.v2"
+            or handoff.get("schema_version") != "stage_handoff"
             or handoff.get("stage") != spec.name
             or handoff.get("success") is not True
             or handoff.get("stage_result", {}).get("sha256")

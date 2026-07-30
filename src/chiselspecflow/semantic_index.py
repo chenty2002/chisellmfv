@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-from .config import SEMANTIC_INDEX_SCHEMA_VERSION, GeneratorConfiguration, ProjectContract
+from .config import SEMANTIC_INDEX_SCHEMA, GeneratorConfiguration, ProjectContract
 
 
 class SemanticIndexError(ValueError):
@@ -23,9 +23,9 @@ def merge_semantic_index(
     output_path: Optional[Path] = None,
     hierarchical_observers: Sequence[Mapping[str, Any]] = (),
 ) -> Dict[str, Any]:
-    if source_index.get("schema_version") != "scala_source_index.v1":
+    if source_index.get("schema_version") != "scala_source_index":
         raise SemanticIndexError("unsupported source index")
-    if baseline.get("schema_version") != "baseline_elaboration.v1":
+    if baseline.get("schema_version") != "baseline_elaboration":
         raise SemanticIndexError("unsupported baseline elaboration index")
     if baseline.get("configuration_id") != configuration.configuration_id:
         raise SemanticIndexError("baseline configuration identity mismatch")
@@ -147,7 +147,7 @@ def merge_semantic_index(
         )
         rows.append(row)
     value = {
-        "schema_version": SEMANTIC_INDEX_SCHEMA_VERSION,
+        "schema_version": SEMANTIC_INDEX_SCHEMA,
         "project_id": project.project_id,
         "configuration_id": configuration.configuration_id,
         "top": top,

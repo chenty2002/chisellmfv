@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping
 
 
-SCHEMA_VERSION = "specflow_capability_assessment.v1"
+SCHEMA_VERSION = "specflow_capability_assessment"
 _FIELDS = {
     "schema_version",
     "project_id",

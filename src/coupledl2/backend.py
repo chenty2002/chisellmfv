@@ -278,7 +278,7 @@ class CoupledL2BuildOperations:
             "".join(
                 json.dumps(
                     {
-                        "schema_version": "proof_event.v1",
+                        "schema_version": "proof_event",
                         "event": "property_finalized",
                         "sequence": index,
                         **item,
@@ -468,7 +468,7 @@ class CoupledL2BuildOperations:
             self._write_json(stage_dir / "verilog_files.json", result)
             return result
         delta = self._load_json(delta_path)
-        if delta.get("schema_version") != "assertion_delta.v2":
+        if delta.get("schema_version") != "assertion_delta":
             result = {
                 "success": False,
                 "error": "unsupported assertion delta schema",
@@ -671,7 +671,7 @@ class CoupledL2BuildOperations:
             operation = _account_streamed_operation(match, segment)
             streamed.append(operation)
             event = {
-                "schema_version": "proof_event.v1",
+                "schema_version": "proof_event",
                 "event": "property_completed",
                 "sequence": len(streamed) - 1,
                 **operation,
@@ -718,7 +718,7 @@ class CoupledL2BuildOperations:
         }
         for index, operation in enumerate(parsed["operation_results"]):
             event = {
-                "schema_version": "proof_event.v1",
+                "schema_version": "proof_event",
                 "event": "property_finalized",
                 "sequence": index,
                 **operation,
@@ -1319,7 +1319,7 @@ def join_property_results(
     property_package_sha256: str,
     assertion_delta_sha256: str,
 ) -> Dict[str, Any]:
-    """Join the exact operation ledger into the V4 result contract."""
+    """Join the exact operation ledger into the  result contract."""
     operation_results = jaspergold_report.get("operation_results")
     auxiliary = jaspergold_report.get("auxiliary_results")
     if not isinstance(operation_results, list):

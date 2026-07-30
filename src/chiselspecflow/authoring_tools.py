@@ -48,7 +48,7 @@ def obligation_tools(clause_ids: Iterable[str], object_ids: Iterable[str], confi
             "configuration_domain": {"type": "array", "minItems": 1, "maxItems": 1, "items": {"type": "string", "const": configuration_id}},
             "support_status": _enum(("candidate", "unsupported", "ambiguous")),
             "authoring_provenance": _strict_object(
-                {"kind": _enum(("model_call", "reused_asset", "revision")), "ref": _string()}
+                {"kind": _enum(("model_call", "reused_asset")), "ref": _string()}
             ),
         }
     )

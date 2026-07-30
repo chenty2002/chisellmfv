@@ -1,4 +1,4 @@
-"""Frozen SpecFlow-side contracts for V6 deterministic causal evidence."""
+"""SpecFlow-side contracts for deterministic causal evidence."""
 
 from __future__ import annotations
 
@@ -10,12 +10,10 @@ from typing import Any, Dict, Mapping
 from src.core.formal_operations import canonical_sha256
 
 
-CAUSAL_GRAPH_MANIFEST_SCHEMA = "causal_graph_manifest.v1"
-CAUSAL_GRAPH_V2_SCHEMA = "verilog_causal_graph.v2"
-CAUSAL_GRAPH_V3_SCHEMA = "verilog_causal_semantic_graph.v1"
-CAUSAL_SOURCE_PROJECTION_SCHEMA = "causal_source_projection.v1"
-DIAGNOSIS_CANDIDATE_SCHEMA = "diagnosis_candidate.v2"
-DIAGNOSIS_TRANSCRIPT_SCHEMA = "diagnosis_transcript_manifest.v1"
+CAUSAL_GRAPH_MANIFEST_SCHEMA = "causal_graph_manifest"
+STRUCTURAL_GRAPH_SCHEMA = "verilog_causal_graph"
+CAUSAL_GRAPH_SCHEMA = "verilog_causal_semantic_graph"
+CAUSAL_SOURCE_PROJECTION_SCHEMA = "causal_source_projection"
 
 CAUSAL_POLICIES = frozenset(
     {
@@ -36,15 +34,12 @@ EDGE_PROJECTION_STATUSES = frozenset(
 )
 
 DEFAULT_CAUSAL_CONFIG = {
-    "causal_backend": "verilog_causal_analysis.v2",
+    "causal_backend": "verilog_causal_analysis",
     "causal_policy": "best_effort",
     "clock_domain": "formal_primary",
     "max_depth": 12,
     "max_nodes": 120,
     "random_seed": 0,
-    "max_model_calls": 3,
-    "max_evidence_queries": 2,
-    "max_source_context_lines": 5,
 }
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -52,14 +47,14 @@ _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 
 
 class CausalContractError(ValueError):
-    """Raised when a SpecFlow V6 causal artifact is not exact."""
+    """Raised when a SpecFlow causal artifact is not exact."""
 
 
 def causal_graph_schema(value: Mapping[str, Any]) -> str:
     """Return one explicitly supported graph schema without field inference."""
 
     schema = value.get("schema_version")
-    if schema not in {CAUSAL_GRAPH_V2_SCHEMA, CAUSAL_GRAPH_V3_SCHEMA}:
+    if schema not in {STRUCTURAL_GRAPH_SCHEMA, CAUSAL_GRAPH_SCHEMA}:
         raise CausalContractError("unsupported causal graph schema")
     return str(schema)
 
@@ -70,7 +65,7 @@ def causal_graph_stable_ids(
     """Extract the materialized stable node/edge domain for one graph."""
 
     schema = causal_graph_schema(value)
-    if schema == CAUSAL_GRAPH_V2_SCHEMA:
+    if schema == STRUCTURAL_GRAPH_SCHEMA:
         rows = value.get("nodes", [])
         if not isinstance(rows, list):
             raise CausalContractError("causal graph identity rows are invalid")
@@ -81,7 +76,7 @@ def causal_graph_stable_ids(
         if not isinstance(signal_rows, list) or not isinstance(
             semantic_rows, list
         ):
-            raise CausalContractError("V3 causal graph node rows are invalid")
+            raise CausalContractError("semantic causal graph node rows are invalid")
         node_rows = [
             *((row, "node_id") for row in signal_rows),
             *((row, "semantic_id") for row in semantic_rows),
@@ -98,12 +93,12 @@ def causal_graph_stable_ids(
             or not isinstance(row.get(identity_field), str)
             or not row[identity_field]
             or (
-                schema == CAUSAL_GRAPH_V3_SCHEMA
+                schema == CAUSAL_GRAPH_SCHEMA
                 and identity_field == "node_id"
                 and "semantic_id" in row
             )
             or (
-                schema == CAUSAL_GRAPH_V3_SCHEMA
+                schema == CAUSAL_GRAPH_SCHEMA
                 and identity_field == "semantic_id"
                 and "node_id" in row
             )
@@ -118,7 +113,7 @@ def causal_graph_stable_ids(
         if identity_field == "semantic_id":
             semantic_ids.add(identity)
 
-    if schema == CAUSAL_GRAPH_V3_SCHEMA:
+    if schema == CAUSAL_GRAPH_SCHEMA:
         for row in value.get("root_candidates", []):
             path = row.get("semantic_path") if isinstance(row, Mapping) else None
             if (
@@ -128,7 +123,7 @@ def causal_graph_stable_ids(
                 or any(item not in semantic_ids for item in path)
             ):
                 raise CausalContractError(
-                    "V3 root candidate references an unknown semantic ID"
+                    "root candidate references an unknown semantic ID"
                 )
 
     edge_ids: set[str] = set()
@@ -167,33 +162,25 @@ def effective_causal_config(
     config = dict(DEFAULT_CAUSAL_CONFIG if value is None else value)
     if set(config) != set(DEFAULT_CAUSAL_CONFIG):
         raise CausalContractError("diagnosis causal config has invalid exact fields")
-    if config["causal_backend"] not in {
-        "verilog_causal_analysis.v2",
-        "verilog_causal_analysis.v3",
-    }:
+    if config["causal_backend"] != "verilog_causal_analysis":
         raise CausalContractError("unsupported causal backend")
     if config["causal_policy"] not in CAUSAL_POLICIES:
         raise CausalContractError("unsupported causal policy")
     if config["clock_domain"] != "formal_primary":
         raise CausalContractError("only the primary formal clock is supported")
-    for field in ("max_depth", "max_nodes", "max_model_calls", "max_source_context_lines"):
+    for field in ("max_depth", "max_nodes"):
         if (
             isinstance(config[field], bool)
             or not isinstance(config[field], int)
             or config[field] < 1
         ):
             raise CausalContractError(f"{field} must be a positive integer")
-    for field in ("random_seed", "max_evidence_queries"):
-        if (
-            isinstance(config[field], bool)
-            or not isinstance(config[field], int)
-            or config[field] < 0
-        ):
-            raise CausalContractError(f"{field} must be a non-negative integer")
-    if config["max_model_calls"] != 3 or config["max_evidence_queries"] != 2:
-        raise CausalContractError("V6 Iteration 3 budget is frozen at 3 calls/2 queries")
-    if config["max_source_context_lines"] != 5:
-        raise CausalContractError("source context is frozen at five lines")
+    if (
+        isinstance(config["random_seed"], bool)
+        or not isinstance(config["random_seed"], int)
+        or config["random_seed"] < 0
+    ):
+        raise CausalContractError("random_seed must be a non-negative integer")
     return config
 
 

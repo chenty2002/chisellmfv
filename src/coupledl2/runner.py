@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Type
+from typing import Any, Dict, Optional
 
 from .backend import CoupledL2BuildOperations
 from .binding_stage import BindingStage
-from .repair_proposal_stage import RepairProposalStage
 from .indexer import compute_index_hashes, compute_workspace_hash, refresh_indexes
 from .preflight import CoupledL2Preflight
 from .stages import COUPLEDL2_STAGES, get_stage_spec
@@ -24,7 +23,6 @@ from .result_contract import (
     validate_operation_plan,
     validate_property_result_map,
 )
-from .revision import design_bug_is_eligible
 from ..core.records import (
     build_run_cost_summary,
     merge_run_cost_summaries,
@@ -41,23 +39,11 @@ class CoupledL2Runner:
         workspace: CoupledL2Workspace,
         logger: Any,
         llm_client: Optional[Any],
-        workflow_cls: Optional[Type[Any]] = None,
-        query_for_stage: Optional[Callable[[str, str], str]] = None,
-        max_repair_rounds: int = 3,
         resumed: bool = False,
     ):
-        if workflow_cls is None:
-            from ..core.workflow import FormalWorkflow
-
-            workflow_cls = FormalWorkflow
         self.workspace = workspace
         self.logger = logger
         self.llm_client = llm_client
-        self.workflow_cls = workflow_cls
-        self.query_for_stage = query_for_stage or (
-            lambda stage, case: f"Complete CoupledL2 stage {stage} for {case}."
-        )
-        self.max_repair_rounds = max(0, int(max_repair_rounds))
         self.resumed = resumed
         self.last_verification_result: Optional[Dict[str, Any]] = None
         cost_path = workspace.results_dir / "run_cost_summary.json"
@@ -66,18 +52,6 @@ class CoupledL2Runner:
             if resumed and cost_path.is_file()
             else None
         )
-        self.compaction_offsets = {
-            path: len(path.read_text(encoding="utf-8").splitlines())
-            for path in (workspace.results_dir / "by_stage").glob(
-                "*/context_compactions.jsonl"
-            )
-        }
-        self.operation_offsets = {
-            path: len(path.read_text(encoding="utf-8").splitlines())
-            for path in (workspace.results_dir / "by_stage").glob(
-                "*/operations.jsonl"
-            )
-        }
 
     def preflight(self) -> Dict[str, Any]:
         result = CoupledL2Preflight(
@@ -101,7 +75,7 @@ class CoupledL2Runner:
                 stage_dir,
                 spec,
                 {
-                    "schema_version": "stage_result.v2",
+                    "schema_version": "stage_result",
                     "stage": spec.name,
                     "success": False,
                     "termination_reason": "deterministic_verification_failed",
@@ -127,11 +101,11 @@ class CoupledL2Runner:
                 stage_dir,
                 spec,
                 {
-                    "schema_version": "stage_result.v2",
+                    "schema_version": "stage_result",
                     "stage": spec.name,
                     "success": False,
                     "termination_reason": "deterministic_verification_failed",
-                    "error_kind": "invalid_v4_result_contract",
+                    "error_kind": "invalid_result_contract",
                     "summary": str(exc),
                     "model_calls": 0,
                 },
@@ -159,7 +133,7 @@ class CoupledL2Runner:
             (stage_dir / "proof_events.jsonl").write_text(
                 "".join(
                     json.dumps(
-                        {"schema_version": "proof_event.v1", "event": "property_finalized", "sequence": index, **item},
+                        {"schema_version": "proof_event", "event": "property_finalized", "sequence": index, **item},
                         ensure_ascii=False,
                         sort_keys=True,
                     )
@@ -179,7 +153,7 @@ class CoupledL2Runner:
             stage_dir,
             spec,
             {
-                "schema_version": "stage_result.v2",
+                "schema_version": "stage_result",
                 "stage": spec.name,
                 "success": True,
                 "termination_reason": "deterministic_verification_completed",
@@ -230,11 +204,7 @@ class CoupledL2Runner:
         for current_stage in stages:
             self._validate_predecessor(current_stage)
             execution_kind = get_stage_spec(current_stage).execution_kind
-            v2c_block = self._v2c_readiness_block(current_stage)
-            if v2c_block is not None:
-                result = {"success": False, "stage_result": v2c_block}
-                self._write_stage_failure(current_stage, v2c_block)
-            elif execution_kind == "binding":
+            if execution_kind == "binding":
                 stage_context = initialize_stage_context(
                     self.workspace, current_stage
                 )
@@ -248,42 +218,8 @@ class CoupledL2Runner:
             elif execution_kind == "deterministic":
                 initialize_stage_context(self.workspace, current_stage)
                 result = self._run_deterministic_verification()
-            elif execution_kind == "repair_proposal":
-                stage_context = initialize_stage_context(
-                    self.workspace, current_stage
-                )
-                result = RepairProposalStage(
-                    self.workspace,
-                    self.llm_client,
-                    self.logger,
-                    stage_context,
-                ).run()
             else:
-                if current_stage == "waveform_explanation":
-                    self._materialize_trace_evidence()
-                waveform_path = self._counterexample_path() if current_stage == "waveform_explanation" else None
-                workflow = self.workflow_cls(
-                    llm_client=self.llm_client,
-                    chisel_dir=".",
-                    workspace_dir=str(self.workspace.run_dir),
-                    logger=self.logger,
-                    waveform_path=waveform_path,
-                    stage=current_stage,
-                    target=self.workspace.config.case_name,
-                    max_repair_rounds=self.max_repair_rounds,
-                    initial_verification_result=self.last_verification_result,
-                    run_context=self.workspace,
-                )
-                result = workflow.process_task(
-                    self.query_for_stage(current_stage, self.workspace.config.case_name)
-                )
-                detail = dict(result.get("stage_result") or {})
-                detail.setdefault("stage", current_stage)
-                result["stage_result"] = write_stage_outcome(
-                    self._handoff_path(current_stage).parent,
-                    get_stage_spec(current_stage),
-                    detail,
-                )
+                raise ValueError(f"unsupported execution kind: {execution_kind}")
             completed_stage = current_stage
             detail = dict(result.get("stage_result") or {})
             detail.setdefault("stage", current_stage)
@@ -307,14 +243,9 @@ class CoupledL2Runner:
                     for item in detail.get("cex_work_items", [])
                 ):
                     break
-            if current_stage == "waveform_explanation":
-                diagnoses = self._read_diagnoses()
-                if not self._diagnoses_allow_bugfix(diagnoses):
-                    self._write_revision_request(diagnoses)
-                    break
 
         summary = {
-            "schema_version": "coupledl2_run_result.v1",
+            "schema_version": "coupledl2_run_result",
             "run_dir": str(self.workspace.run_dir),
             "success": success,
             "completed_stage": completed_stage,
@@ -377,203 +308,6 @@ class CoupledL2Runner:
         )
         if completed is None:
             raise ValueError(f"{stage} requires a successful {predecessor} handoff")
-        if stage == "waveform_explanation":
-            verification = completed
-            if verification.get("formal_outcome") == "all_proven":
-                raise ValueError("waveform_explanation cannot run after all properties were proven")
-            if verification.get("formal_outcome") != "cex":
-                raise ValueError("waveform_explanation requires a formal counterexample")
-            ready_cex = [
-                item
-                for item in verification.get("cex_work_items", [])
-                if item.get("diagnosis_readiness") == "ready"
-            ]
-            if not ready_cex:
-                raise ValueError(
-                    "waveform_explanation requires at least one decode-ready counterexample"
-                )
-        if stage == "propose_bugfix":
-            diagnoses = self._read_diagnoses()
-            if not self._diagnoses_allow_bugfix(diagnoses):
-                raise ValueError(
-                    "propose_bugfix requires every diagnosis to be design_bug"
-                )
-
-    def _counterexample_path(self) -> Optional[str]:
-        result = self._read_stage_result("invoke_verification") or {}
-        value = next(
-            (
-                item.get("trace_path")
-                for item in result.get("cex_work_items", [])
-                if item.get("diagnosis_readiness") == "ready" and item.get("trace_path")
-            ),
-            None,
-        )
-        if not value:
-            return None
-        path = Path(value)
-        return str(path if path.is_absolute() else self.workspace.run_dir / path)
-
-    def _materialize_trace_evidence(self) -> None:
-        """Leave trace decoding to the V4 trace contracts.
-
-        Iteration 0 intentionally has no elaboration-time observation map.  It
-        therefore must not synthesize the retired empty ``signal_map`` input.
-        A future Stage 4 invocation consumes the ready per-CEX contracts
-        directly.
-        """
-        return
-
-    def _read_diagnoses(self) -> list[Dict[str, Any]]:
-        path = (
-            self.workspace.results_dir
-            / "by_stage"
-            / get_stage_spec("waveform_explanation").directory_name
-            / "diagnosis.json"
-        )
-        if not path.is_file():
-            return []
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        diagnoses = payload.get("diagnoses")
-        return diagnoses if isinstance(diagnoses, list) else []
-
-    def _write_revision_request(self, diagnoses: list[Dict[str, Any]]) -> None:
-        layer_by_classification = {
-            "property_schema_error": "property_schema",
-            "template_error": "template",
-            "binding_error": "binding",
-            "environment_error": "environment",
-            "assumption_error": "formal_contract",
-            "inconclusive": "environment",
-        }
-        requests = []
-        for item in diagnoses:
-            classification = item.get("classification")
-            if classification == "design_bug":
-                continue
-            requests.append(
-                {
-                    "property": item.get("property"),
-                    "jaspergold_property_id": item.get(
-                        "jaspergold_property_id"
-                    ),
-                    "classification": classification,
-                    "revision_target": layer_by_classification.get(
-                        classification,
-                        "environment",
-                    ),
-                    "parent_run_id": self.workspace.run_dir.name,
-                    "old_asset_sha256": self._revision_asset_hash(
-                        layer_by_classification.get(classification, "environment"),
-                        item,
-                    ),
-                    "reason": item.get("uncertainty") or classification,
-                    "evidence_refs": item.get("evidence_refs", []),
-                }
-            )
-        path = (
-            self.workspace.results_dir
-            / "by_stage"
-            / get_stage_spec("waveform_explanation").directory_name
-            / "revision_request.json"
-        )
-        _write_json(
-            path,
-            {
-                "schema_version": "revision_request.v2",
-                "requests": requests,
-            },
-        )
-
-    def _revision_asset_hash(self, target: str, diagnosis: Dict[str, Any]) -> str:
-        import hashlib
-
-        stage2 = self.workspace.results_dir / "by_stage" / get_stage_spec("bind_properties").directory_name
-        if target == "binding":
-            path = stage2 / "binding_manifest.json"
-        elif target in {"formal_contract", "environment"}:
-            path = self.workspace.results_dir / "preflight" / "formal_contract.json"
-        else:
-            package = json.loads((stage2 / "property_package.json").read_text(encoding="utf-8"))
-            traceability = package["traceability"]
-            prop = next(
-                item for item in traceability.get("properties", [])
-                if item.get("instance_id") == diagnosis.get("instance_id")
-                or item.get("property_schema_id") == diagnosis.get("property_schema_id")
-            )
-            prefix = "schemas/" if target == "property_schema" else "templates/"
-            asset_id = prop["property_schema_id"] if target == "property_schema" else prop["template_id"]
-            reviewed = prop.get("review", {}).get("asset_hashes", {})
-            return next(
-                sha for asset_path, sha in reviewed.items()
-                if asset_path.startswith(prefix) and Path(asset_path).stem.lower() == asset_id.lower()
-            )
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-
-    def _diagnoses_allow_bugfix(self, diagnoses: list[Dict[str, Any]]) -> bool:
-        stage2 = self.workspace.results_dir / "by_stage" / get_stage_spec("bind_properties").directory_name
-        stage4 = self.workspace.results_dir / "by_stage" / get_stage_spec("waveform_explanation").directory_name
-        evidence_path = stage4 / "diagnosis_evidence.json"
-        review_ok = False
-        formal_review_ok = False
-        package_path = stage2 / "property_package.json"
-        if package_path.is_file():
-            package = json.loads(package_path.read_text(encoding="utf-8"))
-            review = package.get("review") or {}
-            review_ok = review.get("reviewer") == "codex" and review.get("review_status") == "approved"
-            formal_path = self.workspace.results_dir / "preflight" / "formal_contract.json"
-            if formal_path.is_file():
-                formal = json.loads(formal_path.read_text(encoding="utf-8"))
-                formal_review_ok = any(
-                    item.get("kind") == "formal_contract"
-                    and item.get("sha256") == formal.get("sha256")
-                    for item in review.get("assets", [])
-                )
-            result_map_path = (
-                self.workspace.results_dir
-                / "by_stage"
-                / get_stage_spec("invoke_verification").directory_name
-                / "property_result_map.json"
-            )
-            if result_map_path.is_file():
-                result_map = json.loads(
-                    result_map_path.read_text(encoding="utf-8")
-                )
-                review_ok = review_ok and (
-                    result_map.get("property_package_sha256")
-                    == file_sha256(package_path)
-                )
-        evidence_properties = set()
-        reconstruction_complete = False
-        if evidence_path.is_file():
-            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-            reconstruction_complete = (
-                evidence.get("reconstruction_status") == "complete"
-            )
-            evidence_properties = {
-                item.get("property") for item in evidence.get("properties", [])
-            }
-        return bool(diagnoses) and all(
-            design_bug_is_eligible(
-                item,
-                package_approved=review_ok,
-                formal_contract_approved=formal_review_ok,
-                reconstruction_available=(
-                    reconstruction_complete
-                    and item.get("property") in evidence_properties
-                ),
-            )
-            for item in diagnoses
-        )
-
-    def _read_handoff(self, stage: str) -> Optional[Dict[str, Any]]:
-        path = self._handoff_path(stage)
-        if not path.is_file():
-            return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("schema_version") != "stage_handoff.v2" or payload.get("stage") != stage:
-            raise ValueError(f"invalid {stage} handoff")
-        return payload
 
     def _read_stage_result(self, stage: str) -> Optional[Dict[str, Any]]:
         path = self._handoff_path(stage).with_name("stage_result.json")
@@ -583,33 +317,6 @@ class CoupledL2Runner:
         if payload.get("stage") != stage:
             raise ValueError(f"invalid {stage} stage result")
         return payload
-
-    def _v2c_readiness_block(self, stage: str) -> Optional[Dict[str, Any]]:
-        if stage != "bind_properties":
-            return None
-        path = self.workspace.case_workspace / "formal_readiness.json"
-        if not path.is_file():
-            return None
-        readiness = json.loads(path.read_text(encoding="utf-8"))
-        if readiness.get("ready") is not False:
-            return None
-        return {
-            "schema_version": "stage_result.v2",
-            "stage": stage,
-            "success": False,
-            "termination_reason": "invalid_v2c_environment",
-            "error_kind": "invalid_v2c_environment",
-            "summary": "V2C formal readiness failed before property binding.",
-            "invalid_v2c_environment": True,
-            "blocking_issues": readiness.get("blocking_issues", []),
-            "formal_readiness": "formal_readiness.json",
-        }
-
-    def _write_stage_failure(self, stage: str, stage_result: Dict[str, Any]) -> None:
-        path = self._handoff_path(stage)
-        write_stage_outcome(
-            path.parent, get_stage_spec(stage), stage_result
-        )
 
     def _bind_state_to_handoff(self, stage: str, state: Dict[str, Any]) -> None:
         path = self._handoff_path(stage)
@@ -636,31 +343,9 @@ class CoupledL2Runner:
             if self.llm_client is not None and hasattr(self.llm_client, "get_token_usage")
             else {}
         )
-        compactions = []
-        tool_results = []
-        compaction_paths = (self.workspace.results_dir / "by_stage").glob(
-            "*/context_compactions.jsonl"
-        )
-        for path in sorted(compaction_paths):
-            lines = path.read_text(encoding="utf-8").splitlines()
-            for line in lines[self.compaction_offsets.get(path, 0):]:
-                if line.strip():
-                    compactions.append(json.loads(line))
-        operation_paths = (self.workspace.results_dir / "by_stage").glob(
-            "*/operations.jsonl"
-        )
-        for path in sorted(operation_paths):
-            lines = path.read_text(encoding="utf-8").splitlines()
-            for line in lines[self.operation_offsets.get(path, 0):]:
-                if line.strip():
-                    item = json.loads(line)
-                    if item.get("kind") == "tool_result":
-                        tool_results.append(item)
         current = build_run_cost_summary(
             usage,
             stage_results=stage_results,
-            compactions=compactions,
-            tool_results=tool_results,
         )
         _write_json(
             self.workspace.results_dir / "run_cost_summary.json",
@@ -673,7 +358,7 @@ class CoupledL2Runner:
         stage_results: list[Dict[str, Any]],
     ) -> None:
         payload = dict(summary)
-        payload["schema_version"] = "final_result.v2"
+        payload["schema_version"] = "final_result"
         persisted = {}
         for stage in COUPLEDL2_STAGES:
             result = self._read_stage_result(stage)

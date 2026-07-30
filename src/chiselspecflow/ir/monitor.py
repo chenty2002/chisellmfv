@@ -1,11 +1,11 @@
-"""Strict chisel_monitors.v1 validation for bounded repository archetypes."""
+"""Strict chisel_monitors validation for bounded repository archetypes."""
 
 from __future__ import annotations
 
 import hashlib
 from typing import Any, Dict, Mapping
 
-from ..config import MONITOR_SCHEMA_VERSION
+from ..config import MONITOR_SCHEMA
 from .expression import ExpressionValidationError, ExpressionType, infer_expression_type, validate_expression
 
 
@@ -140,7 +140,7 @@ def validate_monitor(
         raise MonitorValidationError("missing_property_role", str(sorted(required_roles - roles)))
     value["state"] = normalized_states
     value["properties"] = normalized_properties
-    value["schema_version"] = MONITOR_SCHEMA_VERSION
+    value["schema_version"] = MONITOR_SCHEMA
     return value
 
 

@@ -122,7 +122,7 @@ def elaborate_baseline(
         )
 
     value = {
-        "schema_version": "baseline_elaboration.v1",
+        "schema_version": "baseline_elaboration",
         "configuration_id": configuration.configuration_id,
         "top": project.generator["top_name"],
         "modules": sorted(set(modules)),
@@ -203,7 +203,7 @@ def elaborate_verification_overlay(
         for index, path in enumerate(sv_files, start=1)
     ]
     certificate = {
-        "schema_version": "elaboration_certificate.v1",
+        "schema_version": "elaboration_certificate",
         "configuration_id": configuration_id,
         "wrapper_top": overlay_manifest["wrapper_top"],
         "verification_package_sha256": file_sha256(verification_package_path),

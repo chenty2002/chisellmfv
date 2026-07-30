@@ -322,7 +322,7 @@ def build_tl_signal_index(
         module_counts[module] = module_counts.get(module, 0) + 1
 
     return {
-        "schema_version": "tl_signal_index.v2",
+        "schema_version": "tl_signal_index",
         "case_root": "workspace/case",
         "roots": _normalized_roots(case_workspace, roots),
         "files_scanned": files_scanned,
@@ -386,7 +386,7 @@ def build_observer_index(
 
     candidates = _assign_candidate_ids(candidates, prefix="obs")
     return {
-        "schema_version": "observer_index.v2",
+        "schema_version": "observer_index",
         "case_root": "workspace/case",
         "roots": _normalized_roots(case_workspace, roots),
         "files_scanned": files_scanned,

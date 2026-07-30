@@ -1,10 +1,10 @@
-"""Strict chisel_bindings.v1 compatibility validation."""
+"""Strict chisel_bindings compatibility validation."""
 
 from __future__ import annotations
 
 from typing import Any, Dict, Mapping
 
-from ..config import BINDING_SCHEMA_VERSION
+from ..config import BINDING_SCHEMA
 
 
 _FIELDS = {
@@ -57,7 +57,7 @@ def validate_binding(
     if errors:
         raise BindingValidationError(errors)
     value = dict(candidate)
-    value["schema_version"] = BINDING_SCHEMA_VERSION
+    value["schema_version"] = BINDING_SCHEMA
     value["validation_errors"] = []
     return value
 

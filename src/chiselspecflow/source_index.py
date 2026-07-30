@@ -22,7 +22,7 @@ def build_source_index(
     model_sources_root = Path(model_sources_root).resolve()
     output_path = Path(output_path).resolve()
     tool_root = Path(tool_root).resolve()
-    if model_view_manifest.get("schema_version") != "model_view_manifest.v1":
+    if model_view_manifest.get("schema_version") != "model_view_manifest":
         raise SourceIndexError("unsupported model view manifest")
     paths = []
     source_ids = {}
@@ -81,7 +81,7 @@ def build_source_index(
 def validate_source_index(
     value: Mapping[str, Any], source_ids: Mapping[str, str], root: Path
 ) -> None:
-    if value.get("schema_version") != "scala_source_index.v1":
+    if value.get("schema_version") != "scala_source_index":
         raise SourceIndexError("unsupported Scala source index schema")
     for name in ("sources", "objects", "guards"):
         if not isinstance(value.get(name), list):

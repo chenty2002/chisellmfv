@@ -1,4 +1,4 @@
-"""Semantic validator for the V3 protocol-obligation intermediate representation."""
+"""Semantic validator for the  protocol-obligation intermediate representation."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ class PropertyIRError(ValueError):
     """Raised when an obligation is structurally present but semantically invalid."""
 
 
-def validate_property_schema_v3(value: Dict[str, Any]) -> None:
+def validate_property_schema(value: Dict[str, Any]) -> None:
     fields = {
         "schema_version", "property_schema_id", "category", "layer", "title",
         "source", "rule_id", "obligation_kind", "channel_scope",
@@ -43,7 +43,7 @@ def validate_property_schema_v3(value: Dict[str, Any]) -> None:
         "review_required",
     }
     _exact(value, fields, "property_schema")
-    if value["schema_version"] != "property_schema.v3":
+    if value["schema_version"] != "property_schema":
         raise PropertyIRError("unsupported property schema version")
     if value["obligation_kind"] not in OBLIGATION_KINDS:
         raise PropertyIRError("invalid obligation kind")
@@ -87,7 +87,7 @@ def validate_property_schema_v3(value: Dict[str, Any]) -> None:
 def structural_completeness(value: Dict[str, Any]) -> bool:
     """Structural completeness counts explicit empty sets as present."""
     try:
-        validate_property_schema_v3(value)
+        validate_property_schema(value)
     except (PropertyIRError, TypeError, KeyError):
         return False
     return True

@@ -73,7 +73,7 @@ def _validate_review(review: object, review_id: str) -> None:
     }
     if set(review) != fields:
         raise PropertyReviewError("property review has invalid fields")
-    if review["schema_version"] != "property_review.v1":
+    if review["schema_version"] != "property_review":
         raise PropertyReviewError("unsupported property review version")
     if review["review_id"] != review_id:
         raise PropertyReviewError("property review id does not match filename")

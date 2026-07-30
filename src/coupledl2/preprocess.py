@@ -208,7 +208,7 @@ def scan_formal_surface(case_workspace: Path) -> Dict[str, Any]:
             if BORING_CALL_RE.search(code):
                 boringutils.append(_record(path, case_workspace, line_no, line))
     return {
-        "schema_version": "formal_surface_scan.v1",
+        "schema_version": "formal_surface_scan",
         "scope": "Chisel/**/*.scala hardware/formal instrumentation",
         "files_checked": [_rel(path, case_workspace) for path in files],
         "assertion_count": len(assertions),
@@ -277,7 +277,7 @@ def build_baseline_assertion_inventory(
                 })
     entries.sort(key=lambda item: (item["source_path"], item["line"], item["kind"]))
     return {
-        "schema_version": "baseline_assertion_inventory.v1",
+        "schema_version": "baseline_assertion_inventory",
         "entries": entries,
         "entry_count": len(entries),
         "preserved_count": sum(item["policy"] == "preserved" for item in entries),
@@ -343,7 +343,7 @@ def clean_formal_surface(case_workspace: Path) -> Dict[str, Any]:
             changed_files.append(_rel(path, case_workspace))
     after = scan_formal_surface(case_workspace)
     return {
-        "schema_version": "formal_surface_cleanup.v2",
+        "schema_version": "formal_surface_cleanup",
         "success": not failures,
         "policy": "profile_owned_generated_regions_only",
         "changed_files": changed_files,

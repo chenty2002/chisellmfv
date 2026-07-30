@@ -1,4 +1,4 @@
-"""Model-free SpecFlow adapter for VerilogCausalAnalysis V2/V3."""
+"""Model-free SpecFlow adapter for the current causal-analysis API."""
 
 from __future__ import annotations
 
@@ -43,8 +43,8 @@ def materialize_causal_evidence(
     """Build immutable causal graphs only from certified Stage-2 artifacts."""
 
     config_row = effective_causal_config(config)
-    stage2 = workspace.stage_dir(round_id, "compile_verify")
-    stage3 = workspace.stage_dir(round_id, "diagnose")
+    stage2 = workspace.stage_dir("compile_verify")
+    stage3 = workspace.stage_dir("diagnose")
     certificate_path = stage2 / "elaboration_certificate.json"
     trace_manifest_path = stage2 / "trace_manifest.json"
     semantic_path = workspace.indexes_dir / "chisel_semantic_index.json"
@@ -69,12 +69,9 @@ def materialize_causal_evidence(
         raise CausalBackendError(
             "causal adapter input identity drifted after evidence projection"
         )
-    if config_row["causal_backend"] == "verilog_causal_analysis.v3":
-        v3_identity = _validate_v3_projection_identity(
-            stage2, projection_identity
-        )
-    else:
-        v3_identity = {}
+    semantic_identity = _validate_semantic_projection_identity(
+        stage2, projection_identity
+    )
     analyzer = _analyzer_identity()
     rtl_rows = certificate.get("generated_files")
     rtl_set_sha256 = _rtl_set_identity(rtl_rows)
@@ -84,10 +81,10 @@ def materialize_causal_evidence(
         "trace_manifest_sha256": file_sha256(trace_manifest_path),
         "semantic_index_sha256": file_sha256(semantic_path),
         "generated_rtl_set_sha256": rtl_set_sha256,
-        **v3_identity,
+        **semantic_identity,
     }
     base_manifest = {
-        "schema_version": "causal_graph_manifest.v1",
+        "schema_version": "causal_graph_manifest",
         "round_id": round_id,
         "policy": config_row["causal_policy"],
         "analyzer": analyzer,
@@ -222,12 +219,9 @@ def materialize_causal_evidence(
 
     try:
         from verilog_causal_analysis import (
-            make_request_v2,
-            make_request_v3,
-            prepare_causal_analysis,
-            prepare_causal_session_v3,
-            validate_semantic_graph_v3,
-            validate_graph_v2,
+            make_request,
+            prepare_causal_session,
+            validate_graph,
         )
     except Exception as exc:
         manifest = {
@@ -281,62 +275,34 @@ def materialize_causal_evidence(
                     endpoint_signal,
                     semantic_by_id.get(str(endpoint["object_id"]), {}),
                 )
-            use_v3 = (
-                config_row["causal_backend"]
-                == "verilog_causal_analysis.v3"
+            formal_clock = observation_identity.get("clock_signal")
+            if (
+                formal_clock is not None
+                and seed["clock_signal"] != formal_clock
+            ):
+                raise CausalBackendError(
+                    "causal endpoint does not use the primary formal clock"
+                )
+            request = _make_semantic_request(
+                make_request,
+                operation_id=operation_id,
+                trace_path=trace_path,
+                trace_row=trace_row,
+                rtl_rows=rtl_rows,
+                endpoint_signal=endpoint_signal,
+                endpoint_cycle=seed["failure_cycle"],
+                clock_signal=seed["clock_signal"],
+                config=config_row,
             )
-            if use_v3:
-                formal_clock = observation_identity.get("clock_signal")
-                if (
-                    formal_clock is not None
-                    and seed["clock_signal"] != formal_clock
-                ):
-                    raise CausalBackendError(
-                        "causal endpoint does not use the primary formal clock"
-                    )
-                request = _make_v3_request(
-                    make_request_v3,
-                    operation_id=operation_id,
-                    trace_path=trace_path,
-                    trace_row=trace_row,
-                    rtl_rows=rtl_rows,
-                    endpoint_signal=endpoint_signal,
-                    endpoint_cycle=seed["failure_cycle"],
-                    clock_signal=seed["clock_signal"],
-                    config=config_row,
-                )
-            else:
-                request = make_request_v2(
-                    trace={
-                        "path": str(trace_path),
-                        "format": "fst",
-                        "sha256": trace_row["sha256"],
-                        "bytes": trace_row["bytes"],
-                    },
-                    rtl_files=[dict(row) for row in rtl_rows],
-                    clock_signal=seed["clock_signal"],
-                    endpoint_signal=endpoint_signal,
-                    endpoint_cycle=seed["failure_cycle"],
-                    max_depth=config_row["max_depth"],
-                    max_nodes=config_row["max_nodes"],
-                    random_seed=config_row["random_seed"],
-                    strict=True,
-                )
             if graph_builder is not None:
-                if use_v3:
-                    request_identities.append(request.identity_dict())
-                    semantic_input_identities.extend(
-                        item.identity_dict() for item in request.semantic_inputs
-                    )
-                built = graph_builder(request)
-                graph = (
-                    validate_semantic_graph_v3(built)
-                    if use_v3
-                    else validate_graph_v2(built)
+                request_identities.append(request.identity_dict())
+                semantic_input_identities.extend(
+                    item.identity_dict() for item in request.semantic_inputs
                 )
+                built = graph_builder(request)
+                graph = validate_graph(built)
             else:
                 prepared_identity = (
-                    config_row["causal_backend"],
                     request.trace.path,
                     request.trace.sha256,
                     request.trace.bytes,
@@ -349,27 +315,18 @@ def materialize_causal_evidence(
                         )
                         for artifact in request.rtl_files
                     ),
-                    (
-                        request.clock_signal
-                        if not use_v3
-                        else request.clock_signal
-                    ),
+                    request.clock_signal,
                     request.strict,
                 )
                 prepared = prepared_by_identity.get(prepared_identity)
                 if prepared is None:
                     prepared = prepared_stack.enter_context(
-                        prepare_causal_session_v3(request)
-                        if use_v3
-                        else prepare_causal_analysis(request)
+                        prepare_causal_session(request)
                     )
                     prepared_by_identity[prepared_identity] = prepared
-                if (
-                    use_v3
-                    and not prepared.instance_graph.get_rtl_context(
-                        endpoint_signal
-                    ).get("found")
-                ):
+                if not prepared.instance_graph.get_rtl_context(
+                    endpoint_signal
+                ).get("found"):
                     projection_input, projection_row = (
                         _materialize_assertion_endpoint_projection(
                             stage2=stage2,
@@ -383,8 +340,8 @@ def materialize_causal_evidence(
                             rtl_set_sha256=rtl_set_sha256,
                         )
                     )
-                    request = _make_v3_request(
-                        make_request_v3,
+                    request = _make_semantic_request(
+                        make_request,
                         operation_id=operation_id,
                         trace_path=trace_path,
                         trace_row=trace_row,
@@ -396,25 +353,16 @@ def materialize_causal_evidence(
                         projection=projection_row,
                         semantic_inputs=[projection_input],
                     )
-                if use_v3:
-                    request_identities.append(request.identity_dict())
-                    semantic_input_identities.extend(
-                        item.identity_dict() for item in request.semantic_inputs
-                    )
-                built = prepared.build(request)
-                graph = (
-                    validate_semantic_graph_v3(built)
-                    if use_v3
-                    else validate_graph_v2(built)
+                request_identities.append(request.identity_dict())
+                semantic_input_identities.extend(
+                    item.identity_dict() for item in request.semantic_inputs
                 )
+                built = prepared.build(request)
+                graph = validate_graph(built)
             identity = graph["identity"]
             if (
                 identity["request_sha256"] != request.request_sha256
                 or identity["trace_sha256"] != request.trace.sha256
-                or (
-                    not use_v3
-                    and identity["random_seed"] != request.random_seed
-                )
             ):
                 raise CausalBackendError(
                     "causal graph identity does not match its exact request"
@@ -450,7 +398,7 @@ def materialize_causal_evidence(
     prepared_stack.close()
     manifest_inputs = dict(inputs)
     if request_identities:
-        manifest_inputs["v3_request_set_sha256"] = canonical_sha256(
+        manifest_inputs["semantic_request_set_sha256"] = canonical_sha256(
             sorted(
                 request_identities,
                 key=lambda row: canonical_sha256(row),
@@ -516,7 +464,7 @@ def materialize_causal_evidence(
     return manifest, source, graphs_by_id
 
 
-_V3_FEATURES = [
+_SEMANTIC_FEATURES = [
     "instance_graph",
     "compiler_net_normalization",
     "register_transition",
@@ -529,7 +477,7 @@ _V3_FEATURES = [
 ]
 
 
-def _make_v3_request(
+def _make_semantic_request(
     make_request: Callable[..., Any],
     *,
     operation_id: str,
@@ -543,7 +491,7 @@ def _make_v3_request(
     projection: Optional[Mapping[str, Any]] = None,
     semantic_inputs: Optional[list[Mapping[str, Any]]] = None,
 ) -> Any:
-    features = list(_V3_FEATURES)
+    features = list(_SEMANTIC_FEATURES)
     if projection is not None:
         features.append("endpoint_projection")
     return make_request(
@@ -557,7 +505,7 @@ def _make_v3_request(
         rtl_files=[dict(row) for row in rtl_rows],
         semantic_profile={
             "name": "chisel",
-            "version": "chisel-semantic-profile.v1",
+            "version": "chisel-semantic-profile",
             "features": features,
         },
         clock={"signal": clock_signal, "edge": "rising"},
@@ -585,14 +533,14 @@ def _make_v3_request(
     )
 
 
-def _validate_v3_projection_identity(
+def _validate_semantic_projection_identity(
     stage2: Path, identity: Mapping[str, Any]
 ) -> Dict[str, str]:
     try:
         package, package_path = _load_certified_package(stage2)
     except Exception as exc:
         raise CausalBackendError(
-            "V3 causal projection package identity drifted"
+            "semantic causal projection package identity drifted"
         ) from exc
     del package
     paths = {
@@ -609,7 +557,7 @@ def _validate_v3_projection_identity(
             or file_sha256(path) != expected
         ):
             raise CausalBackendError(
-                "V3 causal projection input identity drifted"
+                "semantic causal projection input identity drifted"
             )
         resolved[field] = expected
     return resolved
@@ -627,7 +575,7 @@ def _materialize_assertion_endpoint_projection(
     clock_signal: str,
     rtl_set_sha256: str,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Materialize one exact reviewed-monitor projection without name fallback."""
+    """Materialize one exact reviewed-monitor projection."""
 
     package, _package_path = _load_certified_package(stage2)
     plan = _read_json(stage2 / "verification_operation_plan.json")
@@ -708,7 +656,7 @@ def _materialize_assertion_endpoint_projection(
         )[:20]
     )
     artifact = {
-        "schema_version": "assertion_endpoint_projection.v1",
+        "schema_version": "assertion_endpoint_projection",
         "endpoint_signal": endpoint_signal,
         "endpoint_cycle": endpoint_cycle,
         "clock_signal": clock_signal,

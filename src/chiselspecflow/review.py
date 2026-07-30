@@ -11,7 +11,7 @@ from src.core.artifact_contract import file_sha256, write_stage_outcome
 from src.core.formal_operations import canonical_sha256
 
 from .assets import load_run_local_package
-from .config import REVIEW_RECORD_SCHEMA_VERSION, VERIFICATION_PACKAGE_SCHEMA_VERSION
+from .config import REVIEW_RECORD_SCHEMA, VERIFICATION_PACKAGE_SCHEMA
 from .stages import get_stage_spec
 
 
@@ -39,8 +39,8 @@ def install_review(run_dir: Path, review_record_path: Path) -> Dict[str, Any]:
     manifest = _read_json(manifest_path)
     if manifest.get("review_state") != "awaiting_review":
         raise ReviewError("run is not awaiting review")
-    round_id = manifest.get("current_round")
-    stage_dir = run_dir / "rounds" / f"{round_id:04d}" / "01_asset_authoring"
+    round_id = 1
+    stage_dir = run_dir / "stages" / "01_asset_authoring"
     request = _read_json(stage_dir / "review_request.json")
     candidates = _read_json(stage_dir / "authoring_candidates.json")
     stage_inputs = _read_json(stage_dir / "stage_inputs.json")
@@ -63,11 +63,11 @@ def install_review(run_dir: Path, review_record_path: Path) -> Dict[str, Any]:
             },
             source_state=manifest,
         )
-        _update_run_state(run_dir, "rejected", "review_rejected")
+        _update_run_state(run_dir, "rejected")
         return result
 
     package_body = {
-        "schema_version": VERIFICATION_PACKAGE_SCHEMA_VERSION,
+        "schema_version": VERIFICATION_PACKAGE_SCHEMA,
         "project_id": stage_inputs["project"]["project_id"],
         "configuration_id": stage_inputs["configuration"]["configuration_id"],
         "round_id": round_id,
@@ -106,7 +106,7 @@ def install_review(run_dir: Path, review_record_path: Path) -> Dict[str, Any]:
         },
         source_state=manifest,
     )
-    _update_run_state(run_dir, "approved", "authoring_complete")
+    _update_run_state(run_dir, "approved")
     return result
 
 
@@ -114,15 +114,14 @@ def build_review_record_template(run_dir: Path, reviewer: str = "codex") -> Dict
     """Build an unapproved template; a reviewer must supply decisions/evidence."""
 
     run_dir = Path(run_dir).resolve()
-    manifest = _read_json(run_dir / "manifest.json")
-    stage_dir = run_dir / "rounds" / f"{manifest['current_round']:04d}" / "01_asset_authoring"
+    stage_dir = run_dir / "stages" / "01_asset_authoring"
     request = _read_json(stage_dir / "review_request.json")
     reviewed_hashes = list(request["reviewed_hashes_required"])
     reviewed_hashes.append(
         {"artifact": "review_request.json", "sha256": file_sha256(stage_dir / "review_request.json")}
     )
     return {
-        "schema_version": REVIEW_RECORD_SCHEMA_VERSION,
+        "schema_version": REVIEW_RECORD_SCHEMA,
         "reviewer": reviewer,
         "decision": "rejected",
         "reviewed_hashes": reviewed_hashes,
@@ -137,7 +136,7 @@ def build_review_record_template(run_dir: Path, reviewer: str = "codex") -> Dict
 
 
 def _validate_review_record(record: Mapping[str, Any], request: Mapping[str, Any], stage_dir: Path) -> None:
-    if set(record) != _REVIEW_FIELDS or record.get("schema_version") != REVIEW_RECORD_SCHEMA_VERSION:
+    if set(record) != _REVIEW_FIELDS or record.get("schema_version") != REVIEW_RECORD_SCHEMA:
         raise ReviewError("review record has an invalid exact schema")
     reviewer = record.get("reviewer")
     if reviewer != "codex" and not (
@@ -198,15 +197,11 @@ def _model_call_count(candidates: Mapping[str, Any]) -> int:
     return len(candidates.get("model_call_refs", []))
 
 
-def _update_run_state(run_dir: Path, review_state: str, round_state: str) -> None:
+def _update_run_state(run_dir: Path, review_state: str) -> None:
     manifest_path = run_dir / "manifest.json"
     manifest = _read_json(manifest_path)
     manifest["review_state"] = review_state
     _write_json(manifest_path, manifest)
-    round_path = run_dir / "rounds" / f"{manifest['current_round']:04d}" / "round.json"
-    round_manifest = _read_json(round_path)
-    round_manifest["state"] = round_state
-    _write_json(round_path, round_manifest)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:

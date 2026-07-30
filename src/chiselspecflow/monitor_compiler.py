@@ -12,7 +12,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 from src.core.artifact_contract import file_sha256, validate_completed_stage
 
 from .assets import AssetLibrary, load_reviewed_assets, load_run_local_package
-from .config import OVERLAY_MANIFEST_SCHEMA_VERSION, SOURCE_ASSERTION_DELTA_SCHEMA_VERSION
+from .config import OVERLAY_MANIFEST_SCHEMA, SOURCE_ASSERTION_DELTA_SCHEMA
 from .ir.expression import ExpressionType, infer_expression_type, normalized_root
 from .stages import get_stage_spec
 
@@ -56,8 +56,8 @@ def validate_monitor_ir(
 ) -> None:
     """Validate reviewed/normalized monitor references before lowering."""
 
-    if monitor.get("schema_version") != "chisel_monitors.v1":
-        raise MonitorCompilerError("monitor is not normalized chisel_monitors.v1")
+    if monitor.get("schema_version") != "chisel_monitors":
+        raise MonitorCompilerError("monitor is not normalized chisel_monitors")
     archetype_id = monitor.get("archetype_id")
     archetype = asset_library.monitor_archetypes.get(archetype_id)
     if archetype is None or monitor.get("archetype_sha256") != archetype.get("sha256"):
@@ -353,7 +353,6 @@ def compile_reviewed_package(
 
     assets = asset_library or load_reviewed_assets()
     manifest = _read_json(workspace.manifest_path)
-    round_id = manifest["current_round"]
     if frozen_replay:
         if package_path is None:
             raise MonitorCompilerError("frozen replay requires an exact package path")
@@ -361,7 +360,7 @@ def compile_reviewed_package(
     else:
         if manifest.get("review_state") != "approved":
             raise MonitorCompilerError("verification package is not review-approved")
-        stage1 = workspace.stage_dir(round_id, "asset_authoring")
+        stage1 = workspace.stage_dir("asset_authoring")
         if validate_completed_stage(stage1, get_stage_spec("asset_authoring")) is None:
             raise MonitorCompilerError("asset_authoring handoff or artifact hash is invalid")
         package_path = stage1 / "verification_package.json"
@@ -403,13 +402,13 @@ def compile_reviewed_package(
     temporary.write_text(rendered.source, encoding="utf-8")
     temporary.replace(source_path)
 
-    output = Path(output_dir or workspace.stage_dir(round_id, "compile_verify")).resolve()
+    output = Path(output_dir or workspace.stage_dir("compile_verify")).resolve()
     output.mkdir(parents=True, exist_ok=True)
     assertion_delta_path = output / "source_assertion_delta.json"
     _write_json(
         assertion_delta_path,
         {
-            "schema_version": SOURCE_ASSERTION_DELTA_SCHEMA_VERSION,
+            "schema_version": SOURCE_ASSERTION_DELTA_SCHEMA,
             "verification_package_sha256": file_sha256(package_path),
             "properties": list(rendered.properties),
         },
@@ -418,7 +417,7 @@ def compile_reviewed_package(
     _write_json(
         overlay_manifest_path,
         {
-            "schema_version": OVERLAY_MANIFEST_SCHEMA_VERSION,
+            "schema_version": OVERLAY_MANIFEST_SCHEMA,
             "verification_package_sha256": file_sha256(package_path),
             "wrapper_top": rendered.wrapper_top,
             "strategy": "wrapper",
@@ -428,7 +427,7 @@ def compile_reviewed_package(
             },
             "monitor_ids": [unit.monitor_id for unit in units],
             "property_count": len(rendered.properties),
-            "compiler": "chiselspecflow.monitor_compiler.v1",
+            "compiler": "chiselspecflow.monitor_compiler",
         },
     )
     diff_path = output / "overlay_diff.patch"

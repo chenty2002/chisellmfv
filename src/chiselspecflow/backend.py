@@ -115,7 +115,7 @@ class JasperGoldBackend:
                     }
                 )
         trace_manifest = {
-            "schema_version": "trace_manifest.v1",
+            "schema_version": "trace_manifest",
             "operation_plan_sha256": file_sha256(
                 stage_dir / "verification_operation_plan.json"
             ),
@@ -128,7 +128,7 @@ class JasperGoldBackend:
                 handle.write(
                     json.dumps(
                         {
-                            "schema_version": "proof_event.v1",
+                            "schema_version": "proof_event",
                             "event": "property_finalized",
                             "sequence": sequence,
                             **row,

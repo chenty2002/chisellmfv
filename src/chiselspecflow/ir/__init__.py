@@ -1,4 +1,4 @@
-"""Strict, independently versioned ChiselSpecFlow authoring IRs."""
+"""Strict ChiselSpecFlow authoring IRs maintained as one current contract."""
 
 from .binding import BindingValidationError, validate_binding
 from .expression import ExpressionValidationError, validate_expression

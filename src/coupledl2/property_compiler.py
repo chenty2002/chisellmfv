@@ -1,4 +1,4 @@
-"""Deterministic evidence-carrying lowering of V3 obligations."""
+"""Deterministic evidence-carrying lowering of  obligations."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 from .property_catalog import PropertyCatalog
-from .property_ir import LOWERING_FAMILIES, validate_property_schema_v3
+from .property_ir import LOWERING_FAMILIES, validate_property_schema
 
 
 FAMILY_CAPABILITIES = {
@@ -46,7 +46,7 @@ def compile_manifest(
         )
     material = json.dumps(certificates, sort_keys=True, separators=(",", ":")).encode()
     return {
-        "schema_version": "compilation_certificate.v1",
+        "schema_version": "compilation_certificate",
         "property_profile_id": catalog.profile["property_profile_id"],
         "compiler": {"name": "coupledl2_property_compiler", "mode": "deterministic", "version": 1},
         "lowering_families": sorted(LOWERING_FAMILIES),
@@ -59,7 +59,7 @@ def build_witness_plan(manifest: Dict[str, Any], catalog: PropertyCatalog) -> Di
     instances = []
     for instance in manifest["instances"]:
         schema = catalog.schemas[instance["property_schema_id"]]
-        validate_property_schema_v3(schema)
+        validate_property_schema(schema)
         oracle = schema["oracle_plan"]
         instances.append({
             "instance_id": instance["instance_id"],
@@ -73,14 +73,14 @@ def build_witness_plan(manifest: Dict[str, Any], catalog: PropertyCatalog) -> Di
             "assumption_satisfiable_required": oracle["non_vacuity"]["assumption_satisfiable"],
             "parent_evidence_reusable": False,
         })
-    return {"schema_version": "witness_plan.v1", "instances": instances}
+    return {"schema_version": "witness_plan", "instances": instances}
 
 
 def initial_semantic_evidence(
     catalog: PropertyCatalog, certificate: Dict[str, Any]
 ) -> Dict[str, Any]:
     return {
-        "schema_version": "semantic_evidence.v1",
+        "schema_version": "semantic_evidence",
         "approval": {
             "approved_by_codex": bool(catalog.review and catalog.review["review_status"] == "approved"),
             "review_id": catalog.review["review_id"] if catalog.review else None,
@@ -111,7 +111,7 @@ def _compile_instance(
     instance: Dict[str, Any], schema: Dict[str, Any], template: Dict[str, Any],
     records: list[Mapping[str, Any]], reviewed_hashes: Mapping[str, str],
 ) -> Dict[str, Any]:
-    validate_property_schema_v3(schema)
+    validate_property_schema(schema)
     family = schema["lowering_family"]
     capability = FAMILY_CAPABILITIES.get(family)
     if capability is None or schema["obligation_kind"] not in capability["obligation_kinds"]:

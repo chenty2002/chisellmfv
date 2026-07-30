@@ -1,4 +1,4 @@
-"""Frozen V4 operation, observation, trace, and result contracts.
+"""Frozen  operation, observation, trace, and result contracts.
 
 The module deliberately contains no tool or model calls.  It validates the
 immutable Stage-2 operation plan and reduces deterministic Stage-3 operation
@@ -27,11 +27,11 @@ from ..core.formal_operations import (
 )
 
 
-OPERATION_PLAN_SCHEMA_VERSION = "verification_operation_plan.v1"
-OBSERVATION_MAP_SCHEMA_VERSION = "observation_map.v1"
-TRACE_DECODE_CONTRACT_SCHEMA_VERSION = "trace_decode_contract.v1"
-PROPERTY_RESULT_MAP_SCHEMA_VERSION = "property_result_map.v4"
-SEMANTIC_EVIDENCE_SCHEMA_VERSION = "semantic_evidence.v2"
+OPERATION_PLAN_SCHEMA = "verification_operation_plan"
+OBSERVATION_MAP_SCHEMA = "observation_map"
+TRACE_DECODE_CONTRACT_SCHEMA = "trace_decode_contract"
+PROPERTY_RESULT_MAP_SCHEMA = "property_result_map"
+SEMANTIC_EVIDENCE_SCHEMA = "semantic_evidence"
 
 OPERATION_ROLES = frozenset(
     {
@@ -70,7 +70,7 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ResultContractError(ValueError):
-    """Raised when a V4 contract or result ledger is malformed."""
+    """Raised when a  contract or result ledger is malformed."""
 
 
 def operation_id(instance_id: str, role: str, target: str) -> str:
@@ -91,12 +91,7 @@ def build_primary_operation_plan(
     *,
     package_sha256: str,
 ) -> Dict[str, Any]:
-    """Lower the existing assertion delta into the Iteration-0 operation plan.
-
-    Iteration 0 intentionally emits only primary assertion operations.  The
-    semantic roles remain declared by the reducer, so this plan cannot produce
-    a false semantic pass before Iteration 1 adds real cover operations.
-    """
+    """Lower the assertion delta into the executable operation plan."""
     _require_sha(package_sha256, "package_sha256")
     properties = traceability.get("properties")
     if not isinstance(properties, list) or not properties:
@@ -144,7 +139,7 @@ def build_primary_operation_plan(
                 }
             )
     plan = {
-        "schema_version": OPERATION_PLAN_SCHEMA_VERSION,
+        "schema_version": OPERATION_PLAN_SCHEMA,
         "package_sha256": package_sha256,
         "required_roles": ["primary_assertion"],
         "operations": operations,
@@ -159,7 +154,7 @@ def build_operation_plan(
     *,
     package_sha256: str,
 ) -> Dict[str, Any]:
-    """Build the executable Iteration-1 portfolio from labelled RTL properties."""
+    """Build the executable portfolio from labelled RTL properties."""
     plan = build_primary_operation_plan(
         traceability,
         package_sha256=package_sha256,
@@ -172,7 +167,7 @@ def build_operation_plan(
         instance_id = _string(item, "instance_id", path)
         role = _string(item, "role", path)
         if role not in SEMANTIC_GATE_ROLES or role == "negative_oracle":
-            raise ResultContractError(f"{path}.role is not an Iteration-1 role")
+            raise ResultContractError(f"{path}.role is not executable")
         target = _string(item, "rtl_label", path)
         rtl_property_id = _string(item, "expected_property_id", path)
         evidence_target = _string(item, "target", path)
@@ -196,7 +191,7 @@ def build_operation_plan(
             }
         )
     plan = {
-        "schema_version": OPERATION_PLAN_SCHEMA_VERSION,
+        "schema_version": OPERATION_PLAN_SCHEMA,
         "package_sha256": package_sha256,
         "required_roles": sorted({item["role"] for item in operations}),
         "operations": operations,
@@ -209,7 +204,7 @@ def bind_operation_plan_to_package(package: Mapping[str, Any]) -> Dict[str, Any]
     """Return a package copy with the plan bound to its semantic package hash.
 
     A package cannot contain the byte hash of itself without a circular
-    fixed-point.  V4 therefore binds ``operation_plan.package_sha256`` to the
+    fixed-point.   therefore binds ``operation_plan.package_sha256`` to the
     canonical package hash with that one binding field blanked.  The actual
     artifact hash is still recorded independently in Stage 3.
     """
@@ -236,14 +231,14 @@ def bind_operation_plan_to_package(package: Mapping[str, Any]) -> Dict[str, Any]
 def build_unmaterialized_observation_map(
     *, top_module: str, package_sha256: str, reason: str
 ) -> Dict[str, Any]:
-    """Create the explicit fail-closed Iteration-0 observation map."""
+    """Create the explicit observation map."""
     _require_sha(package_sha256, "package_sha256")
     if not isinstance(top_module, str) or not top_module:
         raise ResultContractError("observation map requires a top module")
     if not isinstance(reason, str) or not reason:
         raise ResultContractError("unmaterialized observation map requires a reason")
     value = {
-        "schema_version": OBSERVATION_MAP_SCHEMA_VERSION,
+        "schema_version": OBSERVATION_MAP_SCHEMA,
         "status": "not_materialized",
         "top_module": top_module,
         "property_package_sha256": package_sha256,
@@ -273,7 +268,7 @@ def build_trace_decode_contract(
 ) -> Dict[str, Any]:
     """Build and validate a ready trace-decode contract."""
     value = {
-        "schema_version": TRACE_DECODE_CONTRACT_SCHEMA_VERSION,
+        "schema_version": TRACE_DECODE_CONTRACT_SCHEMA,
         "operation_id": operation_id_value,
         "instance_id": instance_id,
         "rtl_property_id": rtl_property_id,
@@ -304,7 +299,7 @@ def validate_operation_plan(
         optional={"required_roles", "compiler", "selection_coverage"},
         path="verification_operation_plan",
     )
-    if value["schema_version"] != OPERATION_PLAN_SCHEMA_VERSION:
+    if value["schema_version"] != OPERATION_PLAN_SCHEMA:
         raise ResultContractError("unsupported verification operation plan version")
     _require_sha(value["package_sha256"], "verification_operation_plan.package_sha256")
     if expected_package_sha256 is not None and value["package_sha256"] != expected_package_sha256:
@@ -390,7 +385,7 @@ def validate_observation_map(value: Mapping[str, Any]) -> None:
         },
         path="observation_map",
     )
-    if value["schema_version"] != OBSERVATION_MAP_SCHEMA_VERSION:
+    if value["schema_version"] != OBSERVATION_MAP_SCHEMA:
         raise ResultContractError("unsupported observation map version")
     _string(value, "top_module", "observation_map")
     status = value.get("status", "materialized")
@@ -463,7 +458,7 @@ def validate_trace_decode_contract(value: Mapping[str, Any]) -> None:
         optional={"trace_path", "property_id"},
         path="trace_decode_contract",
     )
-    if value["schema_version"] != TRACE_DECODE_CONTRACT_SCHEMA_VERSION:
+    if value["schema_version"] != TRACE_DECODE_CONTRACT_SCHEMA:
         raise ResultContractError("unsupported trace decode contract version")
     for key in ("operation_id", "instance_id", "rtl_property_id"):
         _string(value, key, "trace_decode_contract")
@@ -504,7 +499,7 @@ def validate_trace_decode_contract(value: Mapping[str, Any]) -> None:
 def validate_property_result_map(
     value: Mapping[str, Any], *, operation_plan: Optional[Mapping[str, Any]] = None
 ) -> None:
-    """Validate the canonical V4 result ledger and, when supplied, its exact set."""
+    """Validate the canonical  result ledger and, when supplied, its exact set."""
     _object(value, "property_result_map")
     _fields(
         value,
@@ -534,7 +529,7 @@ def validate_property_result_map(
         },
         path="property_result_map",
     )
-    if value["schema_version"] != PROPERTY_RESULT_MAP_SCHEMA_VERSION:
+    if value["schema_version"] != PROPERTY_RESULT_MAP_SCHEMA:
         raise ResultContractError("unsupported property result map version")
     _string(value, "property_profile_id", "property_result_map")
     _require_sha(value["property_package_sha256"], "property_result_map.property_package_sha256")
@@ -609,7 +604,7 @@ def reduce_property_result_map(
     formal_metadata: Optional[Mapping[str, Any]] = None,
     unmatched_tool_results: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Reduce deterministic operation rows into a total V4 result map."""
+    """Reduce deterministic operation rows into a total  result map."""
     validate_operation_plan(operation_plan)
     _string({"property_profile_id": property_profile_id}, "property_profile_id", "result")
     _require_sha(property_package_sha256, "property_package_sha256")
@@ -679,7 +674,7 @@ def reduce_property_result_map(
         experiment_status = "invalid"
     exclusion_reasons = sorted(set(exclusion_reasons))
     result = {
-        "schema_version": PROPERTY_RESULT_MAP_SCHEMA_VERSION,
+        "schema_version": PROPERTY_RESULT_MAP_SCHEMA,
         "property_profile_id": property_profile_id,
         "property_package_sha256": property_package_sha256,
         "assertion_delta_sha256": assertion_delta_sha256,
@@ -710,7 +705,7 @@ def build_semantic_evidence(
     validate_property_result_map(result_map)
     _require_sha(property_result_map_sha256, "property_result_map_sha256")
     evidence = {
-        "schema_version": SEMANTIC_EVIDENCE_SCHEMA_VERSION,
+        "schema_version": SEMANTIC_EVIDENCE_SCHEMA,
         "property_package_sha256": result_map["property_package_sha256"],
         "property_result_map_sha256": property_result_map_sha256,
         "execution_status": result_map["execution_status"],
@@ -749,7 +744,7 @@ def validate_semantic_evidence(value: Mapping[str, Any]) -> None:
         optional=set(),
         path="semantic_evidence",
     )
-    if value["schema_version"] != SEMANTIC_EVIDENCE_SCHEMA_VERSION:
+    if value["schema_version"] != SEMANTIC_EVIDENCE_SCHEMA:
         raise ResultContractError("unsupported semantic evidence version")
     _require_sha(value["property_package_sha256"], "semantic_evidence.property_package_sha256")
     _require_sha(value["property_result_map_sha256"], "semantic_evidence.property_result_map_sha256")

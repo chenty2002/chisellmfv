@@ -1,11 +1,11 @@
-"""Strict verification_obligations.v1 validation."""
+"""Strict verification_obligations validation."""
 
 from __future__ import annotations
 
 import re
 from typing import Any, Dict, Mapping
 
-from ..config import OBLIGATION_SCHEMA_VERSION
+from ..config import OBLIGATION_SCHEMA
 from .expression import ExpressionValidationError, validate_expression
 
 
@@ -87,7 +87,7 @@ def validate_obligation(
     if not isinstance(domain, list) or not domain or any(not isinstance(item, str) or not item for item in domain):
         raise ObligationValidationError("invalid_configuration_domain", "non-empty ID list required")
     provenance = _exact_object(value["authoring_provenance"], {"kind", "ref"}, "authoring_provenance")
-    if provenance["kind"] not in {"model_call", "reused_asset", "revision"}:
+    if provenance["kind"] not in {"model_call", "reused_asset"}:
         raise ObligationValidationError("invalid_provenance", str(provenance["kind"]))
     _id(provenance["ref"], "authoring_provenance.ref")
     try:
@@ -95,7 +95,7 @@ def validate_obligation(
             value[field] = validate_expression(value[field], object_types)
     except ExpressionValidationError as exc:
         raise ObligationValidationError(exc.code, str(exc)) from exc
-    value["schema_version"] = OBLIGATION_SCHEMA_VERSION
+    value["schema_version"] = OBLIGATION_SCHEMA
     return value
 
 

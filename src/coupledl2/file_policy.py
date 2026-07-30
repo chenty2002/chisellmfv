@@ -35,7 +35,7 @@ SYSTEM_CACHE_DIRS: FrozenSet[str] = frozenset(
     }
 )
 BUILD_OUTPUT_DIRS: FrozenSet[str] = frozenset(
-    {"out", "target", "build", "dist", ".cache", "repair_loop"}
+    {"out", "target", "build", "dist", ".cache"}
 )
 GENERATED_DIRS: FrozenSet[str] = frozenset({"generated"})
 CONTROL_DIRS: FrozenSet[str] = frozenset(

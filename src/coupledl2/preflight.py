@@ -51,7 +51,7 @@ class CoupledL2Preflight:
         )
         prepared = prepare_profile_surface(self.workspace.case_workspace, catalog)
         preprocess = {
-            "schema_version": "coupledl2_preprocess.v3",
+            "schema_version": "coupledl2_preprocess",
             "success": True,
             "property_profile": self.workspace.config.property_profile,
             "prepared_surface": {
@@ -127,7 +127,7 @@ class CoupledL2Preflight:
             and gate["top_policy_satisfied"]
         )
         result = {
-            "schema_version": "coupledl2_preflight.v2",
+            "schema_version": "coupledl2_preflight",
             "success": success,
             "termination_reason": _termination_reason(gate),
             "gate": gate,
@@ -168,7 +168,7 @@ def _source_manifest(case_workspace: Path) -> Dict[str, Any]:
             "size": len(data),
             "sha256": hashlib.sha256(data).hexdigest(),
         })
-    return {"schema_version": "source_manifest.v1", "files": files}
+    return {"schema_version": "source_manifest", "files": files}
 
 
 def _merge_baseline_inventory(
@@ -192,7 +192,7 @@ def _merge_baseline_inventory(
     entries = [*after.get("entries", []), *disabled]
     entries.sort(key=lambda item: (item["source_path"], item["line"], item["kind"]))
     return {
-        "schema_version": "baseline_assertion_inventory.v1",
+        "schema_version": "baseline_assertion_inventory",
         "entries": entries,
         "entry_count": len(entries),
         "preserved_count": sum(item["policy"] == "preserved" for item in entries),
@@ -219,7 +219,7 @@ def _scan_generated_assertions(paths: Iterable[str]) -> Dict[str, Any]:
                     {"path": str(path), "line": line_no, "label": label}
                 )
     return {
-        "schema_version": "generated_assertion_scan.v1",
+        "schema_version": "generated_assertion_scan",
         "assertion_count": len(records),
         "assertions": records,
         "cl2_label_count": len(property_labels),

@@ -1,4 +1,4 @@
-"""Single frozen stage contract for the three-stage SpecFlow method."""
+"""Single stage contract for the continuously maintained SpecFlow method."""
 
 from __future__ import annotations
 
@@ -98,31 +98,18 @@ STAGE_SPECS: Tuple[StageSpec, ...] = (
     StageSpec(
         name="diagnose",
         ordinal=3,
-        execution_kind="conditional_diagnosis",
-        model_policy="conditional",
+        execution_kind="deterministic_diagnosis",
+        model_policy="forbidden",
         required_predecessor="compile_verify",
-        completion_gate="reviewed_final_verdict",
+        completion_gate="deterministic_final_verdict",
         artifact_contract=(
             "evidence_projection.json",
             "causal_graph_manifest.json",
             "causal_source_projection.json",
-            "causal_query_log.jsonl",
-            "model_calls.jsonl",
-            "candidate_attempts.jsonl",
-            "diagnosis_transcript_manifest.json",
-            "diagnosis_candidate.json",
-            "diagnosis_review_request.json",
-            "diagnosis_review.json",
             "root_cause_result.json",
             "source_ranking.json",
-            "revision_request.json",
             "final_verdict.json",
             "counterexample_analysis.md",
-        ),
-        allow_empty_artifacts=(
-            "causal_query_log.jsonl",
-            "model_calls.jsonl",
-            "candidate_attempts.jsonl",
         ),
     ),
 )

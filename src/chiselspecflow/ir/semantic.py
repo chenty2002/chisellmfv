@@ -1,11 +1,11 @@
-"""Independent chisel_semantic_index.v1 fail-closed validator."""
+"""Independent chisel_semantic_index fail-closed validator."""
 
 from __future__ import annotations
 
 import re
 from typing import Any, Dict, Mapping
 
-from ..config import SEMANTIC_INDEX_SCHEMA_VERSION
+from ..config import SEMANTIC_INDEX_SCHEMA
 
 
 class SemanticIRValidationError(ValueError):
@@ -47,7 +47,7 @@ _ROW_FIELDS = {
 def validate_semantic_index(value: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) != _INDEX_FIELDS:
         raise SemanticIRValidationError("malformed_semantic_index", "index fields differ")
-    if value.get("schema_version") != SEMANTIC_INDEX_SCHEMA_VERSION:
+    if value.get("schema_version") != SEMANTIC_INDEX_SCHEMA:
         raise SemanticIRValidationError("unsupported_schema", str(value.get("schema_version")))
     for field in ("project_id", "configuration_id", "top"):
         if not isinstance(value.get(field), str) or not value[field]:

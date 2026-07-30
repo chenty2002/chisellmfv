@@ -143,7 +143,7 @@ def validate_elaboration_certificate(value: Mapping[str, Any]) -> None:
         "generated_files",
         "property_identities",
     }
-    if set(value) != required or value.get("schema_version") != "elaboration_certificate.v1":
+    if set(value) != required or value.get("schema_version") != "elaboration_certificate":
         raise PropertyIdentityError("elaboration certificate has an invalid exact schema")
     identities = value.get("property_identities")
     if not isinstance(identities, list) or not identities:

@@ -38,10 +38,10 @@ def project_stage2_evidence(
     *,
     fst2vcd_argv: Optional[list[str]] = None,
 ) -> Dict[str, Any]:
-    """Build ``evidence_projection.v1`` from one completed Stage-2 directory."""
+    """Build ``evidence_projection`` from one completed Stage-2 directory."""
 
     run_dir = Path(run_dir).resolve()
-    stage2 = run_dir / "rounds" / f"{round_id:04d}" / "02_compile_verify"
+    stage2 = run_dir / "stages" / "02_compile_verify"
     manifest = _read_json(run_dir / "manifest.json")
     semantic = _read_json(run_dir / "indexes" / "chisel_semantic_index.json")
     project = _read_json(run_dir / "inputs" / "project_contract.json")
@@ -162,7 +162,7 @@ def project_stage2_evidence(
         else "incomplete"
     )
     return {
-        "schema_version": "evidence_projection.v1",
+        "schema_version": "evidence_projection",
         "round_id": round_id,
         "status": status,
         "identity": {
@@ -180,7 +180,7 @@ def project_stage2_evidence(
 
 def _load_certified_package(stage2: Path) -> tuple[Dict[str, Any], Path]:
     reference = _read_json(stage2 / "verification_package_ref.json")
-    if reference.get("schema_version") != "verification_package_ref.v1":
+    if reference.get("schema_version") != "verification_package_ref":
         raise TraceProjectionError("invalid verification package reference")
     source_run = Path(reference.get("source_run", "")).resolve()
     relative = Path(reference.get("path", ""))
@@ -195,7 +195,7 @@ def _load_certified_package(stage2: Path) -> tuple[Dict[str, Any], Path]:
         raise TraceProjectionError("verification package hash drifted")
     package = _read_json(package_path)
     if (
-        package.get("schema_version") != "verification_package.v1"
+        package.get("schema_version") != "verification_package"
         or package.get("package_id") != reference.get("package_id")
     ):
         raise TraceProjectionError("verification package identity mismatch")
@@ -297,7 +297,7 @@ def _build_observation_map(
                 }
             )
     return {
-        "schema_version": "observation_map.v1",
+        "schema_version": "observation_map",
         "verification_package_sha256": package_sha256,
         "semantic_index_sha256": semantic_index_sha256,
         "elaboration_certificate_sha256": certificate_sha256,

@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, Optional
 
 
 FORMAL_CONTRACT_ROOT = Path(__file__).with_name("property_assets") / "formal_contracts"
-FORMAL_CONTRACT_SCHEMA_VERSION = "formal_contract.v1"
+FORMAL_CONTRACT_SCHEMA = "formal_contract"
 TRACE_STATUSES = {"cex", "covered"}
 
 
@@ -195,7 +195,7 @@ def _validate_contract(value: Dict[str, Any], requested_id: str) -> None:
         "tool",
     }
     _exact_fields(value, fields, fields, "formal_contract")
-    if value["schema_version"] != FORMAL_CONTRACT_SCHEMA_VERSION:
+    if value["schema_version"] != FORMAL_CONTRACT_SCHEMA:
         raise FormalContractError("unsupported formal contract version")
     if value["formal_contract_id"] != requested_id:
         raise FormalContractError("formal contract id does not match filename")

@@ -40,16 +40,16 @@ class CompileVerifyStage:
         workspace = load_existing_workspace(run_dir)
         manifest = _read_json(workspace.manifest_path)
         _validate_run_integrity(workspace, manifest)
-        round_id = manifest.get("current_round")
+        round_id = 1
         replay = frozen_package_run is not None
         package_workspace = (
             load_existing_workspace(frozen_package_run) if replay else workspace
         )
         package_manifest = _read_json(package_workspace.manifest_path)
-        package_round = package_manifest.get("current_round")
+        package_round = 1
         if package_manifest.get("review_state") != "approved":
             raise SpecFlowRunnerError("compile_verify requires an approved review")
-        stage1 = package_workspace.stage_dir(package_round, "asset_authoring")
+        stage1 = package_workspace.stage_dir("asset_authoring")
         if validate_completed_stage(stage1, get_stage_spec("asset_authoring")) is None:
             raise SpecFlowRunnerError("asset_authoring completion or hashes are invalid")
         if replay:
@@ -59,7 +59,7 @@ class CompileVerifyStage:
                 package_workspace=package_workspace,
                 package_round=package_round,
             )
-        stage2 = workspace.stage_dir(round_id, "compile_verify")
+        stage2 = workspace.stage_dir("compile_verify")
         if any(stage2.iterdir()):
             raise SpecFlowRunnerError("compile_verify stage directory is immutable once written")
 
@@ -102,7 +102,7 @@ class CompileVerifyStage:
         applicability_path = stage2 / "package_applicability.json"
         write_json(applicability_path, applicability)
         verification_package_ref = {
-            "schema_version": "verification_package_ref.v1",
+            "schema_version": "verification_package_ref",
             "mode": "frozen_replay" if replay else "authored_run",
             "package_id": package["package_id"],
             "source_run": str(package_workspace.run_dir),
@@ -176,7 +176,6 @@ class CompileVerifyStage:
             },
             source_state=manifest,
         )
-        _update_round_state(workspace, round_id, "compile_verify_complete")
         return result
 
 
@@ -234,8 +233,8 @@ def _preserve_frozen_package_evidence(
     does not depend only on an external source-run path.
     """
 
-    source_stage1 = package_workspace.stage_dir(package_round, "asset_authoring")
-    target_stage1 = workspace.stage_dir(round_id, "asset_authoring")
+    source_stage1 = package_workspace.stage_dir("asset_authoring")
+    target_stage1 = workspace.stage_dir("asset_authoring")
     if any(target_stage1.iterdir()):
         raise SpecFlowRunnerError(
             "frozen replay asset_authoring evidence directory is not empty"
@@ -259,7 +258,7 @@ def _preserve_frozen_package_evidence(
     write_json(
         target_stage1 / "frozen_package_provenance.json",
         {
-            "schema_version": "frozen_package_provenance.v1",
+            "schema_version": "frozen_package_provenance",
             "status": "preserved",
             "authority": "source_run_external_review",
             "model_calls": 0,
@@ -270,15 +269,6 @@ def _preserve_frozen_package_evidence(
             "review_record_sha256": review_sha256,
         },
     )
-
-
-def _update_round_state(
-    workspace: SpecFlowWorkspace, round_id: int, state: str
-) -> None:
-    round_path = workspace.round_dir(round_id) / "round.json"
-    value = _read_json(round_path)
-    value["state"] = state
-    write_json(round_path, value)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -301,7 +291,7 @@ def _validate_trace_manifest(
     if set(manifest) != {"schema_version", "operation_plan_sha256", "traces"}:
         raise SpecFlowRunnerError("trace manifest has an invalid exact schema")
     if (
-        manifest.get("schema_version") != "trace_manifest.v1"
+        manifest.get("schema_version") != "trace_manifest"
         or manifest.get("operation_plan_sha256") != file_sha256(operation_plan_path)
         or not isinstance(manifest.get("traces"), list)
     ):

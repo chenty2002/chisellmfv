@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping
 
 
-SCHEMA_VERSION = "specflow_property_decomposition.v1"
+SCHEMA_VERSION = "specflow_property_decomposition"
 _ROW_FIELDS = {
     "expected_property_id",
     "decomposition_kind",
@@ -228,7 +228,7 @@ def build_authoring_scope(
         ]
         require_complete = False
     return {
-        "schema_version": "specflow_authoring_scope.v1",
+        "schema_version": "specflow_authoring_scope",
         "specification_id": public_spec["specification_id"],
         "spec_sha256": public_spec["spec_sha256"],
         "expected_property_ids": list(selected),

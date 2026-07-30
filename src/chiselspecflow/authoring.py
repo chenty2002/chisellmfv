@@ -20,10 +20,10 @@ from .authoring_tools import (
     obligation_tools,
 )
 from .config import (
-    AUTHORING_CANDIDATES_SCHEMA_VERSION,
-    CANDIDATE_ASSET_DELTA_SCHEMA_VERSION,
-    REVIEW_REQUEST_SCHEMA_VERSION,
-    STAGE_INPUTS_SCHEMA_VERSION,
+    AUTHORING_CANDIDATES_SCHEMA,
+    CANDIDATE_ASSET_DELTA_SCHEMA,
+    REVIEW_REQUEST_SCHEMA,
+    STAGE_INPUTS_SCHEMA,
 )
 from .ir.binding import BindingValidationError, validate_binding
 from .ir.monitor import MonitorValidationError, validate_monitor
@@ -39,7 +39,7 @@ class AuthoringModel(Protocol):
 
 
 class AuthoringError(ValueError):
-    """Raised for a bounded protocol/validation failure after one repair."""
+    """Raised when the single authoring submission is invalid."""
 
     def __init__(self, code: str, message: str):
         self.code = code
@@ -65,8 +65,8 @@ def run_asset_authoring(
     manifest = _read_json(workspace.manifest_path)
     if manifest.get("preflight_status") != "index_ready":
         raise AuthoringError("preflight_incomplete", "semantic index is not frozen")
-    round_id = manifest["current_round"]
-    stage_dir = workspace.stage_dir(round_id, "asset_authoring")
+    round_id = 1
+    stage_dir = workspace.stage_dir("asset_authoring")
     if (stage_dir / "stage_result.json").exists():
         raise FileExistsError("asset_authoring already has a stage outcome")
     semantic = validate_semantic_index(
@@ -78,14 +78,13 @@ def run_asset_authoring(
     )
     authoring_scope = _read_json(workspace.inputs_dir / "authoring_scope.json")
     if (
-        authoring_scope.get("schema_version") != "specflow_authoring_scope.v1"
+        authoring_scope.get("schema_version") != "specflow_authoring_scope"
         or authoring_scope.get("specification_id") != public_spec["specification_id"]
         or authoring_scope.get("spec_sha256") != public_spec["spec_sha256"]
     ):
         raise AuthoringError("authoring_scope_invalid", "public task scope identity mismatch")
     project = _read_json(workspace.inputs_dir / "project_contract.json")
     configuration = _read_json(workspace.inputs_dir / "configuration.json")
-    revision_context = _load_revision_context(workspace, round_id)
     confirmed = [
         row for row in semantic.get("objects", [])
         if row.get("fact_status") == "elaboration_confirmed"
@@ -105,7 +104,7 @@ def run_asset_authoring(
         authoring_scope["clause_ids"],
     )
     stage_inputs = {
-        "schema_version": STAGE_INPUTS_SCHEMA_VERSION,
+        "schema_version": STAGE_INPUTS_SCHEMA,
         "round_id": round_id,
         "project": {
             "project_id": project["project_id"],
@@ -129,7 +128,6 @@ def run_asset_authoring(
         "asset_library": assets.snapshot(),
         "input_hashes": manifest["input_hashes"],
         "index_hashes": manifest["index_hashes"],
-        "revision_context": revision_context,
     }
     _write_json(stage_dir / "stage_inputs.json", stage_inputs)
     calls = 0
@@ -243,14 +241,6 @@ def run_asset_authoring(
         )
         calls += used
         call_refs += refs
-        if revision_context["status"] == "required":
-            _validate_revision_scope(
-                workspace,
-                revision_context,
-                raw_obligations,
-                raw_bindings,
-                raw_monitors,
-            )
     except AuthoringError as exc:
         calls = len(call_audit)
         _write_jsonl(_model_log_path(workspace, round_id), call_audit)
@@ -260,7 +250,7 @@ def run_asset_authoring(
         _write_json(
             stage_dir / "authoring_candidates.json",
             {
-                "schema_version": AUTHORING_CANDIDATES_SCHEMA_VERSION,
+                "schema_version": AUTHORING_CANDIDATES_SCHEMA,
                 "status": "unsupported" if exc.code != "spec_ambiguity" else "ambiguous",
                 "obligations": locals().get("raw_obligations", []),
                 "bindings": locals().get("raw_bindings", []),
@@ -282,7 +272,7 @@ def run_asset_authoring(
             },
             source_state=manifest,
         )
-        _set_review_state(workspace, "not_applicable", "authoring_unsupported")
+        _set_review_state(workspace, "not_applicable")
         return AuthoringResult(
             "ambiguous" if exc.code == "spec_ambiguity" else "unsupported",
             stage_dir,
@@ -291,7 +281,7 @@ def run_asset_authoring(
         )
 
     candidates = {
-        "schema_version": AUTHORING_CANDIDATES_SCHEMA_VERSION,
+        "schema_version": AUTHORING_CANDIDATES_SCHEMA,
         "status": "candidate",
         "obligations": raw_obligations,
         "bindings": raw_bindings,
@@ -303,7 +293,7 @@ def run_asset_authoring(
     _write_jsonl(_candidate_attempt_log_path(workspace, round_id), candidate_attempts)
     _write_json(stage_dir / "authoring_candidates.json", candidates)
     delta = {
-        "schema_version": CANDIDATE_ASSET_DELTA_SCHEMA_VERSION,
+        "schema_version": CANDIDATE_ASSET_DELTA_SCHEMA,
         "base_asset_library_sha256": canonical_sha256(stage_inputs["asset_library"]),
         "new_run_local_ids": sorted(
             obligation_ids
@@ -327,7 +317,7 @@ def run_asset_authoring(
         },
         source_state=manifest,
     )
-    _set_review_state(workspace, "awaiting_review", "awaiting_review")
+    _set_review_state(workspace, "awaiting_review")
     return AuthoringResult("awaiting_review", stage_dir, stage_dir / "review_request.json", calls)
 
 
@@ -341,122 +331,84 @@ def _request_candidates(
     audit_log: Optional[list[Dict[str, Any]]] = None,
     candidate_attempt_log: Optional[list[Dict[str, Any]]] = None,
 ) -> tuple[list[Dict[str, Any]], int, list[str]]:
-    messages = [
+    response = model.chat_with_tools(
+        messages=[
         {
             "role": "system",
             "content": (
-                "You are a bounded candidate generator. Use exactly the required named tool. "
+                "You are a one-shot candidate generator. Use exactly the required named tool. "
                 "Submit only IDs and typed IR from the supplied context. Never emit Scala, file edits, review, or approval."
             ),
         },
         {"role": "user", "content": json.dumps(context, sort_keys=True)},
-    ]
-    refs = []
-    last_error = ""
-    for attempt in range(2):
-        if attempt:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "One bounded protocol repair is allowed. Correct this deterministic error: " + last_error,
-                }
-            )
-        response = model.chat_with_tools(
-            messages=messages,
-            tools=tools,
-            max_tokens=4096,
-            temperature=0.0,
-            tool_choice="required",
-            enable_thinking=False,
-            parallel_tool_calls=False,
-            usage_metadata={"stage": "asset_authoring", "task_type": "candidate_authoring"},
+        ],
+        tools=tools,
+        max_tokens=4096,
+        temperature=0.0,
+        tool_choice="required",
+        enable_thinking=False,
+        parallel_tool_calls=False,
+        usage_metadata={"stage": "asset_authoring", "task_type": "candidate_authoring"},
+    )
+    audit = {
+        "schema_version": "specflow_model_call",
+        "sequence": len(audit_log or []) + 1,
+        "stage": "asset_authoring",
+        "expected_tool": expected_tool,
+        "parallel_tool_calls": False,
+        "thinking_enabled": False,
+        "response_type": response.get("type"),
+        "finish_reason": response.get("finish_reason"),
+    }
+    if audit_log is not None:
+        audit_log.append(audit)
+    calls = response.get("function_calls") if response.get("type") == "function_calls" else None
+    if not isinstance(calls, list) or len(calls) != 1:
+        audit["outcome"] = "invalid_submission"
+        raise AuthoringError("invalid_model_submission", "exactly one function call is required")
+    call = calls[0]
+    call_ref = str(call.get("id") or expected_tool)
+    audit["call_id"] = call_ref
+    audit["returned_tool"] = call.get("name")
+    arguments = call.get("arguments")
+    if call.get("name") == AMBIGUITY_TOOL_NAME:
+        if not isinstance(arguments, Mapping) or set(arguments) != {"clause_ids", "reason"}:
+            audit["outcome"] = "invalid_submission"
+            raise AuthoringError("invalid_model_submission", "malformed ambiguity report")
+        audit["outcome"] = "spec_ambiguity"
+        raise AuthoringError("spec_ambiguity", str(arguments["reason"]))
+    if call.get("name") != expected_tool:
+        audit["outcome"] = "invalid_submission"
+        raise AuthoringError("invalid_model_submission", f"unexpected tool {call.get('name')!r}")
+    if not isinstance(arguments, Mapping) or set(arguments) != {"candidates"} or not isinstance(arguments["candidates"], list):
+        audit["outcome"] = "invalid_submission"
+        raise AuthoringError("invalid_model_submission", "tool arguments must contain only candidates[]")
+    if _contains_forbidden_authoring_content(arguments):
+        audit["outcome"] = "invalid_submission"
+        raise AuthoringError("invalid_model_submission", "forbidden authoring content")
+    audit["submitted_candidate_count"] = len(arguments["candidates"])
+    audit["submitted_candidates_sha256"] = canonical_sha256(
+        {"candidates": arguments["candidates"]}
+    )
+    if candidate_attempt_log is not None:
+        candidate_attempt_log.append(
+            {
+                "schema_version": "specflow_candidate_submission",
+                "expected_tool": expected_tool,
+                "call_id": call_ref,
+                "candidates_sha256": audit["submitted_candidates_sha256"],
+                "candidates": arguments["candidates"],
+            }
         )
-        audit = {
-            "schema_version": "specflow_model_call.v1",
-            "sequence": len(audit_log or []) + 1,
-            "stage": "asset_authoring",
-            "expected_tool": expected_tool,
-            "attempt": attempt + 1,
-            "parallel_tool_calls": False,
-            "thinking_enabled": False,
-            "response_type": response.get("type"),
-            "finish_reason": response.get("finish_reason"),
-        }
-        if response.get("type") == "text":
-            response_text = str(response.get("content", ""))
-            audit["response_text_bytes"] = len(response_text.encode("utf-8"))
-            audit["response_text_sha256"] = hashlib.sha256(
-                response_text.encode("utf-8")
-            ).hexdigest()
-            parse_errors = response.get("tool_parse_errors")
-            if isinstance(parse_errors, list) and parse_errors:
-                audit["tool_parse_error_count"] = len(parse_errors)
-                audit["tool_parse_errors_sha256"] = canonical_sha256(
-                    {"errors": parse_errors}
-                )
-        if audit_log is not None:
-            audit_log.append(audit)
-        calls = response.get("function_calls") if response.get("type") == "function_calls" else None
-        if not isinstance(calls, list) or len(calls) != 1:
-            last_error = "exactly one function call is required"
-            audit["outcome"] = "protocol_repair"
-            audit["error"] = last_error
-            continue
-        call = calls[0]
-        refs.append(str(call.get("id") or f"{expected_tool}:{attempt + 1}"))
-        audit["call_id"] = refs[-1]
-        audit["returned_tool"] = call.get("name")
-        if call.get("name") == AMBIGUITY_TOOL_NAME:
-            arguments = call.get("arguments")
-            if not isinstance(arguments, Mapping) or set(arguments) != {"clause_ids", "reason"}:
-                last_error = "malformed report_spec_ambiguity arguments"
-                audit["outcome"] = "protocol_repair"
-                audit["error"] = last_error
-                continue
-            audit["outcome"] = "spec_ambiguity"
-            raise AuthoringError("spec_ambiguity", str(arguments["reason"]))
-        if call.get("name") != expected_tool:
-            last_error = f"unexpected tool {call.get('name')!r}"
-            audit["outcome"] = "protocol_repair"
-            audit["error"] = last_error
-            continue
-        arguments = call.get("arguments")
-        if not isinstance(arguments, Mapping) or set(arguments) != {"candidates"} or not isinstance(arguments["candidates"], list):
-            last_error = "tool arguments must contain only candidates[]"
-            audit["outcome"] = "protocol_repair"
-            audit["error"] = last_error
-            continue
-        audit["submitted_candidate_count"] = len(arguments["candidates"])
-        audit["submitted_candidates_sha256"] = canonical_sha256(
-            {"candidates": arguments["candidates"]}
-        )
-        if candidate_attempt_log is not None:
-            candidate_attempt_log.append(
-                {
-                    "schema_version": "specflow_candidate_attempt.v1",
-                    "sequence": len(candidate_attempt_log) + 1,
-                    "expected_tool": expected_tool,
-                    "attempt": attempt + 1,
-                    "call_id": refs[-1],
-                    "candidates_sha256": audit["submitted_candidates_sha256"],
-                    "candidates": arguments["candidates"],
-                }
-            )
-        if _contains_forbidden_authoring_content(arguments):
-            last_error = "raw Scala, approval, and file-write fields are forbidden"
-            audit["outcome"] = "protocol_repair"
-            audit["error"] = last_error
-            continue
-        try:
-            validated = validator(arguments["candidates"])
-            audit["outcome"] = "accepted_candidates"
-            audit["candidate_count"] = len(validated)
-            return validated, attempt + 1, refs
-        except (ObligationValidationError, BindingValidationError, MonitorValidationError, AuthoringError) as exc:
-            last_error = str(exc)
-            audit["outcome"] = "validation_repair"
-            audit["error"] = last_error
-    raise AuthoringError("candidate_repair_exhausted", last_error)
+    try:
+        validated = validator(arguments["candidates"])
+    except (ObligationValidationError, BindingValidationError, MonitorValidationError) as exc:
+        audit["outcome"] = "invalid_submission"
+        audit["error"] = str(exc)
+        raise AuthoringError("invalid_model_submission", str(exc)) from exc
+    audit["outcome"] = "accepted_candidates"
+    audit["candidate_count"] = len(validated)
+    return validated, 1, [call_ref]
 
 
 def _validate_obligations(
@@ -592,7 +544,7 @@ def _build_review_request(
         + [row["monitor_id"] for row in candidates["monitors"]]
     )
     return {
-        "schema_version": REVIEW_REQUEST_SCHEMA_VERSION,
+        "schema_version": REVIEW_REQUEST_SCHEMA,
         "round_id": round_id,
         "reviewed_hashes_required": artifacts,
         "semantic_intent_ids": intent_ids,
@@ -637,118 +589,10 @@ def _contains_forbidden_authoring_content(value: Any) -> bool:
     return False
 
 
-def _load_revision_context(
-    workspace: SpecFlowWorkspace, round_id: int
-) -> Dict[str, Any]:
-    if round_id == 1:
-        return {
-            "schema_version": "revision_context.v1",
-            "status": "not_required",
-            "reason": "initial_round",
-        }
-    round_manifest = _read_json(workspace.round_dir(round_id) / "round.json")
-    parent = round_manifest.get("parent_round")
-    digest = round_manifest.get("revision_request_sha256")
-    if not isinstance(parent, int) or parent >= round_id or not isinstance(digest, str):
-        raise AuthoringError("revision_identity_invalid", "child round identity is malformed")
-    revision_path = workspace.stage_dir(parent, "diagnose") / "revision_request.json"
-    if not revision_path.is_file() or file_sha256(revision_path) != digest:
-        raise AuthoringError("revision_identity_invalid", "parent revision request hash drifted")
-    revision = _read_json(revision_path)
-    if (
-        revision.get("schema_version") != "revision_request.v1"
-        or revision.get("status") != "required"
-        or revision.get("parent_round") != parent
-    ):
-        raise AuthoringError("revision_identity_invalid", "parent revision request is not actionable")
-    return {
-        "schema_version": "revision_context.v1",
-        "status": "required",
-        "parent_round": parent,
-        "revision_request_sha256": digest,
-        "revision_layer": revision["revision_layer"],
-        "evidence_refs": revision["evidence_refs"],
-        "allowed_change_scope": revision["allowed_change_scope"],
-        "forbidden_change_scope": revision["forbidden_change_scope"],
-    }
-
-
-def _validate_revision_scope(
-    workspace: SpecFlowWorkspace,
-    revision: Mapping[str, Any],
-    obligations: list[Mapping[str, Any]],
-    bindings: list[Mapping[str, Any]],
-    monitors: list[Mapping[str, Any]],
-) -> None:
-    parent = revision["parent_round"]
-    reference = _read_json(
-        workspace.stage_dir(parent, "compile_verify") / "verification_package_ref.json"
-    )
-    source_run = Path(reference["source_run"]).resolve()
-    relative = Path(reference["path"])
-    if relative.is_absolute() or ".." in relative.parts:
-        raise AuthoringError("revision_identity_invalid", "parent package path is unsafe")
-    package_path = (source_run / relative).resolve()
-    try:
-        package_path.relative_to(source_run)
-    except ValueError as exc:
-        raise AuthoringError("revision_identity_invalid", "parent package path escapes") from exc
-    if not package_path.is_file() or file_sha256(package_path) != reference.get("sha256"):
-        raise AuthoringError("revision_identity_invalid", "parent package hash drifted")
-    parent_package = _read_json(package_path)
-    layer = revision["revision_layer"]
-    changed = {
-        "obligation": _revision_rows(obligations, "obligation")
-        != _revision_rows(parent_package["obligations"], "obligation"),
-        "binding": _revision_rows(bindings, "binding")
-        != _revision_rows(parent_package["bindings"], "binding"),
-        "monitor": _revision_rows(monitors, "monitor")
-        != _revision_rows(parent_package["monitors"], "monitor"),
-    }
-    allowed = {
-        "obligation": {"obligation", "monitor"},
-        "assumption": {"obligation", "monitor"},
-        "binding": {"binding", "monitor"},
-        "monitor": {"monitor"},
-    }.get(layer)
-    if allowed is None:
-        raise AuthoringError("revision_scope_invalid", f"unsupported revision layer: {layer}")
-    forbidden_changes = sorted(name for name, differs in changed.items() if differs and name not in allowed)
-    if forbidden_changes:
-        raise AuthoringError(
-            "revision_scope_violation",
-            "candidate changes outside typed scope: " + ",".join(forbidden_changes),
-        )
-    if not any(changed[name] for name in allowed):
-        raise AuthoringError("revision_noop", "revision candidate does not change an allowed layer")
-
-
-def _revision_rows(rows: list[Mapping[str, Any]], layer: str) -> str:
-    normalized = []
-    for source in rows:
-        row = json.loads(json.dumps(source, sort_keys=True))
-        row.pop("configuration_domain", None)
-        if layer == "obligation":
-            row.pop("authoring_provenance", None)
-        elif layer == "binding":
-            row.pop("rationale", None)
-            row.pop("rejected_alternatives", None)
-            row.pop("review_state", None)
-            row.pop("validation_errors", None)
-            if isinstance(row.get("compatibility"), dict):
-                row["compatibility"].pop("configuration", None)
-        normalized.append(row)
-    return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
-
-
-def _set_review_state(workspace: SpecFlowWorkspace, review_state: str, round_state: str) -> None:
+def _set_review_state(workspace: SpecFlowWorkspace, review_state: str) -> None:
     manifest = _read_json(workspace.manifest_path)
     manifest["review_state"] = review_state
     _write_json(workspace.manifest_path, manifest)
-    round_path = workspace.round_dir(manifest["current_round"]) / "round.json"
-    round_manifest = _read_json(round_path)
-    round_manifest["state"] = round_state
-    _write_json(round_path, round_manifest)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -775,18 +619,10 @@ def _write_jsonl(path: Path, rows: list[Mapping[str, Any]]) -> None:
 
 
 def _model_log_path(workspace: SpecFlowWorkspace, round_id: int) -> Path:
-    """Keep the round-1 name stable while allowing immutable revision logs."""
-
-    name = "model_calls.jsonl" if round_id == 1 else f"model_calls.round-{round_id:04d}.jsonl"
-    return workspace.logs_dir / name
+    return workspace.logs_dir / "model_calls.jsonl"
 
 
 def _candidate_attempt_log_path(
     workspace: SpecFlowWorkspace, round_id: int
 ) -> Path:
-    name = (
-        "candidate_attempts.jsonl"
-        if round_id == 1
-        else f"candidate_attempts.round-{round_id:04d}.jsonl"
-    )
-    return workspace.logs_dir / name
+    return workspace.logs_dir / "candidate_submission.jsonl"

@@ -1,4 +1,4 @@
-"""Frozen input contracts and strict Iteration-1 validators."""
+"""Frozen input contracts and strict validators."""
 
 from __future__ import annotations
 
@@ -11,73 +11,65 @@ from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 
-PROJECT_SCHEMA_VERSION = "specflow_project.v1"
-PUBLIC_SPEC_PACKAGE_SCHEMA_VERSION = "public_spec_package.v1"
-PROPERTY_DECOMPOSITION_SCHEMA_VERSION = "specflow_property_decomposition.v1"
-RUN_MANIFEST_SCHEMA_VERSION = "specflow_run_manifest.v1"
-MODEL_VIEW_MANIFEST_SCHEMA_VERSION = "model_view_manifest.v1"
-OBLIGATION_SCHEMA_VERSION = "verification_obligations.v1"
-SEMANTIC_INDEX_SCHEMA_VERSION = "chisel_semantic_index.v1"
-BINDING_SCHEMA_VERSION = "chisel_bindings.v1"
-MONITOR_SCHEMA_VERSION = "chisel_monitors.v1"
-EXPRESSION_SCHEMA_VERSION = "expression_ir.v1"
-REVIEW_RECORD_SCHEMA_VERSION = "review_record.v1"
-STAGE_INPUTS_SCHEMA_VERSION = "specflow_stage_inputs.v1"
-AUTHORING_CANDIDATES_SCHEMA_VERSION = "authoring_candidates.v1"
-CANDIDATE_ASSET_DELTA_SCHEMA_VERSION = "candidate_asset_delta.v1"
-REVIEW_REQUEST_SCHEMA_VERSION = "review_request.v1"
-VERIFICATION_PACKAGE_SCHEMA_VERSION = "verification_package.v1"
-OVERLAY_MANIFEST_SCHEMA_VERSION = "overlay_manifest.v1"
-SOURCE_ASSERTION_DELTA_SCHEMA_VERSION = "source_assertion_delta.v1"
-ELABORATION_CERTIFICATE_SCHEMA_VERSION = "elaboration_certificate.v1"
-OPERATION_PLAN_SCHEMA_VERSION = "verification_operation_plan.v2"
-PROPERTY_RESULT_MAP_SCHEMA_VERSION = "property_result_map.v5"
-SEMANTIC_EVIDENCE_SCHEMA_VERSION = "semantic_evidence.v3"
-TRACE_MANIFEST_SCHEMA_VERSION = "trace_manifest.v1"
-EVIDENCE_PROJECTION_SCHEMA_VERSION = "evidence_projection.v1"
-CAUSAL_GRAPH_MANIFEST_SCHEMA_VERSION = "causal_graph_manifest.v1"
-CAUSAL_SOURCE_PROJECTION_SCHEMA_VERSION = "causal_source_projection.v1"
-DIAGNOSIS_TRANSCRIPT_SCHEMA_VERSION = "diagnosis_transcript_manifest.v1"
-DIAGNOSIS_CANDIDATE_SCHEMA_VERSION = "diagnosis_candidate.v2"
-DIAGNOSIS_REVIEW_REQUEST_SCHEMA_VERSION = "diagnosis_review_request.v2"
-ROOT_CAUSE_RESULT_SCHEMA_VERSION = "root_cause_result.v1"
-FINAL_VERDICT_SCHEMA_VERSION = "final_verdict.v1"
-REVISION_REQUEST_SCHEMA_VERSION = "revision_request.v1"
+PROJECT_SCHEMA = "specflow_project"
+PUBLIC_SPEC_PACKAGE_SCHEMA = "public_spec_package"
+PROPERTY_DECOMPOSITION_SCHEMA = "specflow_property_decomposition"
+RUN_MANIFEST_SCHEMA = "specflow_run_manifest"
+MODEL_VIEW_MANIFEST_SCHEMA = "model_view_manifest"
+OBLIGATION_SCHEMA = "verification_obligations"
+SEMANTIC_INDEX_SCHEMA = "chisel_semantic_index"
+BINDING_SCHEMA = "chisel_bindings"
+MONITOR_SCHEMA = "chisel_monitors"
+EXPRESSION_SCHEMA = "expression_ir"
+REVIEW_RECORD_SCHEMA = "review_record"
+STAGE_INPUTS_SCHEMA = "specflow_stage_inputs"
+AUTHORING_CANDIDATES_SCHEMA = "authoring_candidates"
+CANDIDATE_ASSET_DELTA_SCHEMA = "candidate_asset_delta"
+REVIEW_REQUEST_SCHEMA = "review_request"
+VERIFICATION_PACKAGE_SCHEMA = "verification_package"
+OVERLAY_MANIFEST_SCHEMA = "overlay_manifest"
+SOURCE_ASSERTION_DELTA_SCHEMA = "source_assertion_delta"
+ELABORATION_CERTIFICATE_SCHEMA = "elaboration_certificate"
+OPERATION_PLAN_SCHEMA = "verification_operation_plan"
+PROPERTY_RESULT_MAP_SCHEMA = "property_result_map"
+SEMANTIC_EVIDENCE_SCHEMA = "semantic_evidence"
+TRACE_MANIFEST_SCHEMA = "trace_manifest"
+EVIDENCE_PROJECTION_SCHEMA = "evidence_projection"
+CAUSAL_GRAPH_MANIFEST_SCHEMA = "causal_graph_manifest"
+CAUSAL_SOURCE_PROJECTION_SCHEMA = "causal_source_projection"
+ROOT_CAUSE_RESULT_SCHEMA = "root_cause_result"
+FINAL_VERDICT_SCHEMA = "final_verdict"
 
-SCHEMA_VERSIONS: Mapping[str, str] = MappingProxyType(
+SCHEMAS: Mapping[str, str] = MappingProxyType(
     {
-        "project": PROJECT_SCHEMA_VERSION,
-        "public_spec_package": PUBLIC_SPEC_PACKAGE_SCHEMA_VERSION,
-        "property_decomposition": PROPERTY_DECOMPOSITION_SCHEMA_VERSION,
-        "run_manifest": RUN_MANIFEST_SCHEMA_VERSION,
-        "model_view_manifest": MODEL_VIEW_MANIFEST_SCHEMA_VERSION,
-        "obligations": OBLIGATION_SCHEMA_VERSION,
-        "semantic_index": SEMANTIC_INDEX_SCHEMA_VERSION,
-        "bindings": BINDING_SCHEMA_VERSION,
-        "monitors": MONITOR_SCHEMA_VERSION,
-        "expression": EXPRESSION_SCHEMA_VERSION,
-        "review_record": REVIEW_RECORD_SCHEMA_VERSION,
-        "stage_inputs": STAGE_INPUTS_SCHEMA_VERSION,
-        "authoring_candidates": AUTHORING_CANDIDATES_SCHEMA_VERSION,
-        "candidate_asset_delta": CANDIDATE_ASSET_DELTA_SCHEMA_VERSION,
-        "review_request": REVIEW_REQUEST_SCHEMA_VERSION,
-        "verification_package": VERIFICATION_PACKAGE_SCHEMA_VERSION,
-        "overlay_manifest": OVERLAY_MANIFEST_SCHEMA_VERSION,
-        "source_assertion_delta": SOURCE_ASSERTION_DELTA_SCHEMA_VERSION,
-        "elaboration_certificate": ELABORATION_CERTIFICATE_SCHEMA_VERSION,
-        "operation_plan": OPERATION_PLAN_SCHEMA_VERSION,
-        "property_result_map": PROPERTY_RESULT_MAP_SCHEMA_VERSION,
-        "semantic_evidence": SEMANTIC_EVIDENCE_SCHEMA_VERSION,
-        "trace_manifest": TRACE_MANIFEST_SCHEMA_VERSION,
-        "evidence_projection": EVIDENCE_PROJECTION_SCHEMA_VERSION,
-        "causal_graph_manifest": CAUSAL_GRAPH_MANIFEST_SCHEMA_VERSION,
-        "causal_source_projection": CAUSAL_SOURCE_PROJECTION_SCHEMA_VERSION,
-        "diagnosis_transcript": DIAGNOSIS_TRANSCRIPT_SCHEMA_VERSION,
-        "diagnosis_candidate": DIAGNOSIS_CANDIDATE_SCHEMA_VERSION,
-        "diagnosis_review_request": DIAGNOSIS_REVIEW_REQUEST_SCHEMA_VERSION,
-        "root_cause_result": ROOT_CAUSE_RESULT_SCHEMA_VERSION,
-        "final_verdict": FINAL_VERDICT_SCHEMA_VERSION,
-        "revision_request": REVISION_REQUEST_SCHEMA_VERSION,
+        "project": PROJECT_SCHEMA,
+        "public_spec_package": PUBLIC_SPEC_PACKAGE_SCHEMA,
+        "property_decomposition": PROPERTY_DECOMPOSITION_SCHEMA,
+        "run_manifest": RUN_MANIFEST_SCHEMA,
+        "model_view_manifest": MODEL_VIEW_MANIFEST_SCHEMA,
+        "obligations": OBLIGATION_SCHEMA,
+        "semantic_index": SEMANTIC_INDEX_SCHEMA,
+        "bindings": BINDING_SCHEMA,
+        "monitors": MONITOR_SCHEMA,
+        "expression": EXPRESSION_SCHEMA,
+        "review_record": REVIEW_RECORD_SCHEMA,
+        "stage_inputs": STAGE_INPUTS_SCHEMA,
+        "authoring_candidates": AUTHORING_CANDIDATES_SCHEMA,
+        "candidate_asset_delta": CANDIDATE_ASSET_DELTA_SCHEMA,
+        "review_request": REVIEW_REQUEST_SCHEMA,
+        "verification_package": VERIFICATION_PACKAGE_SCHEMA,
+        "overlay_manifest": OVERLAY_MANIFEST_SCHEMA,
+        "source_assertion_delta": SOURCE_ASSERTION_DELTA_SCHEMA,
+        "elaboration_certificate": ELABORATION_CERTIFICATE_SCHEMA,
+        "operation_plan": OPERATION_PLAN_SCHEMA,
+        "property_result_map": PROPERTY_RESULT_MAP_SCHEMA,
+        "semantic_evidence": SEMANTIC_EVIDENCE_SCHEMA,
+        "trace_manifest": TRACE_MANIFEST_SCHEMA,
+        "evidence_projection": EVIDENCE_PROJECTION_SCHEMA,
+        "causal_graph_manifest": CAUSAL_GRAPH_MANIFEST_SCHEMA,
+        "causal_source_projection": CAUSAL_SOURCE_PROJECTION_SCHEMA,
+        "root_cause_result": ROOT_CAUSE_RESULT_SCHEMA,
+        "final_verdict": FINAL_VERDICT_SCHEMA,
     }
 )
 
@@ -199,9 +191,6 @@ _DIAGNOSIS_FIELDS = {
     "max_depth",
     "max_nodes",
     "random_seed",
-    "max_model_calls",
-    "max_evidence_queries",
-    "max_source_context_lines",
 }
 _CONFIG_FIELDS = {"schema_version", "configuration_id", "parameters"}
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -211,7 +200,7 @@ def load_project_contract(path: Path) -> ProjectContract:
     path = Path(path).resolve()
     value = _read_json_object(path, "project contract")
     _require_exact_fields(value, _PROJECT_FIELDS, "project contract")
-    if value["schema_version"] != PROJECT_SCHEMA_VERSION:
+    if value["schema_version"] != PROJECT_SCHEMA:
         raise SpecFlowConfigError("unsupported project contract schema version")
     project_id = _safe_id(value["project_id"], "project_id")
     repository_root = _find_repository_root(path.parent)
@@ -300,7 +289,7 @@ def load_project_contract(path: Path) -> ProjectContract:
     build = _object(value["build"], "build")
     _require_exact_fields(build, _BUILD_FIELDS, "build")
     if build["kind"] != "sbt":
-        raise SpecFlowConfigError("Iteration 1 supports only an sbt build")
+        raise SpecFlowConfigError("SpecFlow supports only an sbt build")
     _validate_argv(build["compile_argv"], "build.compile_argv")
     _safe_relative(build["overlay_source_root"], "build.overlay_source_root")
     _nonempty_string(build["elaborate_main"], "build.elaborate_main")
@@ -338,7 +327,7 @@ def load_project_contract(path: Path) -> ProjectContract:
     if not isinstance(formal["reset_active_high"], bool):
         raise SpecFlowConfigError("formal.reset_active_high must be boolean")
     if formal["backend"] != "jaspergold":
-        raise SpecFlowConfigError("Iteration 1 supports only the jaspergold backend")
+        raise SpecFlowConfigError("SpecFlow supports only the jaspergold backend")
     proof_fields = _FORMAL_OPTIONAL_FIELDS & set(formal)
     if proof_fields and proof_fields != _FORMAL_OPTIONAL_FIELDS:
         raise SpecFlowConfigError(

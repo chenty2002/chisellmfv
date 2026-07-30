@@ -14,7 +14,7 @@ VALID_PROPERTY_PROFILES = set(list_property_profiles())
 
 @dataclass(frozen=True)
 class CoupledL2RunConfig:
-    """Configuration needed before preflight and the four active stages."""
+    """Configuration needed before preflight and the two active stages."""
 
     case_path: Path
     property_profile: str

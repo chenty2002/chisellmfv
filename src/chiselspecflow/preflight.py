@@ -1,4 +1,4 @@
-"""Iteration-1 deterministic project materialization and semantic indexing."""
+"""Deterministic project materialization and semantic indexing."""
 
 from __future__ import annotations
 
@@ -19,12 +19,12 @@ from .specification import load_public_spec_package
 from .workspace import SpecFlowWorkspace
 
 
-def prepare_iteration1_workspace(
+def prepare_workspace(
     config: SpecFlowRunConfig,
     run_dir: Path,
     suite_ledger: Path,
 ) -> SpecFlowWorkspace:
-    """Run the full Iteration-1 gate and stop before Stage-1 authoring."""
+    """Materialize and index one run, then stop before authoring."""
 
     project = load_project_contract(config.project_contract)
     configuration = load_generator_configuration(config.configuration, project)

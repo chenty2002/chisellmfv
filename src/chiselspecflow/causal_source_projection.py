@@ -103,7 +103,7 @@ def project_causal_sources(
         else "not_required"
     )
     return {
-        "schema_version": "causal_source_projection.v1",
+        "schema_version": "causal_source_projection",
         "round_id": round_id,
         "status": status,
         "graphs": graph_rows,
@@ -120,7 +120,7 @@ def not_required_source_projection(
     if status not in {"not_required", "unsupported", "incomplete"}:
         raise CausalSourceProjectionError("invalid empty source projection status")
     return {
-        "schema_version": "causal_source_projection.v1",
+        "schema_version": "causal_source_projection",
         "round_id": round_id,
         "status": status,
         "graphs": [],
@@ -265,34 +265,6 @@ def _project_edge(
             and row["line_start"] <= line <= row["line_end"]
         ]
         exact_matches.extend(matches)
-    if not exact_matches and len(locators) == 1:
-        relative, line = next(iter(locators))
-        file_hashes = {
-            str(row["source_sha256"])
-            for row in semantic_rows
-            if row["path"] == relative
-        }
-        source_path = (project_root / relative).resolve()
-        line_count = (
-            len(source_path.read_text(encoding="utf-8").splitlines())
-            if source_path.is_file()
-            else 0
-        )
-        if (
-            len(file_hashes) == 1
-            and 1 <= line <= line_count
-            and file_sha256(source_path) in file_hashes
-        ):
-            exact_matches.append(
-                {
-                    "object_id": None,
-                    "path": relative,
-                    "line_start": line,
-                    "line_end": line,
-                    "source_sha256": next(iter(file_hashes)),
-                    "enclosing_symbol": None,
-                }
-            )
     anchor_keys = {
         (
             row["path"],

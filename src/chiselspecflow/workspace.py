@@ -1,4 +1,4 @@
-"""Atomic isolated workspaces, allowlisted model views, and immutable rounds."""
+"""Atomic isolated workspaces and allowlisted model views."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from .config import (
-    MODEL_VIEW_MANIFEST_SCHEMA_VERSION,
-    RUN_MANIFEST_SCHEMA_VERSION,
+    MODEL_VIEW_MANIFEST_SCHEMA,
+    RUN_MANIFEST_SCHEMA,
     GeneratorConfiguration,
     ProjectContract,
     SpecFlowRunConfig,
@@ -26,7 +26,6 @@ from .property_decomposition import (
 )
 
 
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MODEL_LEAK_RE = re.compile(
     r"\b(?:buggy(?:_[0-9]+)?|gold(?:en)?|mutation|expected[_ -]?verdict|"
     r"private[_ -]?trigger|reference[_ -]?diff)\b",
@@ -43,42 +42,6 @@ _COPY_IGNORES = {
     "formal",
     "__pycache__",
 }
-
-
-@dataclass(frozen=True)
-class SpecFlowRound:
-    round_id: int
-    parent_round: Optional[int] = None
-    revision_request_sha256: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.round_id, int)
-            or isinstance(self.round_id, bool)
-            or self.round_id < 1
-        ):
-            raise ValueError("round_id must be a positive integer")
-        if self.parent_round is not None:
-            if (
-                not isinstance(self.parent_round, int)
-                or isinstance(self.parent_round, bool)
-                or self.parent_round < 1
-                or self.parent_round >= self.round_id
-            ):
-                raise ValueError("parent_round must be a positive earlier round")
-            if (
-                not isinstance(self.revision_request_sha256, str)
-                or not _SHA256_RE.fullmatch(self.revision_request_sha256)
-            ):
-                raise ValueError(
-                    "a child round requires a lowercase revision request SHA-256"
-                )
-        elif self.revision_request_sha256 is not None:
-            raise ValueError("the first round cannot have a revision request hash")
-
-    @property
-    def directory_name(self) -> str:
-        return f"{self.round_id:04d}"
 
 
 @dataclass(frozen=True)
@@ -112,8 +75,8 @@ class SpecFlowWorkspace:
         return self.run_dir / "logs"
 
     @property
-    def rounds_dir(self) -> Path:
-        return self.run_dir / "rounds"
+    def stages_dir(self) -> Path:
+        return self.run_dir / "stages"
 
     @property
     def final_result_path(self) -> Path:
@@ -123,25 +86,17 @@ class SpecFlowWorkspace:
     def cost_summary_path(self) -> Path:
         return self.run_dir / "run_cost_summary.json"
 
-    def round_dir(self, round_ref: SpecFlowRound | int) -> Path:
-        ref = (
-            round_ref
-            if isinstance(round_ref, SpecFlowRound)
-            else SpecFlowRound(round_ref)
-        )
-        return self.rounds_dir / ref.directory_name
-
-    def stage_dir(self, round_ref: SpecFlowRound | int, stage: str) -> Path:
-        return self.round_dir(round_ref) / get_stage_spec(stage).directory_name
+    def stage_dir(self, stage: str) -> Path:
+        return self.stages_dir / get_stage_spec(stage).directory_name
 
     def manifest_contract(self) -> dict:
         """Return the stage/layout portion embedded in every live manifest."""
 
         return {
-            "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+            "schema_version": RUN_MANIFEST_SCHEMA,
             "copy_strategy": self.config.copy_strategy,
             "stages": list(stage_contract_snapshot()),
-            "rounds_root": "rounds",
+            "stages_root": "stages",
             "workspace_project": "workspace/project",
         }
 
@@ -181,7 +136,7 @@ class SpecFlowWorkspace:
             inputs.mkdir(parents=True)
             indexes.mkdir(parents=True)
             logs.mkdir(parents=True)
-            (staging / "rounds").mkdir()
+            (staging / "stages").mkdir()
             _copy_file(project.path, inputs / "project_contract.json")
             _copy_file(configuration.path, inputs / "configuration.json")
             _copy_file(self.config.specification, inputs / "specification.md")
@@ -225,22 +180,10 @@ class SpecFlowWorkspace:
                 ),
             }
             _write_json(inputs / "input_hashes.json", input_hashes)
-            first_round = SpecFlowRound(1)
             for stage in stage_contract_snapshot():
-                (staging / "rounds" / first_round.directory_name / (
+                (staging / "stages" / (
                     f"{stage['ordinal']:02d}_{stage['name']}"
                 )).mkdir(parents=True)
-            round_manifest = {
-                "schema_version": "specflow_round.v1",
-                "round_id": 1,
-                "parent_round": None,
-                "revision_request_sha256": None,
-                "state": "indexing",
-            }
-            _write_json(
-                staging / "rounds" / first_round.directory_name / "round.json",
-                round_manifest,
-            )
 
             manifest = self.manifest_contract()
             manifest.update(
@@ -265,7 +208,6 @@ class SpecFlowWorkspace:
                     "suite_ledger_sha256": public_spec_package[
                         "suite_ledger_sha256"
                     ],
-                    "current_round": 1,
                     "review_state": "not_started",
                     "index_hashes": {},
                 }
@@ -277,38 +219,6 @@ class SpecFlowWorkspace:
             if staging.exists():
                 shutil.rmtree(staging)
             raise
-
-    def create_round(self, round_ref: SpecFlowRound) -> Path:
-        """Create a new round without modifying any earlier round."""
-
-        if round_ref.round_id == 1:
-            raise ValueError("round 1 is created with the workspace")
-        path = self.round_dir(round_ref)
-        if path.exists():
-            raise FileExistsError(f"SpecFlow round already exists: {path}")
-        manifest = _read_json(self.manifest_path)
-        if manifest.get("current_round") != round_ref.parent_round:
-            raise ValueError("new round must name the current round as its parent")
-        path.mkdir(parents=False, exist_ok=False)
-        try:
-            for stage in stage_contract_snapshot():
-                (path / f"{stage['ordinal']:02d}_{stage['name']}").mkdir()
-            _write_json(
-                path / "round.json",
-                {
-                    "schema_version": "specflow_round.v1",
-                    "round_id": round_ref.round_id,
-                    "parent_round": round_ref.parent_round,
-                    "revision_request_sha256": round_ref.revision_request_sha256,
-                    "state": "indexing",
-                },
-            )
-        except BaseException:
-            shutil.rmtree(path)
-            raise
-        manifest["current_round"] = round_ref.round_id
-        _write_json(self.manifest_path, manifest)
-        return path
 
     def record_indexes(self, artifacts: Dict[str, Path]) -> Dict[str, str]:
         """Bind completed deterministic index artifacts into the run manifest."""
@@ -329,10 +239,6 @@ class SpecFlowWorkspace:
         manifest["index_hashes"] = hashes
         manifest["preflight_status"] = "index_ready"
         _write_json(self.manifest_path, manifest)
-        round_path = self.round_dir(manifest["current_round"]) / "round.json"
-        round_manifest = _read_json(round_path)
-        round_manifest["state"] = "index_ready"
-        _write_json(round_path, round_manifest)
         return hashes
 
 
@@ -392,7 +298,7 @@ def _materialize_model_view(
             }
         )
     return {
-        "schema_version": MODEL_VIEW_MANIFEST_SCHEMA_VERSION,
+        "schema_version": MODEL_VIEW_MANIFEST_SCHEMA,
         "files": files,
     }
 

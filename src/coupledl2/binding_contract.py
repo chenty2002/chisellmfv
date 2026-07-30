@@ -7,18 +7,10 @@ import re
 from typing import Any, Dict
 
 from .property_catalog import PropertyCatalog
-from .binding_candidates import compatible_candidates, fill_singleton_bindings
+from .binding_candidates import compatible_candidates
 
 
 BASE_LABEL_RE = re.compile(r"^(?:CL2|TL)_[A-Z0-9_]{1,80}$")
-PATCH_OPERATIONS = {"replace_binding", "replace_parameter", "replace_template"}
-REPAIRABLE_ERROR_KINDS = {
-    "candidate_incompatible",
-    "parameter_out_of_range",
-    "template_incompatible",
-}
-
-
 class BindingContractError(ValueError):
     def __init__(
         self,
@@ -53,9 +45,7 @@ def binding_manifest_tool(catalog: PropertyCatalog) -> Dict[str, Any]:
     return {
         "name": "submit_binding_manifest",
         "description": (
-            "Submit one to eight property bindings using repository candidate IDs. Slots with "
-            "one compatible candidate are deterministic; only slots listed by "
-            "model_selectable_slots represent a model choice."
+            "Submit one to eight complete property bindings using repository candidate IDs."
         ),
         "strict": True,
         "parameters": {
@@ -63,7 +53,7 @@ def binding_manifest_tool(catalog: PropertyCatalog) -> Dict[str, Any]:
             "additionalProperties": False,
             "required": ["schema_version", "property_profile_id", "instances"],
             "properties": {
-                "schema_version": {"type": "string", "const": "binding_manifest.v1"},
+                "schema_version": {"type": "string", "const": "binding_manifest"},
                 "property_profile_id": {
                     "type": "string",
                     "const": profile["property_profile_id"],
@@ -144,60 +134,12 @@ def binding_manifest_tool(catalog: PropertyCatalog) -> Dict[str, Any]:
     }
 
 
-def model_selectable_slots(catalog: PropertyCatalog) -> Dict[str, list[str]]:
-    """Expose only slots that have two or more approved profile candidates."""
-    slots: Dict[str, list[str]] = {}
-    for template in catalog.templates.values():
-        for role, definition in template["slots"].items():
-            compatible = [
-                candidate["candidate_id"]
-                for candidate in compatible_candidates(
-                    catalog, role, definition["type"]
-                )
-            ]
-            if len(compatible) >= 2:
-                slots[f"{template['template_id']}:{role}"] = compatible
-    return dict(sorted(slots.items()))
-
-
-def binding_patch_tool(catalog: PropertyCatalog, instance_id: str) -> Dict[str, Any]:
-    return {
-        "name": "submit_binding_patch",
-        "description": "Replace only an allowed binding, parameter, or template.",
-        "strict": True,
-        "parameters": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["schema_version", "instance_id", "operations"],
-            "properties": {
-                "schema_version": {"type": "string", "const": "binding_patch.v1"},
-                "instance_id": {"type": "string", "const": instance_id},
-                "operations": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 4,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": ["op", "name", "value"],
-                        "properties": {
-                            "op": {"type": "string", "enum": sorted(PATCH_OPERATIONS)},
-                            "name": {"type": "string"},
-                            "value": {},
-                        },
-                    },
-                },
-            },
-        },
-    }
-
-
 def validate_binding_manifest(
     payload: Dict[str, Any],
     catalog: PropertyCatalog,
 ) -> Dict[str, Any]:
     _object(payload, {"schema_version", "property_profile_id", "instances"}, "$")
-    _equal(payload["schema_version"], "binding_manifest.v1", "$.schema_version")
+    _equal(payload["schema_version"], "binding_manifest", "$.schema_version")
     _equal(
         payload["property_profile_id"],
         catalog.profile["property_profile_id"],
@@ -213,10 +155,6 @@ def validate_binding_manifest(
     if len(set(base_labels)) != len(instances):
         raise BindingContractError("$.instances", "duplicate_value", "base labels must be globally unique")
     normalized = copy.deepcopy(payload)
-    normalized["instances"] = [
-        fill_singleton_bindings(instance, catalog)
-        for instance in normalized["instances"]
-    ]
     for index, instance in enumerate(normalized["instances"]):
         _validate_instance(instance, catalog, index)
     return normalized
@@ -323,45 +261,6 @@ def _validate_instance(instance: Dict[str, Any], catalog: PropertyCatalog, index
                 "unknown candidate",
                 sorted(catalog.candidates),
             )
-
-
-def apply_binding_patch(
-    manifest: Dict[str, Any],
-    patch: Dict[str, Any],
-    catalog: PropertyCatalog,
-) -> Dict[str, Any]:
-    _object(patch, {"schema_version", "instance_id", "operations"}, "$")
-    _equal(patch["schema_version"], "binding_patch.v1", "$.schema_version")
-    matching = [
-        item for item in manifest["instances"]
-        if item.get("instance_id") == patch["instance_id"]
-    ]
-    if len(matching) != 1:
-        raise BindingContractError("$.instance_id", "unknown_value", "instance id is not present in manifest")
-    operations = patch["operations"]
-    if not isinstance(operations, list) or not 1 <= len(operations) <= 4:
-        raise BindingContractError("$.operations", "cardinality", "patch requires one to four operations")
-    updated = copy.deepcopy(manifest)
-    target = next(
-        item for item in updated["instances"]
-        if item["instance_id"] == patch["instance_id"]
-    )
-    for index, operation in enumerate(operations):
-        path = f"$.operations[{index}]"
-        _object(operation, {"op", "name", "value"}, path)
-        op = operation["op"]
-        if op not in PATCH_OPERATIONS:
-            raise BindingContractError(f"{path}.op", "unknown_value", "unsupported patch operation", sorted(PATCH_OPERATIONS))
-        name = operation["name"]
-        if op == "replace_binding":
-            target["bindings"][name] = operation["value"]
-        elif op == "replace_parameter":
-            target["parameters"][name] = operation["value"]
-        else:
-            if name != "template_id":
-                raise BindingContractError(f"{path}.name", "unknown_value", "replace_template name must be template_id")
-            target["template_id"] = operation["value"]
-    return validate_binding_manifest(updated, catalog)
 
 
 def _object(value: Any, fields: set[str], path: str) -> None:

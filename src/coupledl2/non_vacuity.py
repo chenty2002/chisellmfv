@@ -1,4 +1,4 @@
-"""Minimum witness/non-vacuity evidence gate for V3 experiment eligibility."""
+"""Minimum witness/non-vacuity evidence gate for  experiment eligibility."""
 
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ def apply_non_vacuity_evidence(
     semantic_evidence: Dict[str, Any], witness_plan: Dict[str, Any], evidence: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Return a new semantic-evidence ledger; parent results are never inherited."""
-    if witness_plan.get("schema_version") != "witness_plan.v1":
+    if witness_plan.get("schema_version") != "witness_plan":
         raise NonVacuityError("unsupported witness plan")
-    if evidence.get("schema_version") != "non_vacuity_evidence.v1":
+    if evidence.get("schema_version") != "non_vacuity_evidence":
         raise NonVacuityError("unsupported non-vacuity evidence")
     result = copy.deepcopy(semantic_evidence)
     planned = {item["instance_id"]: item for item in witness_plan["instances"]}

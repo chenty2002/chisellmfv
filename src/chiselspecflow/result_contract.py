@@ -1,4 +1,4 @@
-"""V5 exact operation planning and semantic-evidence reduction."""
+""" exact operation planning and semantic-evidence reduction."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def build_operation_plan(
             }
         )
     plan = {
-        "schema_version": "verification_operation_plan.v2",
+        "schema_version": "verification_operation_plan",
         "verification_package_sha256": verification_package_sha256,
         "certificate_sha256": certificate_sha256,
         "expected_operation_count": len(operations),
@@ -83,7 +83,7 @@ def validate_operation_plan(value: Mapping[str, Any]) -> None:
         "expected_operation_count",
         "operations",
     }
-    if set(value) != required or value.get("schema_version") != "verification_operation_plan.v2":
+    if set(value) != required or value.get("schema_version") != "verification_operation_plan":
         raise SpecFlowResultError("operation plan has an invalid exact schema")
     rows = value.get("operations")
     if not isinstance(rows, list) or not rows:
@@ -200,7 +200,7 @@ def reduce_property_results(
         else "inconclusive"
     )
     result_map = {
-        "schema_version": "property_result_map.v5",
+        "schema_version": "property_result_map",
         "operation_plan_sha256": file_sha256(operation_plan_path),
         "certificate_sha256": operation_plan["certificate_sha256"],
         "trace_manifest_sha256": trace_manifest_sha256,
@@ -218,7 +218,7 @@ def reduce_property_results(
         "tool": dict(tool),
     }
     semantic_evidence = {
-        "schema_version": "semantic_evidence.v3",
+        "schema_version": "semantic_evidence",
         "operation_plan_sha256": result_map["operation_plan_sha256"],
         "trace_manifest_sha256": trace_manifest_sha256,
         "evidence_status": overall_evidence,
