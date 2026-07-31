@@ -21,7 +21,6 @@ from .config import (
 from .stages import get_stage_spec, stage_contract_snapshot
 from .property_decomposition import (
     build_authoring_scope,
-    build_identity_decomposition,
     load_property_decomposition,
 )
 
@@ -142,10 +141,12 @@ class SpecFlowWorkspace:
             _copy_file(self.config.specification, inputs / "specification.md")
             _write_json(inputs / "public_spec_package.json", public_spec_package)
             decomposition_path = self.config.specification.parent / "property_decomposition.json"
-            decomposition = (
-                load_property_decomposition(decomposition_path, public_spec_package)
-                if decomposition_path.is_file()
-                else build_identity_decomposition(public_spec_package)
+            if not decomposition_path.is_file():
+                raise FileNotFoundError(
+                    f"missing required property decomposition: {decomposition_path}"
+                )
+            decomposition = load_property_decomposition(
+                decomposition_path, public_spec_package
             )
             _write_json(inputs / "property_decomposition.json", decomposition)
             authoring_scope = build_authoring_scope(

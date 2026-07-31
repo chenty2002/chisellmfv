@@ -145,6 +145,16 @@ def lower_expression(
     if op == "slice":
         arg = lower_expression(node["arg"], typed_bindings, states).source
         return ChiselExpr(f"({arg})({node['high']}, {node['low']})", result)
+    if op == "lookup_table":
+        selectors = [
+            lower_expression(selector, typed_bindings, states).source
+            for selector in node["selectors"]
+        ]
+        index = selectors[0] if len(selectors) == 1 else f"Cat({', '.join(selectors)})"
+        literals = ", ".join(
+            _literal_source(value, result) for value in node["values"]
+        )
+        return ChiselExpr(f"VecInit(Seq({literals}))({index})", result)
     if op == "bounded_counter_relation":
         state = states.get(node["counter_state_id"])
         if state is None:
@@ -170,7 +180,9 @@ def lower_monitor(
     ):
         raise MonitorCompilerError("monitor reset source is not a bounded identifier")
     object_rows = {row["object_id"]: row for row in semantic_index["objects"]}
-    required_binding_ids = set(monitor_ir["binding_refs"])
+    required_binding_ids = set(monitor_ir["binding_refs"]) | set(
+        monitor_ir["required_observations"]
+    )
     if not required_binding_ids <= set(bindings):
         raise MonitorCompilerError("monitor references a binding outside the package")
     required_object_ids = {
@@ -489,6 +501,14 @@ def _observer_access_path(
 
 def _result_type(node: Mapping[str, Any]) -> ExpressionType:
     return _type_from_mapping(node["result_type"])
+
+
+def _literal_source(value: Any, result: ExpressionType) -> str:
+    if result.kind == "Bool":
+        return "true.B" if value else "false.B"
+    suffix = "S" if result.kind == "SInt" else "U"
+    literal = f"({value})" if result.kind == "SInt" and value < 0 else str(value)
+    return f"{literal}.{suffix}({result.width}.W)"
 
 
 def _type_from_mapping(value: Mapping[str, Any]) -> ExpressionType:

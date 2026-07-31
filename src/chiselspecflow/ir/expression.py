@@ -55,6 +55,7 @@ _ALLOWED_OPS = {
     "bit_select",
     "slice",
     "bounded_counter_relation",
+    "lookup_table",
 }
 
 
@@ -228,6 +229,65 @@ def _validate_node(
             normalized = {"op": op, "arg": arg, "high": high, "low": low}
             result = ExpressionType("UInt", high - low + 1, False)
         return _checked_type(_with_type(normalized, result), result, declared_result, path)
+
+    if op == "lookup_table":
+        _exact(value, {"op", "selectors", "values", "type"}, path)
+        selectors = value["selectors"]
+        if not isinstance(selectors, list) or not 1 <= len(selectors) <= 8:
+            raise ExpressionValidationError(
+                "malformed_expression", f"{path}.selectors must contain 1..8 nodes"
+            )
+        normalized_selectors = []
+        selector_width = 0
+        for index, selector in enumerate(selectors):
+            normalized, selector_type = _validate_node(
+                selector,
+                object_types,
+                state_types,
+                f"{path}.selectors[{index}]",
+            )
+            if selector_type.kind not in {"Bool", "UInt"}:
+                raise ExpressionValidationError(
+                    "type_mismatch", "lookup_table selectors must be Bool or UInt"
+                )
+            selector_width += selector_type.width
+            normalized_selectors.append(normalized)
+        if selector_width > 8:
+            raise ExpressionValidationError(
+                "width_mismatch", "lookup_table selector width exceeds eight bits"
+            )
+        result = _parse_type(value["type"], f"{path}.type")
+        if result.kind == "Bool":
+            maximum = 1
+        elif result.signed:
+            maximum = (1 << (result.width - 1)) - 1
+        else:
+            maximum = (1 << result.width) - 1
+        values = value["values"]
+        if (
+            not isinstance(values, list)
+            or len(values) != 1 << selector_width
+            or any(
+                not isinstance(item, int)
+                or isinstance(item, bool)
+                or item < (-(1 << (result.width - 1)) if result.signed else 0)
+                or item > maximum
+                for item in values
+            )
+        ):
+            raise ExpressionValidationError(
+                "width_mismatch",
+                "lookup_table values must exactly cover the selector domain and result type",
+            )
+        normalized = {
+            "op": op,
+            "selectors": normalized_selectors,
+            "values": list(values),
+            "type": result.as_dict(),
+        }
+        return _checked_type(
+            _with_type(normalized, result), result, declared_result, path
+        )
 
     _exact(value, {"op", "counter_state_id", "relation", "bound"}, path)
     state_id = _identifier(value["counter_state_id"], f"{path}.counter_state_id")

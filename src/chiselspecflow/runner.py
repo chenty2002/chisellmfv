@@ -35,7 +35,11 @@ class CompileVerifyStage:
         self.backend = backend or JasperGoldBackend()
 
     def run(
-        self, run_dir: Path, *, frozen_package_run: Optional[Path] = None
+        self,
+        run_dir: Path,
+        *,
+        frozen_package_run: Optional[Path] = None,
+        direct_one_shot: bool = False,
     ) -> Dict[str, Any]:
         workspace = load_existing_workspace(run_dir)
         manifest = _read_json(workspace.manifest_path)
@@ -47,7 +51,8 @@ class CompileVerifyStage:
         )
         package_manifest = _read_json(package_workspace.manifest_path)
         package_round = 1
-        if package_manifest.get("review_state") != "approved":
+        expected_state = "direct_submission" if direct_one_shot else "approved"
+        if package_manifest.get("review_state") != expected_state:
             raise SpecFlowRunnerError("compile_verify requires an approved review")
         stage1 = package_workspace.stage_dir("asset_authoring")
         if validate_completed_stage(stage1, get_stage_spec("asset_authoring")) is None:
@@ -120,7 +125,7 @@ class CompileVerifyStage:
             workspace,
             output_dir=stage2,
             package_path=package_path,
-            frozen_replay=replay,
+            frozen_replay=replay or direct_one_shot,
         )
         certificate = elaborate_verification_overlay(
             workspace.project_workspace,
@@ -202,6 +207,35 @@ def run_frozen_package_replay(
     return CompileVerifyStage(
         JasperGoldBackend(timeout_seconds, per_property_seconds)
     ).run(target_run_dir, frozen_package_run=frozen_package_run)
+
+
+def run_direct_compile_verify(
+    run_dir: Path,
+    *,
+    timeout_seconds: int = 300,
+    per_property_seconds: int = 60,
+) -> Dict[str, Any]:
+    """Compile one unreviewed P0 submission without granting review authority."""
+
+    return CompileVerifyStage(
+        JasperGoldBackend(timeout_seconds, per_property_seconds)
+    ).run(run_dir, direct_one_shot=True)
+
+
+def run_direct_frozen_package_replay(
+    target_run_dir: Path,
+    frozen_package_run: Path,
+    *,
+    timeout_seconds: int = 300,
+    per_property_seconds: int = 60,
+) -> Dict[str, Any]:
+    return CompileVerifyStage(
+        JasperGoldBackend(timeout_seconds, per_property_seconds)
+    ).run(
+        target_run_dir,
+        frozen_package_run=frozen_package_run,
+        direct_one_shot=True,
+    )
 
 
 def load_existing_workspace(run_dir: Path) -> SpecFlowWorkspace:

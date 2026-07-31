@@ -13,11 +13,19 @@ AUTHORING_TOOL_NAMES = (
 AMBIGUITY_TOOL_NAME = "report_spec_ambiguity"
 
 
-def obligation_tools(clause_ids: Iterable[str], object_ids: Iterable[str], configuration_id: str) -> list[Dict[str, Any]]:
+def obligation_tools(
+    clause_ids: Iterable[str],
+    object_ids: Iterable[str],
+    configuration_id: str,
+    obligation_ids: Iterable[str] | None = None,
+) -> list[Dict[str, Any]]:
+    obligation_ids = tuple(obligation_ids) if obligation_ids is not None else None
     expression = _expression_schema(tuple(object_ids))
     candidate = _strict_object(
         {
-            "obligation_id": _string(),
+            "obligation_id": (
+                _enum(obligation_ids) if obligation_ids is not None else _string()
+            ),
             "clause_ref": _strict_object(
                 {"spec_sha256": _sha256(), "locator": _enum(clause_ids), "text_sha256": _sha256()}
             ),
@@ -52,7 +60,13 @@ def obligation_tools(clause_ids: Iterable[str], object_ids: Iterable[str], confi
             ),
         }
     )
-    return [_tool("submit_obligation_candidates", candidate), _ambiguity_tool(clause_ids)]
+    tool = _tool("submit_obligation_candidates", candidate)
+    if obligation_ids is not None:
+        count = len(obligation_ids)
+        candidates = tool["parameters"]["properties"]["candidates"]
+        candidates["minItems"] = count
+        candidates["maxItems"] = count
+    return [tool, _ambiguity_tool(clause_ids)]
 
 
 def binding_tools(
@@ -109,6 +123,8 @@ def monitor_tools(
     configuration_id: str,
     archetypes: Mapping[str, Mapping[str, Any]],
     source_property_ids: Iterable[str] | None = None,
+    role_hints: Mapping[str, str] | None = None,
+    archetype_id: str | None = None,
 ) -> list[Dict[str, Any]]:
     expression = _expression_schema(tuple(object_ids), allow_state=True)
     state = _strict_object(
@@ -131,26 +147,92 @@ def monitor_tools(
         }
     )
     variants = []
-    for archetype_id, archetype in sorted(archetypes.items()):
+    selected_archetypes = (
+        {archetype_id: archetypes[archetype_id]}
+        if archetype_id is not None
+        else archetypes
+    )
+    for selected_id, archetype in sorted(selected_archetypes.items()):
         contract = archetype["state_contract"]
+        state_rows = {
+            "type": "array",
+            "minItems": contract["minimum_count"],
+            "maxItems": contract["maximum_count"],
+            "items": state,
+        }
+        if contract["required_type_kinds"]:
+            state_rows["allOf"] = [
+                {
+                    "contains": _strict_object(
+                        {
+                            "state_id": _string(),
+                            "type": _strict_object(
+                                {
+                                    "kind": {"type": "string", "const": kind},
+                                    "width": {"type": "integer", "minimum": 1},
+                                    "signed": {"type": "boolean"},
+                                }
+                            ),
+                            "init": expression,
+                            "update": expression,
+                            "clear": expression,
+                        }
+                    ),
+                    "minContains": 1,
+                }
+                for kind in contract["required_type_kinds"]
+            ]
+        properties = {"type": "array", "minItems": 1, "items": prop}
+        if source_property_ids is not None:
+            component_ids = tuple(source_property_ids)
+            properties["minItems"] = len(component_ids)
+            properties["maxItems"] = len(component_ids)
+            properties["allOf"] = [
+                {
+                    "contains": _strict_object(
+                        {
+                            "source_property_id": {
+                                "type": "string",
+                                "const": component_id,
+                            },
+                            "role": (
+                                {
+                                    "type": "string",
+                                    "const": role_hints[component_id],
+                                }
+                                if role_hints is not None
+                                else _enum(
+                                    (
+                                        "primary_assertion",
+                                        "activation_cover",
+                                        "observer_cover",
+                                        "state_cover",
+                                        "assumption_sat",
+                                    )
+                                )
+                            ),
+                            "expression_ir": expression,
+                            "guard_ir": expression,
+                        }
+                    ),
+                    "minContains": 1,
+                    "maxContains": 1,
+                }
+                for component_id in component_ids
+            ]
         variants.append(
             _strict_object(
                 {
                     "monitor_id": _string(),
                     "obligation_id": _enum(obligation_ids),
-                    "archetype_id": {"type": "string", "const": archetype_id},
+                    "archetype_id": {"type": "string", "const": selected_id},
                     "archetype_sha256": {
                         "type": "string",
                         "const": archetype["sha256"],
                     },
                     "binding_refs": {"type": "array", "minItems": 1, "items": _enum(binding_ids)},
-                    "state": {
-                        "type": "array",
-                        "minItems": contract["minimum_count"],
-                        "maxItems": contract["maximum_count"],
-                        "items": state,
-                    },
-                    "properties": {"type": "array", "minItems": 1, "items": prop},
+                    "state": state_rows,
+                    "properties": properties,
                     "reset_policy": {"type": "string", "const": "disable_while_reset"},
                     "overlay": _strict_object(
                         {
@@ -164,8 +246,12 @@ def monitor_tools(
                 }
             )
         )
-    candidate = {"anyOf": variants}
-    return [_tool("submit_monitor_candidates", candidate), _ambiguity_tool(obligation_ids)]
+    candidate = variants[0] if len(variants) == 1 else {"anyOf": variants}
+    tool = _tool("submit_monitor_candidates", candidate)
+    candidates = tool["parameters"]["properties"]["candidates"]
+    candidates["minItems"] = 1
+    candidates["maxItems"] = 1
+    return [tool, _ambiguity_tool(obligation_ids)]
 
 
 def _tool(name: str, candidate: Mapping[str, Any]) -> Dict[str, Any]:
@@ -204,7 +290,7 @@ def _expression_schema(object_ids: tuple[str, ...], allow_state: bool = False) -
     # JSON Schema recursion keeps the tool surface bounded without raw-code fields.
     ref = {"$ref": "#/$defs/expression"}
     variants = [
-        _strict_object({"op": {"type": "string", "const": "literal"}, "value": {"type": ["boolean", "integer"]}, "type": _type_schema()}),
+        _literal_schema(),
         _strict_object({"op": {"type": "string", "const": "object_ref"}, "object_id": _enum(object_ids)}),
         _strict_object({"op": {"type": "string", "const": "not"}, "arg": ref}),
         _strict_object({"op": _enum(("and", "or")), "args": {"type": "array", "minItems": 2, "items": ref}}),
@@ -213,6 +299,24 @@ def _expression_schema(object_ids: tuple[str, ...], allow_state: bool = False) -
         _strict_object({"op": _enum(("onehot", "popcount")), "arg": ref}),
         _strict_object({"op": {"type": "string", "const": "bit_select"}, "arg": ref, "index": {"type": "integer", "minimum": 0}}),
         _strict_object({"op": {"type": "string", "const": "slice"}, "arg": ref, "high": {"type": "integer", "minimum": 0}, "low": {"type": "integer", "minimum": 0}}),
+        _strict_object(
+            {
+                "op": {"type": "string", "const": "lookup_table"},
+                "selectors": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": ref,
+                },
+                "values": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 256,
+                    "items": {"type": "integer"},
+                },
+                "type": _type_schema(),
+            }
+        ),
     ]
     if allow_state:
         variants.extend(
@@ -257,8 +361,41 @@ def _type_schema() -> Dict[str, Any]:
     )
 
 
+def _literal_schema() -> Dict[str, Any]:
+    return {
+        "anyOf": [
+            _strict_object(
+                {
+                    "op": {"type": "string", "const": "literal"},
+                    "value": {"type": "boolean"},
+                    "type": _strict_object(
+                        {
+                            "kind": {"type": "string", "const": "Bool"},
+                            "width": {"type": "integer", "const": 1},
+                            "signed": {"type": "boolean", "const": False},
+                        }
+                    ),
+                }
+            ),
+            _strict_object(
+                {
+                    "op": {"type": "string", "const": "literal"},
+                    "value": {"type": "integer"},
+                    "type": _strict_object(
+                        {
+                            "kind": _enum(("UInt", "SInt")),
+                            "width": {"type": "integer", "minimum": 1},
+                            "signed": {"type": "boolean"},
+                        }
+                    ),
+                }
+            ),
+        ]
+    }
+
+
 def _string() -> Dict[str, Any]:
-    return {"type": "string", "minLength": 1}
+    return {"type": "string", "minLength": 1, "maxLength": 512}
 
 
 def _sha256() -> Dict[str, Any]:

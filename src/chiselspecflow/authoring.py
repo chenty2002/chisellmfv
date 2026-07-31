@@ -122,6 +122,9 @@ def run_asset_authoring(
             "specification_id": public_spec["specification_id"],
             "spec_sha256": public_spec["spec_sha256"],
             "clauses": clause_slices,
+            "full_text": (
+                workspace.inputs_dir / "specification.md"
+            ).read_text(encoding="utf-8"),
         },
         "authoring_scope": authoring_scope,
         "semantic_objects": confirmed,
@@ -136,6 +139,34 @@ def run_asset_authoring(
     candidate_attempts: list[Dict[str, Any]] = []
 
     try:
+        selected_archetype_id = _selected_monitor_archetype(
+            authoring_scope["component_role_hints"]
+        )
+        model_stage_inputs = {
+            key: stage_inputs[key]
+            for key in (
+                "schema_version",
+                "round_id",
+                "project",
+                "configuration",
+                "specification",
+                "authoring_scope",
+                "semantic_objects",
+                "input_hashes",
+                "index_hashes",
+            )
+        }
+        asset_snapshot = stage_inputs["asset_library"]
+        model_stage_inputs["asset_library"] = {
+            "schema_version": asset_snapshot["schema_version"],
+            "obligation_schemas": asset_snapshot["obligation_schemas"],
+            "api_adapters": asset_snapshot["api_adapters"],
+            "monitor_archetypes": [
+                row
+                for row in asset_snapshot["monitor_archetypes"]
+                if row["asset_id"] == selected_archetype_id
+            ],
+        }
         raw_obligations, used, refs = _request_candidates(
             model,
             expected_tool="submit_obligation_candidates",
@@ -143,12 +174,14 @@ def run_asset_authoring(
                 [row["locator"] for row in clause_slices],
                 object_types,
                 configuration["configuration_id"],
+                authoring_scope["primary_component_ids"],
             ),
             context={
-                "stage_inputs": stage_inputs,
+                "stage_inputs": model_stage_inputs,
                 "task": (
                     "author exactly one obligation for each authoring_scope.primary_component_ids; "
-                    "component IDs with cover/state/assumption role hints are monitor evidence, not obligations"
+                    "component IDs with cover/state/assumption role hints are monitor evidence, not obligations; "
+                    "obligations cannot reference monitor state; use lookup_table for a complete public table"
                 ),
             },
             validator=lambda rows: _validate_obligations(
@@ -162,6 +195,7 @@ def run_asset_authoring(
             ),
             audit_log=call_audit,
             candidate_attempt_log=candidate_attempts,
+            max_tokens=8192,
         )
         calls += used
         call_refs += refs
@@ -193,6 +227,7 @@ def run_asset_authoring(
             ),
             audit_log=call_audit,
             candidate_attempt_log=candidate_attempts,
+            max_tokens=8192,
         )
         calls += used
         call_refs += refs
@@ -208,22 +243,31 @@ def run_asset_authoring(
                 configuration["configuration_id"],
                 assets.monitor_archetypes,
                 authoring_scope["component_ids"],
+                authoring_scope["component_role_hints"],
+                selected_archetype_id,
             ),
             context={
                 "task": "compose typed monitor IR from reviewed archetype IDs",
                 "obligations": raw_obligations,
                 "bindings": raw_bindings,
-                "archetypes": {
-                    asset_id: dict(asset)
-                    for asset_id, asset in assets.monitor_archetypes.items()
-                },
+                "archetype": dict(
+                    assets.monitor_archetypes[selected_archetype_id]
+                ),
                 "component_role_hints": authoring_scope["component_role_hints"],
                 "typed_state_contract": {
                     "init": "must have exactly the declared state type",
                     "update": "must have exactly the declared state type",
                     "clear": "must be Bool regardless of the declared state type",
                     "property_expression_and_guard": "must both be Bool",
+                    "historical_state": (
+                        "previous_value and past_valid may reference only state_id "
+                        "values declared in this monitor state array"
+                    ),
                 },
+                "submission_contract": (
+                    "submit exactly one monitor; every selected component ID must "
+                    "appear exactly once with its declared role"
+                ),
             },
             validator=lambda rows: _validate_monitors(
                 rows,
@@ -238,6 +282,7 @@ def run_asset_authoring(
             ),
             audit_log=call_audit,
             candidate_attempt_log=candidate_attempts,
+            max_tokens=16384,
         )
         calls += used
         call_refs += refs
@@ -247,11 +292,18 @@ def run_asset_authoring(
         _write_jsonl(
             _candidate_attempt_log_path(workspace, round_id), candidate_attempts
         )
+        failure_status = (
+            "ambiguous"
+            if exc.code == "spec_ambiguity"
+            else "invalid_submission"
+            if exc.code == "invalid_model_submission"
+            else "unsupported"
+        )
         _write_json(
             stage_dir / "authoring_candidates.json",
             {
                 "schema_version": AUTHORING_CANDIDATES_SCHEMA,
-                "status": "unsupported" if exc.code != "spec_ambiguity" else "ambiguous",
+                "status": failure_status,
                 "obligations": locals().get("raw_obligations", []),
                 "bindings": locals().get("raw_bindings", []),
                 "monitors": locals().get("raw_monitors", []),
@@ -264,7 +316,7 @@ def run_asset_authoring(
             get_stage_spec("asset_authoring"),
             {
                 "success": False,
-                "status": "ambiguous" if exc.code == "spec_ambiguity" else "unsupported",
+                "status": failure_status,
                 "error_kind": exc.code,
                 "error": str(exc),
                 "round_id": round_id,
@@ -274,7 +326,7 @@ def run_asset_authoring(
         )
         _set_review_state(workspace, "not_applicable")
         return AuthoringResult(
-            "ambiguous" if exc.code == "spec_ambiguity" else "unsupported",
+            failure_status,
             stage_dir,
             None,
             calls,
@@ -330,6 +382,7 @@ def _request_candidates(
     validator: Callable[[list[Mapping[str, Any]]], list[Dict[str, Any]]],
     audit_log: Optional[list[Dict[str, Any]]] = None,
     candidate_attempt_log: Optional[list[Dict[str, Any]]] = None,
+    max_tokens: int = 4096,
 ) -> tuple[list[Dict[str, Any]], int, list[str]]:
     response = model.chat_with_tools(
         messages=[
@@ -342,10 +395,13 @@ def _request_candidates(
         },
         {"role": "user", "content": json.dumps(context, sort_keys=True)},
         ],
-        tools=tools,
-        max_tokens=4096,
+        tools=[tool for tool in tools if tool["name"] == expected_tool],
+        max_tokens=max_tokens,
         temperature=0.0,
-        tool_choice="required",
+        tool_choice={
+            "type": "function",
+            "function": {"name": expected_tool},
+        },
         enable_thinking=False,
         parallel_tool_calls=False,
         usage_metadata={"stage": "asset_authoring", "task_type": "candidate_authoring"},
@@ -527,6 +583,15 @@ def _validate_monitors(
             str(sorted(allowed_property_ids - source_property_ids)),
         )
     return normalized
+
+
+def _selected_monitor_archetype(role_hints: Mapping[str, str]) -> str:
+    roles = set(role_hints.values())
+    if "assumption_sat" in roles:
+        return "bounded_counter"
+    if "state_cover" in roles:
+        return "previous_value"
+    return "direct_relation"
 
 
 def _build_review_request(

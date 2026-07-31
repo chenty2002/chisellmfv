@@ -15,9 +15,10 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -125,6 +126,30 @@ LEDGER_REQUIRED_FIELDS = {
 SENSITIVE_ENV_NAMES = {
     "CHISELLMFV_LLM_API_KEY",
 }
+P0_OUTPUT_BUDGET = (32768,)
+P1_OUTPUT_BUDGET = (8192, 8192, 16384)
+SELECTED_AUTHORING_SCOPE = {
+    "counter": ("CTR-P-TIM-002", "CTR-P-TIM-002"),
+    "fsm_16": ("FSM16-P-TIM-001", "FSM16-P-TIM-001"),
+    "i2c": ("I2C-P004", "I2C-P004.bit-phase-completion"),
+    "alu": ("ALU-P-SAF-001", "ALU-P-SAF-001"),
+    "decoder_3_to_8": ("DEC-P-SAF-001", "DEC-P-SAF-001"),
+    "arbiter": ("ARB-P001", "ARB-P001"),
+    "led_controller": ("LED-P001", "LED-P001"),
+    "sdram_controller": ("SDR-P001", "SDR-P001"),
+    "reed_solomon_decoder": ("RS204-P-REL-001", "RS204-P-REL-001"),
+    "sha3": ("K512-P-REL-001", "K512-P-REL-001"),
+}
+DEVELOPMENT_FAMILIES = ("counter", "fsm_16", "i2c")
+EVALUATION_FAMILIES = (
+    "alu",
+    "decoder_3_to_8",
+    "arbiter",
+    "led_controller",
+    "sdram_controller",
+    "reed_solomon_decoder",
+    "sha3",
+)
 
 
 class ExperimentContractError(ValueError):
@@ -255,17 +280,46 @@ def _family_entry(repo: Path, run_dir: Path, family: str) -> dict[str, Any]:
     project = family_root / "specflow/project.json"
     spec = family_root / "specflow/spec.md"
     config = family_root / "specflow/configs/cfg_000.json"
+    decomposition_path = family_root / "specflow/property_decomposition.json"
 
     # Reuse the public parser so this manifest cannot bless an invalid contract.
     from src.chiselspecflow.config import (
         load_generator_configuration,
         load_project_contract,
     )
+    from src.chiselspecflow.property_decomposition import (
+        build_authoring_scope,
+        load_property_decomposition,
+    )
+    from src.chiselspecflow.specification import load_public_spec_package
 
     parsed_project = load_project_contract(project)
     parsed_config = load_generator_configuration(config, parsed_project)
     if parsed_config.configuration_id != "cfg_000":
         raise ExperimentContractError(f"{family}: main configuration is not cfg_000")
+    if not decomposition_path.is_file():
+        raise ExperimentContractError(f"{family}: missing property decomposition")
+    public_spec = load_public_spec_package(
+        spec, repo / "benchmark/synth/SPECIFICATIONS.sha256"
+    )
+    decomposition = load_property_decomposition(decomposition_path, public_spec)
+    selected_property, selected_primary = SELECTED_AUTHORING_SCOPE[family]
+    selected_scope = build_authoring_scope(
+        decomposition,
+        public_spec,
+        (selected_property,),
+        (selected_primary,),
+    )
+    expected_group = decomposition["component_groups"].get(selected_primary)
+    if (
+        selected_scope["primary_component_ids"] != [selected_primary]
+        or not selected_scope["require_complete_primary_set"]
+        or not expected_group
+        or selected_scope["component_ids"] != expected_group
+    ):
+        raise ExperimentContractError(
+            f"{family}: selected primary component group is incomplete"
+        )
 
     frozen_root = run_dir / "raw/frozen_inputs" / family
     candidates_path = frozen_root / "source_candidate_universe.json"
@@ -308,6 +362,8 @@ def _family_entry(repo: Path, run_dir: Path, family: str) -> dict[str, Any]:
         "project": _ref(repo, project),
         "specification": _ref(repo, spec),
         "configuration": _ref(repo, config),
+        "property_decomposition": _ref(repo, decomposition_path),
+        "selected_authoring_scope": selected_scope,
         "clean": {
             "variant_index": 0,
             "chisel": {
@@ -433,12 +489,18 @@ def _validate_url(url: str) -> None:
 
 
 def prepare(args: argparse.Namespace) -> Path:
+    from src.utils.config import get_llm_settings
+
     repo = Path(args.repo).resolve()
     _validate_url(args.url)
     if not args.model.strip():
         raise ExperimentContractError("model is required; no default is allowed")
-    if args.max_output_tokens < 1:
-        raise ExperimentContractError("max output tokens must be positive")
+    if args.max_output_tokens != sum(P0_OUTPUT_BUDGET):
+        raise ExperimentContractError(
+            f"Development output budget must be {sum(P0_OUTPUT_BUDGET)}"
+        )
+    if sum(P0_OUTPUT_BUDGET) != sum(P1_OUTPUT_BUDGET):
+        raise ExperimentContractError("P0/P1 output budgets differ")
     stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d-%H%M%S")
     run_dir = repo / "runs/specflow-experiments" / f"{stamp}-paper"
     if run_dir.exists():
@@ -463,9 +525,19 @@ def prepare(args: argparse.Namespace) -> Path:
             "corpus": _ref(repo, corpus_path),
             "prompt": _ref(repo, prompt),
             "scoring_script": _ref(repo, scoring),
+            "experiment_runner": _ref(repo, repo / "src/experiments/paper.py"),
+            "direct_baseline": _ref(repo, repo / "src/experiments/direct.py"),
+            "llm_client": _ref(repo, repo / "src/core/llm_client.py"),
+            "specflow_authoring": _ref(
+                repo, repo / "src/chiselspecflow/authoring.py"
+            ),
+            "specflow_tool_schema": _ref(
+                repo, repo / "src/chiselspecflow/authoring_tools.py"
+            ),
             "suite_ledger": _ref(repo, suite_ledger),
             "input_set_sha256": _aggregate_hashes(corpus),
         }
+        environment_extra_body = get_llm_settings()["extra_body"]
         config = {
             "schema_version": "specflow_paper_experiment",
             "experiment_id": run_dir.name,
@@ -476,9 +548,17 @@ def prepare(args: argparse.Namespace) -> Path:
                 "name": args.model,
                 "url": args.url,
                 "temperature": 0,
-                "max_output_tokens": args.max_output_tokens,
-                "hard_token_limit": 32768,
-                "calls_per_task": 1,
+                "max_output_tokens": sum(P0_OUTPUT_BUDGET),
+                "output_budget_tokens": {
+                    "p0": list(P0_OUTPUT_BUDGET),
+                    "p1": list(P1_OUTPUT_BUDGET),
+                },
+                "environment_extra_body": environment_extra_body,
+                "request_mode": {
+                    "thinking": {"type": "disabled"},
+                    "parallel_tool_calls": False,
+                    "tool_choice": "required_named_tool",
+                },
             },
             "specflow_formal": {
                 "global_timeout_seconds": 300,
@@ -529,7 +609,13 @@ def prepare(args: argparse.Namespace) -> Path:
                 }),
             },
         }
+        _write_json(run_dir / "config.development.json", config)
         _write_json(run_dir / "config.json", config)
+        (run_dir / "config.development.sha256").write_text(
+            _sha256(run_dir / "config.development.json")
+            + "  config.development.json\n",
+            encoding="utf-8",
+        )
         for ledger in LEDGERS:
             (run_dir / ledger).touch(exist_ok=False)
         for relative in (
@@ -626,11 +712,15 @@ def convert_vcd(
 def write_report(run_dir: Path) -> None:
     from src.experiments.scoring import status_counts
 
+    decision_path = run_dir / "decision.json"
+    status = "development"
+    if decision_path.is_file():
+        status = json.loads(decision_path.read_text(encoding="utf-8"))["decision"]
     sections = [
         "# SpecFlow paper experiment report",
         "",
         f"- Experiment ID: `{run_dir.name}`",
-        "- Config status: `development`",
+        f"- Config status: `{status}`",
         "",
         "## Canonical ledger status",
         "",
@@ -651,25 +741,743 @@ def write_report(run_dir: Path) -> None:
 
 def validate_prepared(run_dir: Path) -> None:
     config_path = run_dir / "config.json"
+    development_config_path = run_dir / "config.development.json"
     corpus_path = run_dir / "corpus.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    development_config = json.loads(
+        development_config_path.read_text(encoding="utf-8")
+    )
     corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    if config != development_config:
+        raise ExperimentContractError("Development config snapshot differs from config.json")
     if config["experiment_id"] != run_dir.name or corpus["experiment_id"] != run_dir.name:
         raise ExperimentContractError("experiment identity mismatch")
     if len(corpus["families"]) != 10 or len(corpus["coupledl2_cases"]) != 2:
         raise ExperimentContractError("corpus must contain 10 families and 2 CoupledL2 cases")
     if any(entry["main_configuration_id"] != "cfg_000" for entry in corpus["families"]):
         raise ExperimentContractError("every family must use cfg_000")
+    for entry in corpus["families"]:
+        decomposition = entry.get("property_decomposition")
+        scope = entry.get("selected_authoring_scope")
+        if not isinstance(decomposition, dict) or not decomposition.get("sha256"):
+            raise ExperimentContractError(
+                f"{entry['family']}: corpus lacks decomposition hash"
+            )
+        if (
+            not isinstance(scope, dict)
+            or len(scope.get("primary_component_ids", [])) != 1
+            or not scope.get("component_ids")
+            or not scope.get("require_complete_primary_set")
+        ):
+            raise ExperimentContractError(
+                f"{entry['family']}: selected authoring scope is incomplete"
+            )
     required = {
-        "name", "url", "temperature", "max_output_tokens", "hard_token_limit"
+        "name", "url", "temperature", "max_output_tokens",
+        "output_budget_tokens", "request_mode"
     }
     if required - set(config["model"]):
         raise ExperimentContractError("model budget is incomplete")
+    budgets = config["model"]["output_budget_tokens"]
+    if (
+        budgets.get("p0") != list(P0_OUTPUT_BUDGET)
+        or budgets.get("p1") != list(P1_OUTPUT_BUDGET)
+        or sum(budgets["p0"]) != sum(budgets["p1"])
+        or config["model"]["request_mode"]
+        != {
+            "thinking": {"type": "disabled"},
+            "parallel_tool_calls": False,
+            "tool_choice": "required_named_tool",
+        }
+    ):
+        raise ExperimentContractError("P0/P1 request mode or output budget differs")
     if config["frozen_inputs"]["corpus"]["sha256"] != _sha256(corpus_path):
         raise ExperimentContractError("corpus hash mismatch")
     for ledger in LEDGERS:
         if not (run_dir / ledger).is_file():
             raise ExperimentContractError(f"missing canonical ledger: {ledger}")
+
+
+def _verify_frozen_reference(repo: Path, reference: Mapping[str, Any]) -> None:
+    path = _repo_path(repo, reference)
+    if (
+        not path.is_file()
+        or _sha256(path) != reference.get("sha256")
+        or path.stat().st_size != reference.get("size_bytes")
+    ):
+        raise ExperimentContractError(f"frozen input drift: {reference.get('path')}")
+
+
+def _experiment_config(
+    run_dir: Path, repo: Path, group: str
+) -> dict[str, Any]:
+    validate_prepared(run_dir)
+    value = json.loads(
+        (run_dir / "config.development.json").read_text(encoding="utf-8")
+    )
+    decision_path = run_dir / "decision.json"
+    if group == "Development":
+        if decision_path.exists():
+            raise ExperimentContractError("Development decision already exists")
+        if value.get("status") != "development":
+            raise ExperimentContractError(
+                "Development Track P requires development status"
+            )
+        return value
+    if group != "Evaluation":
+        raise ExperimentContractError(f"unknown corpus group: {group}")
+    if not decision_path.is_file():
+        raise ExperimentContractError("Evaluation requires decision.json")
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    if (
+        decision.get("decision") != "frozen"
+        or decision.get("evaluation_authorized") is not True
+    ):
+        raise ExperimentContractError("Evaluation is not authorized by a frozen decision")
+    if decision.get("config_development_sha256") != _sha256(
+        run_dir / "config.development.json"
+    ):
+        raise ExperimentContractError("frozen config drift")
+    decision_digest_path = run_dir / "decision.sha256"
+    expected_decision_line = (
+        _sha256(decision_path) + "  decision.json\n"
+    )
+    if (
+        not decision_digest_path.is_file()
+        or decision_digest_path.read_text(encoding="utf-8")
+        != expected_decision_line
+    ):
+        raise ExperimentContractError("decision hash drift")
+    frozen_inputs = decision.get("frozen_inputs")
+    if not isinstance(frozen_inputs, Mapping):
+        raise ExperimentContractError("frozen decision lacks input references")
+    for name in (
+        "corpus",
+        "prompt",
+        "scoring_script",
+        "experiment_runner",
+        "direct_baseline",
+        "specflow_tool_schema",
+        "specflow_authoring",
+        "llm_client",
+        "suite_ledger",
+    ):
+        reference = frozen_inputs.get(name)
+        if not isinstance(reference, Mapping):
+            raise ExperimentContractError(f"frozen decision lacks {name}")
+        _verify_frozen_reference(repo, reference)
+    if frozen_inputs.get("input_set_sha256") != value["frozen_inputs"].get(
+        "input_set_sha256"
+    ):
+        raise ExperimentContractError("frozen input-set hash drift")
+    return value
+
+
+def _corpus_family(run_dir: Path, family: str, group: str) -> dict[str, Any]:
+    corpus = json.loads((run_dir / "corpus.json").read_text(encoding="utf-8"))
+    matches = [row for row in corpus["families"] if row["family"] == family]
+    if len(matches) != 1 or matches[0]["group"] != group:
+        raise ExperimentContractError(f"not one {group} family: {family}")
+    return matches[0]
+
+
+def _repo_path(repo: Path, reference: Mapping[str, Any]) -> Path:
+    path = Path(reference["path"])
+    return path if path.is_absolute() else repo / path
+
+
+def _scheduled_track_p_tasks(group: str) -> tuple[str, ...]:
+    families = (
+        DEVELOPMENT_FAMILIES if group == "Development" else EVALUATION_FAMILIES
+    )
+    return tuple(f"{family}-{method}" for family in families for method in ("p0", "p1"))
+
+
+def _assert_track_p_task_order(
+    run_dir: Path, group: str, family: str, method: str
+) -> None:
+    task = f"{family}-{method}"
+    schedule = _scheduled_track_p_tasks(group)
+    if task not in schedule:
+        raise ExperimentContractError(f"{task} is not scheduled for {group}")
+    rows = [
+        row
+        for row in _load_jsonl(run_dir / "track_p.jsonl")
+        if row.get("group") == group
+    ]
+    actual = tuple(row.get("task") for row in rows)
+    expected_prefix = schedule[: schedule.index(task)]
+    if actual != expected_prefix:
+        raise ExperimentContractError(
+            f"{group} Track P order mismatch: expected={expected_prefix}, actual={actual}"
+        )
+
+
+def track_p_author(args: argparse.Namespace) -> Path:
+    """Perform the single scheduled authoring action for one P0/P1 task."""
+
+    from src.chiselspecflow.authoring import run_asset_authoring
+    from src.chiselspecflow.config import SpecFlowRunConfig
+    from src.chiselspecflow.preflight import prepare_workspace
+    from src.chiselspecflow.workspace import SpecFlowWorkspace
+    from src.core.llm_client import LLMClient
+    from src.experiments.direct import run_direct_one_shot
+
+    run_dir = Path(args.run).resolve()
+    repo = Path(args.repo).resolve()
+    group = FAMILY_GROUPS[args.family]
+    config = _experiment_config(run_dir, repo, group)
+    family_entry = _corpus_family(run_dir, args.family, group)
+    _assert_track_p_task_order(run_dir, group, args.family, args.method)
+    method_root = run_dir / "raw/track_p" / args.family / args.method
+    source_run = method_root / "source_run"
+    state_path = method_root / "task_state.json"
+    if state_path.exists() or source_run.exists():
+        raise ExperimentContractError(
+            f"scheduled authoring task already started: {args.family}-{args.method}"
+        )
+    method_root.mkdir(parents=True, exist_ok=True)
+    project = _repo_path(repo, family_entry["project"])
+    specification = _repo_path(repo, family_entry["specification"])
+    configuration = _repo_path(repo, family_entry["configuration"])
+    suite_ledger = repo / "benchmark/synth/SPECIFICATIONS.sha256"
+    started = time.monotonic()
+    workspace = prepare_workspace(
+        SpecFlowRunConfig(
+            project_contract=project,
+            specification=specification,
+            configuration=configuration,
+            run_root=method_root,
+            opaque_task_id=f"{args.family}-{args.method}",
+            expected_property_ids=tuple(
+                family_entry["selected_authoring_scope"]["expected_property_ids"]
+            ),
+            component_ids=tuple(
+                family_entry["selected_authoring_scope"]["primary_component_ids"]
+            ),
+        ),
+        source_run,
+        suite_ledger,
+    )
+    client = LLMClient(
+        model=config["model"]["name"],
+        llm_url=config["model"]["url"],
+        raw_response_dir=method_root / "raw_responses",
+    )
+    try:
+        if args.method == "p0":
+            result = run_direct_one_shot(
+                workspace,
+                client,
+                max_tokens=config["model"]["output_budget_tokens"]["p0"][0],
+            )
+        else:
+            result = run_asset_authoring(workspace, client)
+        status = result["status"] if isinstance(result, dict) else result.status
+    except Exception as exc:
+        usage = client.get_token_usage()
+        state = {
+            "schema_version": "track_p_task_state",
+            "task": f"{args.family}-{args.method}",
+            "family": args.family,
+            "method": args.method,
+            "status": "authoring_error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "source_run": str(source_run),
+            "model_usage": usage,
+            "model_request_attempts": int(usage.get("llm_calls", 0)),
+            "wall_time_seconds": time.monotonic() - started,
+        }
+        _write_json(state_path, state)
+        _append_terminal_track_p(run_dir, family_entry, method_root, state)
+        return state_path
+    state = {
+        "schema_version": "track_p_task_state",
+        "task": f"{args.family}-{args.method}",
+        "family": args.family,
+        "method": args.method,
+        "status": status,
+        "source_run": str(source_run),
+        "model_usage": client.get_token_usage(),
+        "model_request_attempts": int(client.get_token_usage().get("llm_calls", 0)),
+        "wall_time_seconds": time.monotonic() - started,
+    }
+    _write_json(state_path, state)
+    expected_ready = "completed" if args.method == "p0" else "awaiting_review"
+    if status != expected_ready:
+        _append_terminal_track_p(run_dir, family_entry, method_root, state)
+    with (run_dir / "run.log").open("a", encoding="utf-8") as stream:
+        stream.write(
+            f"{datetime.now(ZoneInfo('Asia/Shanghai')).isoformat()} "
+            f"authored {args.family}-{args.method} status={status}\n"
+        )
+    return state_path
+
+
+def _append_terminal_track_p(
+    run_dir: Path,
+    family_entry: Mapping[str, Any],
+    method_root: Path,
+    state: Mapping[str, Any],
+) -> Path:
+    row = {
+        "schema_version": "track_p_result",
+        "task": state["task"],
+        "family": state["family"],
+        "group": family_entry["group"],
+        "method": state["method"],
+        "status": state["status"],
+        "error": state.get("error"),
+        "metrics": {
+            "executable_variant_rate": None,
+            "clean_false_alarm": None,
+            "bug_kill_count": None,
+            "bug_count": len(family_entry["bugs"]),
+            "bug_kill_rate": None,
+            "non_vacuous_property_rate": None,
+        },
+        "clean": None,
+        "variants": [],
+        "cost": {
+            "model": state["model_usage"],
+            "model_request_attempts": state.get("model_request_attempts"),
+            "authoring_wall_time_seconds": state["wall_time_seconds"],
+            "formal_wall_time_seconds": 0.0,
+        },
+        "input_hashes": {
+            "corpus_sha256": _sha256(run_dir / "corpus.json"),
+            "config_development_sha256": _sha256(
+                run_dir / "config.development.json"
+            ),
+            "family_input_set_sha256": _aggregate_hashes(family_entry),
+        },
+        "artifacts": {
+            "method_root": str(method_root),
+            "source_run": state["source_run"],
+            "verification_package_sha256": None,
+        },
+    }
+    row_path = method_root / "track_p_row.json"
+    _write_json(row_path, row)
+    append_row(run_dir, "track_p.jsonl", row_path)
+    write_report(run_dir)
+    return row_path
+
+
+def _variant_parameters(family: str, index: int) -> dict[str, Any]:
+    if family == "counter":
+        rows = {
+            1: {"increment": 2, "overflowAtMax": True, "resetCounter": True},
+            2: {"increment": 1, "overflowAtMax": False, "resetCounter": True},
+            3: {"increment": 1, "overflowAtMax": True, "resetCounter": False},
+        }
+        return rows[index]
+    return {"variantIndex": index}
+
+
+def _variant_config(
+    repo: Path,
+    method_root: Path,
+    family_entry: Mapping[str, Any],
+    family: str,
+    index: int,
+) -> Path:
+    clean = json.loads(
+        _repo_path(repo, family_entry["configuration"]).read_text(encoding="utf-8")
+    )
+    value = {
+        "schema_version": clean["schema_version"],
+        "configuration_id": f"paper_bug_{index:02d}",
+        "parameters": _variant_parameters(family, index),
+    }
+    path = method_root / "variant_inputs" / f"bug_{index:02d}.json"
+    _write_json(path, value)
+    return path
+
+
+def _formal_summary(stage2: Path) -> dict[str, Any]:
+    result_map = json.loads(
+        (stage2 / "property_result_map.json").read_text(encoding="utf-8")
+    )
+    evidence = json.loads(
+        (stage2 / "semantic_evidence.json").read_text(encoding="utf-8")
+    )
+    primary = [
+        row for row in evidence["properties"]
+        if isinstance(row.get("primary_status"), str)
+    ]
+    return {
+        "execution_status": result_map["execution_status"],
+        "formal_outcome": result_map["formal_outcome"],
+        "evidence_status": result_map["evidence_status"],
+        "operation_set_complete": result_map["operation_set_complete"],
+        "expected_operation_count": result_map["expected_operation_count"],
+        "accounted_operation_count": result_map["accounted_operation_count"],
+        "status_counts": result_map["status_counts"],
+        "primary_statuses": [row["primary_status"] for row in primary],
+        "non_vacuous_properties": sum(
+            row["evidence_status"] == "complete" for row in primary
+        ),
+        "property_count": len(primary),
+    }
+
+
+def track_p_verify(args: argparse.Namespace) -> Path:
+    """Compile/formal-check clean plus all frozen bugs and append one row."""
+
+    from src.chiselspecflow.config import SpecFlowRunConfig
+    from src.chiselspecflow.preflight import prepare_workspace
+    from src.chiselspecflow.runner import (
+        run_compile_verify,
+        run_direct_compile_verify,
+        run_direct_frozen_package_replay,
+        run_frozen_package_replay,
+    )
+
+    run_dir = Path(args.run).resolve()
+    repo = Path(args.repo).resolve()
+    group = FAMILY_GROUPS[args.family]
+    config = _experiment_config(run_dir, repo, group)
+    family_entry = _corpus_family(run_dir, args.family, group)
+    _assert_track_p_task_order(run_dir, group, args.family, args.method)
+    method_root = run_dir / "raw/track_p" / args.family / args.method
+    state_path = method_root / "task_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    source_run = Path(state["source_run"])
+    if any(
+        row["task"] == f"{args.family}-{args.method}"
+        and row.get("method") == args.method
+        for row in _load_jsonl(run_dir / "track_p.jsonl")
+    ):
+        raise ExperimentContractError("scheduled Track P row already exists")
+    manifest = json.loads((source_run / "manifest.json").read_text(encoding="utf-8"))
+    expected_state = "direct_submission" if args.method == "p0" else "approved"
+    if manifest.get("review_state") != expected_state:
+        raise ExperimentContractError(
+            f"{args.family}-{args.method} is not ready for formal: "
+            f"{manifest.get('review_state')}"
+        )
+    started = time.monotonic()
+    timeout = config["specflow_formal"]["global_timeout_seconds"]
+    per_property = config["specflow_formal"]["per_property_timeout_seconds"]
+
+    def failure_summary(exc: Exception) -> dict[str, Any]:
+        return {
+            "execution_status": "compile_error",
+            "formal_outcome": "not_run",
+            "evidence_status": "incomplete",
+            "operation_set_complete": False,
+            "expected_operation_count": 0,
+            "accounted_operation_count": 0,
+            "status_counts": {},
+            "primary_statuses": [],
+            "non_vacuous_properties": 0,
+            "property_count": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    def record_failure(
+        exc: Exception,
+        *,
+        clean: Mapping[str, Any],
+        variants: list[dict[str, Any]],
+    ) -> Path:
+        row = {
+            "schema_version": "track_p_result",
+            "task": f"{args.family}-{args.method}",
+            "family": args.family,
+            "group": group,
+            "method": args.method,
+            "status": "compile_error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "metrics": {
+                "executable_variant_rate": 0.0,
+                "clean_false_alarm": None,
+                "bug_kill_count": 0,
+                "bug_count": len(family_entry["bugs"]),
+                "bug_kill_rate": 0.0,
+                "non_vacuous_property_rate": None,
+            },
+            "clean": dict(clean),
+            "variants": variants,
+            "cost": {
+                "model": state["model_usage"],
+                "model_request_attempts": state.get("model_request_attempts"),
+                "authoring_wall_time_seconds": state["wall_time_seconds"],
+                "formal_wall_time_seconds": time.monotonic() - started,
+            },
+            "input_hashes": {
+                "corpus_sha256": _sha256(run_dir / "corpus.json"),
+                "config_development_sha256": _sha256(
+                    run_dir / "config.development.json"
+                ),
+                "family_input_set_sha256": _aggregate_hashes(family_entry),
+            },
+            "artifacts": {
+                "method_root": str(method_root),
+                "source_run": str(source_run),
+                "verification_package_sha256": _sha256(
+                    source_run
+                    / "stages/01_asset_authoring/verification_package.json"
+                ),
+            },
+        }
+        row_path = method_root / "track_p_row.json"
+        _write_json(row_path, row)
+        append_row(run_dir, "track_p.jsonl", row_path)
+        write_report(run_dir)
+        return row_path
+
+    clean_runner = (
+        run_direct_compile_verify if args.method == "p0" else run_compile_verify
+    )
+    try:
+        clean_runner(
+            source_run,
+            timeout_seconds=timeout,
+            per_property_seconds=per_property,
+        )
+    except Exception as exc:
+        return record_failure(exc, clean=failure_summary(exc), variants=[])
+    clean_stage = source_run / "stages/02_compile_verify"
+    try:
+        clean_summary = _formal_summary(clean_stage)
+    except Exception as exc:
+        return record_failure(exc, clean=failure_summary(exc), variants=[])
+    variants = []
+    project = _repo_path(repo, family_entry["project"])
+    specification = _repo_path(repo, family_entry["specification"])
+    suite_ledger = repo / "benchmark/synth/SPECIFICATIONS.sha256"
+    replay_runner = (
+        run_direct_frozen_package_replay
+        if args.method == "p0"
+        else run_frozen_package_replay
+    )
+    for bug in family_entry["bugs"]:
+        index = int(bug["variant_index"])
+        variant_config = _variant_config(
+            repo, method_root, family_entry, args.family, index
+        )
+        target_run = method_root / "variants" / f"bug_{index:02d}"
+        prepare_workspace(
+            SpecFlowRunConfig(
+                project_contract=project,
+                specification=specification,
+                configuration=variant_config,
+                run_root=target_run.parent,
+                opaque_task_id=f"{args.family}-{args.method}-bug-{index:02d}",
+                expected_property_ids=tuple(
+                    family_entry["selected_authoring_scope"][
+                        "expected_property_ids"
+                    ]
+                ),
+                component_ids=tuple(
+                    family_entry["selected_authoring_scope"][
+                        "primary_component_ids"
+                    ]
+                ),
+            ),
+            target_run,
+            suite_ledger,
+        )
+        try:
+            replay_runner(
+                target_run,
+                source_run,
+                timeout_seconds=timeout,
+                per_property_seconds=per_property,
+            )
+            summary = _formal_summary(target_run / "stages/02_compile_verify")
+        except Exception as exc:
+            summary = failure_summary(exc)
+        variants.append(
+            {
+                "bug_id": bug["bug_id"],
+                "variant_index": index,
+                "run": str(target_run),
+                "summary": summary,
+            }
+        )
+    killed = [
+        row["bug_id"]
+        for row in variants
+        if "cex" in row["summary"]["primary_statuses"]
+    ]
+    clean_false_alarm = "cex" in clean_summary["primary_statuses"]
+    all_summaries = [clean_summary, *[row["summary"] for row in variants]]
+    executable = sum(
+        summary["operation_set_complete"]
+        and summary["execution_status"] != "tool_error"
+        for summary in all_summaries
+    )
+    row = {
+        "schema_version": "track_p_result",
+        "task": f"{args.family}-{args.method}",
+        "family": args.family,
+        "group": group,
+        "method": args.method,
+        "status": (
+            "completed"
+            if executable == len(all_summaries)
+            else "partial"
+        ),
+        "error": None,
+        "metrics": {
+            "executable_variant_rate": executable / len(all_summaries),
+            "clean_false_alarm": clean_false_alarm,
+            "bug_kill_count": len(killed),
+            "bug_count": len(variants),
+            "bug_kill_rate": len(killed) / len(variants),
+            "non_vacuous_property_rate": (
+                clean_summary["non_vacuous_properties"]
+                / clean_summary["property_count"]
+                if clean_summary["property_count"]
+                else None
+            ),
+        },
+        "clean": clean_summary,
+        "variants": variants,
+        "cost": {
+            "model": state["model_usage"],
+            "model_request_attempts": state.get("model_request_attempts"),
+            "authoring_wall_time_seconds": state["wall_time_seconds"],
+            "formal_wall_time_seconds": time.monotonic() - started,
+        },
+        "input_hashes": {
+            "corpus_sha256": _sha256(run_dir / "corpus.json"),
+            "config_development_sha256": _sha256(
+                run_dir / "config.development.json"
+            ),
+            "family_input_set_sha256": _aggregate_hashes(family_entry),
+        },
+        "artifacts": {
+            "method_root": str(method_root),
+            "source_run": str(source_run),
+            "verification_package_sha256": _sha256(
+                source_run / "stages/01_asset_authoring/verification_package.json"
+            ),
+        },
+    }
+    row_path = method_root / "track_p_row.json"
+    _write_json(row_path, row)
+    append_row(run_dir, "track_p.jsonl", row_path)
+    write_report(run_dir)
+    with (run_dir / "run.log").open("a", encoding="utf-8") as stream:
+        stream.write(
+            f"{datetime.now(ZoneInfo('Asia/Shanghai')).isoformat()} "
+            f"verified {args.family}-{args.method} status={row['status']}\n"
+        )
+    return row_path
+
+
+def _development_rows(run_dir: Path) -> list[dict[str, Any]]:
+    rows = [
+        row
+        for row in _load_jsonl(run_dir / "track_p.jsonl")
+        if row.get("group") == "Development"
+    ]
+    expected = {
+        (family, method)
+        for family in ("counter", "fsm_16", "i2c")
+        for method in ("p0", "p1")
+    }
+    actual = {(row.get("family"), row.get("method")) for row in rows}
+    if actual != expected or len(rows) != 6:
+        raise ExperimentContractError(
+            f"9.4 requires exactly six Development rows; missing={sorted(expected - actual)}"
+        )
+    schema_keys = {tuple(sorted(row)) for row in rows}
+    if len(schema_keys) != 1:
+        raise ExperimentContractError("P0/P1 rows do not share one exact schema")
+    return rows
+
+
+def _has_verification_package_and_clean_run(row: Mapping[str, Any]) -> bool:
+    return (
+        isinstance((row.get("artifacts") or {}).get("verification_package_sha256"), str)
+        and isinstance(row.get("clean"), Mapping)
+        and "execution_status" in row["clean"]
+        and row["clean"].get("operation_set_complete") is True
+    )
+
+
+def _write_development_decision(
+    run_dir: Path,
+    config: Mapping[str, Any],
+    rows: list[dict[str, Any]],
+    decision: str,
+) -> None:
+    decision_path = run_dir / "decision.json"
+    if decision_path.exists():
+        raise ExperimentContractError("Development decision already exists")
+    repo = Path.cwd().resolve()
+    record = {
+        "schema_version": "specflow_development_decision",
+        "experiment_id": run_dir.name,
+        "decision": decision,
+        "evaluation_authorized": decision == "frozen",
+        "decided_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+        "config_development_sha256": _sha256(
+            run_dir / "config.development.json"
+        ),
+        "track_p_development_sha256": _sha256(run_dir / "track_p.jsonl"),
+        "task_statuses": {row["task"]: row["status"] for row in rows},
+        "frozen_inputs": {
+        "corpus": _ref(repo, run_dir / "corpus.json"),
+        "prompt": _ref(repo, repo / "src/experiments/assets/direct_one_shot_prompt.md"),
+        "scoring_script": _ref(repo, repo / "src/experiments/scoring.py"),
+        "experiment_runner": _ref(repo, repo / "src/experiments/paper.py"),
+        "direct_baseline": _ref(repo, repo / "src/experiments/direct.py"),
+        "specflow_tool_schema": _ref(
+            repo, repo / "src/chiselspecflow/authoring_tools.py"
+        ),
+        "specflow_authoring": _ref(repo, repo / "src/chiselspecflow/authoring.py"),
+        "llm_client": _ref(repo, repo / "src/core/llm_client.py"),
+        "suite_ledger": config["frozen_inputs"]["suite_ledger"],
+        "input_set_sha256": config["frozen_inputs"]["input_set_sha256"],
+        },
+    }
+    if decision == "pilot_only":
+        record["reasons"] = [
+            row["task"]
+            for row in rows
+            if not _has_verification_package_and_clean_run(row)
+        ]
+    _write_json(decision_path, record)
+    (run_dir / "decision.sha256").write_text(
+        _sha256(decision_path) + "  decision.json\n",
+        encoding="utf-8",
+    )
+    write_report(run_dir)
+    with (run_dir / "run.log").open("a", encoding="utf-8") as stream:
+        stream.write(
+            f"{record['decided_at']} 9.4 decision={decision} "
+            f"track_p_sha256={record['track_p_development_sha256']}\n"
+        )
+
+
+def freeze_development(run_dir: Path) -> None:
+    """Write the one 9.4 freeze decision without changing Development config."""
+
+    run_dir = Path(run_dir).resolve()
+    config = _experiment_config(run_dir, Path.cwd().resolve(), "Development")
+    rows = _development_rows(run_dir)
+    if not all(_has_verification_package_and_clean_run(row) for row in rows):
+        raise ExperimentContractError(
+            "freeze requires six packages and six clean deterministic verification runs"
+        )
+    _write_development_decision(run_dir, config, rows, "frozen")
+
+
+def close_development_pilot(run_dir: Path) -> None:
+    """Record the 9.4 no-freeze decision when Development requires changes."""
+
+    run_dir = Path(run_dir).resolve()
+    config = _experiment_config(run_dir, Path.cwd().resolve(), "Development")
+    rows = _development_rows(run_dir)
+    if all(_has_verification_package_and_clean_run(row) for row in rows):
+        raise ExperimentContractError("Development passed; use the freeze gate")
+    _write_development_decision(run_dir, config, rows, "pilot_only")
 
 
 def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -701,6 +1509,36 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
     convert_parser.add_argument("--case-id", required=True)
     convert_parser.add_argument("--property-id", required=True)
 
+    author_parser = actions.add_parser("track-p-author")
+    author_parser.add_argument("--run", required=True)
+    author_parser.add_argument("--repo", default=".")
+    author_parser.add_argument(
+        "--family", required=True, choices=list(FAMILY_GROUPS)
+    )
+    author_parser.add_argument("--method", required=True, choices=["p0", "p1"])
+
+    verify_parser = actions.add_parser("track-p-verify")
+    verify_parser.add_argument("--run", required=True)
+    verify_parser.add_argument("--repo", default=".")
+    verify_parser.add_argument(
+        "--family", required=True, choices=list(FAMILY_GROUPS)
+    )
+    verify_parser.add_argument("--method", required=True, choices=["p0", "p1"])
+
+    freeze_parser = actions.add_parser("freeze")
+    freeze_parser.add_argument("--run", required=True)
+
+    terminal_parser = actions.add_parser("record-terminal-authoring")
+    terminal_parser.add_argument("--run", required=True)
+    terminal_parser.add_argument("--repo", default=".")
+    terminal_parser.add_argument(
+        "--family", required=True, choices=["counter", "fsm_16", "i2c"]
+    )
+    terminal_parser.add_argument("--method", required=True, choices=["p0", "p1"])
+
+    pilot_parser = actions.add_parser("close-pilot")
+    pilot_parser.add_argument("--run", required=True)
+
 
 def run(args: argparse.Namespace) -> None:
     if args.experiment_action == "prepare":
@@ -730,5 +1568,34 @@ def run(args: argparse.Namespace) -> None:
         print(json.dumps(record, ensure_ascii=False, sort_keys=True))
         if record["status"] != "complete":
             raise SystemExit(1)
+    elif args.experiment_action == "track-p-author":
+        state_path = track_p_author(args)
+        print(json.dumps({"task_state": str(state_path)}, sort_keys=True))
+    elif args.experiment_action == "track-p-verify":
+        row_path = track_p_verify(args)
+        print(json.dumps({"track_p_row": str(row_path)}, sort_keys=True))
+    elif args.experiment_action == "freeze":
+        freeze_development(run_dir)
+        print(json.dumps({"run_dir": str(run_dir), "status": "frozen"}, sort_keys=True))
+    elif args.experiment_action == "record-terminal-authoring":
+        family_entry = _corpus_family(
+            run_dir, args.family, FAMILY_GROUPS[args.family]
+        )
+        method_root = run_dir / "raw/track_p" / args.family / args.method
+        state = json.loads(
+            (method_root / "task_state.json").read_text(encoding="utf-8")
+        )
+        row_path = _append_terminal_track_p(
+            run_dir, family_entry, method_root, state
+        )
+        print(json.dumps({"track_p_row": str(row_path)}, sort_keys=True))
+    elif args.experiment_action == "close-pilot":
+        close_development_pilot(run_dir)
+        print(
+            json.dumps(
+                {"run_dir": str(run_dir), "status": "pilot_only"},
+                sort_keys=True,
+            )
+        )
     else:
         raise ExperimentContractError(f"unknown experiment action: {args.experiment_action}")

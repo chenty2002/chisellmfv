@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
@@ -27,6 +29,7 @@ class LLMClient:
         model_role: str = "main",
         max_token_budget: Optional[int] = None,
         budget_ledger: Optional[RunBudgetLedger] = None,
+        raw_response_dir: Optional[Path] = None,
     ):
         settings = get_llm_settings()
         self.model = model or settings["model"]
@@ -36,6 +39,9 @@ class LLMClient:
         self.logger = logger
         self.model_role = model_role
         self.budget_ledger = budget_ledger or RunBudgetLedger(max_token_budget)
+        self.raw_response_dir = (
+            Path(raw_response_dir).resolve() if raw_response_dir is not None else None
+        )
         self.session = requests.Session()
         self.usage = {
             "llm_calls": 0,
@@ -61,21 +67,27 @@ class LLMClient:
         usage_metadata: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         wire_tools = [{"type": "function", "function": tool} for tool in tools]
-        payload: Dict[str, Any] = {
+        payload: Dict[str, Any] = dict(self.extra_body)
+        payload.update({
             "model": self.model,
             "messages": messages,
             "tools": wire_tools,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": False,
-        }
+        })
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
         if parallel_tool_calls is not None:
             payload["parallel_tool_calls"] = parallel_tool_calls
         if enable_thinking is not None:
-            payload["enable_thinking"] = enable_thinking
-        payload.update(self.extra_body)
+            # DeepSeek's OpenAI-format API uses the structured ``thinking``
+            # switch.  Remove the retired environment key so it cannot keep
+            # thinking enabled after a caller explicitly disables it.
+            payload.pop("enable_thinking", None)
+            payload["thinking"] = {
+                "type": "enabled" if enable_thinking else "disabled"
+            }
 
         estimated = _count_tokens(messages) + _count_tokens(wire_tools) + max_tokens
         metadata = usage_metadata or {}
@@ -89,7 +101,11 @@ class LLMClient:
             json=payload,
             timeout=120,
         )
-        response.raise_for_status()
+        if not response.ok:
+            raise requests.HTTPError(
+                f"{response.status_code} model request failed: {response.text[:2000]}",
+                response=response,
+            )
         result = response.json()
         usage = result.get("usage") or {}
         prompt = int(usage.get("prompt_tokens", 0) or 0)
@@ -111,6 +127,42 @@ class LLMClient:
         choice = result["choices"][0]
         message = choice["message"]
         calls = message.get("tool_calls") or []
+        self._save_raw_response(
+            {
+                "schema_version": "llm_raw_response",
+                "request": {
+                    "model": self.model,
+                    "message_count": len(messages),
+                    "messages_sha256": hashlib.sha256(
+                        json.dumps(
+                            messages,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    "tool_names": [tool["name"] for tool in tools],
+                    "max_output_tokens": max_tokens,
+                    "temperature": temperature,
+                    "tool_choice": tool_choice,
+                    "enable_thinking": enable_thinking,
+                    "parallel_tool_calls": parallel_tool_calls,
+                    "usage_metadata": metadata,
+                },
+                "response_id": result.get("id"),
+                "finish_reason": choice.get("finish_reason"),
+                "usage": usage,
+                "text": message.get("content"),
+                "raw_tool_calls": [
+                    {
+                        "id": call.get("id"),
+                        "name": (call.get("function") or {}).get("name"),
+                        "arguments": (call.get("function") or {}).get("arguments"),
+                    }
+                    for call in calls
+                ],
+            }
+        )
         if not calls:
             return {
                 "type": "text",
@@ -122,7 +174,22 @@ class LLMClient:
             function = call["function"]
             arguments = function["arguments"]
             if isinstance(arguments, str):
-                arguments = json.loads(arguments)
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    try:
+                        # Some OpenAI-compatible providers emit literal newlines
+                        # inside otherwise valid JSON strings.  Accept only that
+                        # JSON-standard-library relaxation; typed tool validators
+                        # still enforce the complete submitted contract.
+                        arguments = json.loads(arguments, strict=False)
+                    except json.JSONDecodeError:
+                        return {
+                            "type": "invalid_tool_arguments",
+                            "content": message.get("content", ""),
+                            "finish_reason": choice.get("finish_reason"),
+                            "parse_error": str(exc),
+                        }
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must decode to a JSON object")
             parsed.append(
@@ -145,6 +212,18 @@ class LLMClient:
         for key in self.usage:
             self.usage[key] = 0
         self.budget_ledger.reset()
+
+    def _save_raw_response(self, value: Dict[str, Any]) -> None:
+        if self.raw_response_dir is None:
+            return
+        self.raw_response_dir.mkdir(parents=True, exist_ok=True)
+        path = self.raw_response_dir / f"response_{self.usage['llm_calls']:02d}.json"
+        if path.exists():
+            raise FileExistsError(f"raw model response already exists: {path}")
+        path.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
 
 def _chat_url(value: str) -> str:

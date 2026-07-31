@@ -42,7 +42,12 @@ def main_specflow(args: argparse.Namespace) -> None:
         )
         result = run_asset_authoring(
             workspace,
-            LLMClient(max_token_budget=args.max_tokens),
+            LLMClient(
+                model=args.model,
+                llm_url=args.url,
+                max_token_budget=args.max_tokens,
+                raw_response_dir=run_dir / "logs/raw_model_responses",
+            ),
         )
         print(
             json.dumps(
@@ -228,6 +233,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--expected-property-id", action="append")
     start.add_argument("--component-id", action="append")
     start.add_argument("--max-tokens", type=int)
+    start.add_argument("--model")
+    start.add_argument("--url")
     review = actions.add_parser("review")
     review.add_argument("--run", required=True)
     review.add_argument("--review-record", required=True)

@@ -869,6 +869,15 @@ def _evaluate_expression(
             return None
         width = node["high"] - node["low"] + 1
         return (int(value) >> node["low"]) & ((1 << width) - 1)
+    if op == "lookup_table":
+        index = 0
+        for selector in node["selectors"]:
+            value = _evaluate_expression(selector, objects, states)
+            if value is None:
+                return None
+            width = int(selector["result_type"]["width"])
+            index = (index << width) | int(value)
+        return node["values"][index]
     if op == "bounded_counter_relation":
         value = states.get(node["counter_state_id"])
         if value is None:
