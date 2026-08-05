@@ -88,6 +88,7 @@ def elaborate_baseline(
     modules = []
     files = []
     for sv_path in sv_files:
+        _remove_circt_resource_file_list(sv_path)
         text = sv_path.read_text(encoding="utf-8")
         module_blocks = _module_blocks(text)
         if not module_blocks:

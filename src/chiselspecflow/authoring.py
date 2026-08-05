@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol
 
@@ -15,7 +16,9 @@ from src.core.formal_operations import canonical_sha256
 from .assets import AssetLibrary, load_reviewed_assets
 from .authoring_tools import (
     AMBIGUITY_TOOL_NAME,
+    bind_and_instantiate_tools,
     binding_tools,
+    extract_obligation_tools,
     monitor_tools,
     obligation_tools,
 )
@@ -29,6 +32,7 @@ from .ir.binding import BindingValidationError, validate_binding
 from .ir.monitor import MonitorValidationError, validate_monitor
 from .ir.obligation import ObligationValidationError, validate_obligation
 from .ir.semantic import validate_semantic_index
+from .monitor_compiler import materialize_generic_bindings
 from .stages import get_stage_spec
 from .property_decomposition import validate_property_decomposition
 from .workspace import SpecFlowWorkspace
@@ -371,6 +375,615 @@ def run_asset_authoring(
     )
     _set_review_state(workspace, "awaiting_review")
     return AuthoringResult("awaiting_review", stage_dir, stage_dir / "review_request.json", calls)
+
+
+def run_two_stage_authoring(
+    workspace: SpecFlowWorkspace,
+    model: AuthoringModel,
+    *,
+    max_tokens: tuple[int, int],
+    asset_library: Optional[AssetLibrary] = None,
+) -> Dict[str, Any]:
+    """Create one run-local S2 package with exactly two compact model calls."""
+
+    if len(max_tokens) != 2 or any(value < 1 for value in max_tokens):
+        raise ValueError("two positive output budgets are required")
+    assets = asset_library or load_reviewed_assets()
+    manifest = _read_json(workspace.manifest_path)
+    if manifest.get("preflight_status") != "index_ready":
+        raise AuthoringError("preflight_incomplete", "semantic index is not frozen")
+    stage_dir = workspace.stage_dir("asset_authoring")
+    if any(stage_dir.iterdir()):
+        raise FileExistsError("two-stage authoring directory is immutable once written")
+
+    semantic = validate_semantic_index(
+        _read_json(workspace.indexes_dir / "chisel_semantic_index.json")
+    )
+    confirmed = [
+        row
+        for row in semantic["objects"]
+        if row.get("fact_status") == "elaboration_confirmed"
+        and row.get("accessibility") in {"direct", "wrapper"}
+    ]
+    public_spec = _read_json(workspace.inputs_dir / "public_spec_package.json")
+    scope = _read_json(workspace.inputs_dir / "authoring_scope.json")
+    project = _read_json(workspace.inputs_dir / "project_contract.json")
+    configuration = _read_json(workspace.inputs_dir / "configuration.json")
+    clauses = _clause_slices(
+        workspace.inputs_dir / "specification.md", scope["clause_ids"]
+    )
+    adapters = [
+        (asset_id, row)
+        for asset_id, row in assets.api_adapters.items()
+        if row.get("project_id") == project["project_id"]
+        and row.get("strategy") == "wrapper"
+    ]
+    if len(adapters) != 1:
+        raise AuthoringError("adapter_unavailable", "one project wrapper is required")
+    adapter_id = adapters[0][0]
+    primary_ids = list(scope["primary_component_ids"])
+    stage_inputs = {
+        "schema_version": STAGE_INPUTS_SCHEMA,
+        "round_id": 1,
+        "method": "two_stage_specflow",
+        "project": {
+            "project_id": project["project_id"],
+            "generator": project["generator"],
+            "formal": project["formal"],
+        },
+        "configuration": configuration,
+        "specification": {
+            "specification_id": public_spec["specification_id"],
+            "spec_sha256": public_spec["spec_sha256"],
+            "clauses": clauses,
+            "full_text": (workspace.inputs_dir / "specification.md").read_text(
+                encoding="utf-8"
+            ),
+        },
+        "authoring_scope": scope,
+        "semantic_objects": confirmed,
+        "asset_library": assets.snapshot(),
+        "input_hashes": manifest["input_hashes"],
+        "index_hashes": manifest["index_hashes"],
+    }
+    _write_json(stage_dir / "stage_inputs.json", stage_inputs)
+    audits: list[Dict[str, Any]] = []
+    attempts: list[Dict[str, Any]] = []
+    refs: list[str] = []
+    try:
+        intents, _used, intent_refs = _request_candidates(
+            model,
+            expected_tool="extract_obligations",
+            tools=extract_obligation_tools(
+                [row["locator"] for row in clauses], count=len(primary_ids)
+            ),
+            context={
+                "task": "select one typed obligation intent for each primary component",
+                "stage_inputs": stage_inputs,
+            },
+            validator=lambda rows: _validate_extracted_intents(
+                rows, clauses, len(primary_ids)
+            ),
+            audit_log=audits,
+            candidate_attempt_log=attempts,
+            max_tokens=max_tokens[0],
+        )
+        refs.extend(intent_refs)
+        indexed = [
+            {"obligation_ref": f"obligation_{index:02d}", **row}
+            for index, row in enumerate(intents, 1)
+        ]
+        instances, _used, instance_refs = _request_candidates(
+            model,
+            expected_tool="bind_and_instantiate",
+            tools=bind_and_instantiate_tools(
+                [row["obligation_ref"] for row in indexed],
+                confirmed,
+                assets.monitor_archetypes,
+            ),
+            context={
+                "task": (
+                    "select elaboration-confirmed objects and fill archetype slots; "
+                    "use the literal role name none for an unused optional role"
+                ),
+                "obligations": indexed,
+                "semantic_objects": confirmed,
+                "component_role_hints": scope["component_role_hints"],
+                "archetypes": [
+                    dict(assets.monitor_archetypes[asset_id])
+                    for asset_id in sorted(assets.monitor_archetypes)
+                ],
+            },
+            validator=lambda rows: _validate_instances(
+                rows, indexed, confirmed, assets.monitor_archetypes
+            ),
+            audit_log=audits,
+            candidate_attempt_log=attempts,
+            max_tokens=max_tokens[1],
+        )
+        refs.extend(instance_refs)
+        obligations, bindings, monitors = _materialize_two_stage_candidates(
+            indexed=indexed,
+            instances=instances,
+            primary_ids=primary_ids,
+            scope=scope,
+            clauses=clauses,
+            public_spec=public_spec,
+            configuration=configuration,
+            semantic=semantic,
+            assets=assets,
+            adapter_id=adapter_id,
+        )
+    except (AuthoringError, ValueError) as exc:
+        _write_jsonl(_model_log_path(workspace, 1), audits)
+        _write_jsonl(_candidate_attempt_log_path(workspace, 1), attempts)
+        _write_json(
+            stage_dir / "authoring_candidates.json",
+            {
+                "schema_version": AUTHORING_CANDIDATES_SCHEMA,
+                "status": "invalid",
+                "obligations": [],
+                "bindings": [],
+                "monitors": [],
+                "model_call_refs": refs,
+                "error": str(exc),
+            },
+        )
+        return write_stage_outcome(
+            stage_dir,
+            get_stage_spec("asset_authoring"),
+            {
+                "success": False,
+                "status": "invalid_submission",
+                "error_kind": getattr(exc, "code", "invalid_submission"),
+                "error": str(exc),
+                "method": "two_stage_specflow",
+                "model_calls": len(audits),
+            },
+            source_state=manifest,
+        )
+
+    _write_jsonl(_model_log_path(workspace, 1), audits)
+    _write_jsonl(_candidate_attempt_log_path(workspace, 1), attempts)
+    candidates = {
+        "schema_version": AUTHORING_CANDIDATES_SCHEMA,
+        "status": "run_local_evaluation",
+        "obligations": obligations,
+        "bindings": bindings,
+        "monitors": monitors,
+        "model_call_refs": refs,
+    }
+    _write_json(stage_dir / "authoring_candidates.json", candidates)
+    delta = {
+        "schema_version": CANDIDATE_ASSET_DELTA_SCHEMA,
+        "base_asset_library_sha256": canonical_sha256(stage_inputs["asset_library"]),
+        "new_run_local_ids": sorted(
+            {row["obligation_id"] for row in obligations}
+            | {row["binding_id"] for row in bindings}
+            | {row["monitor_id"] for row in monitors}
+        ),
+        "modified_reviewed_asset_ids": [],
+    }
+    _write_json(stage_dir / "candidate_asset_delta.json", delta)
+    authored_at = datetime.now(timezone.utc).isoformat()
+    review = {
+        "schema_version": "specflow_experiment_authoring_record",
+        "authority": "run_local_evaluation_only",
+        "reviewer": "none",
+        "reviewed_at": authored_at,
+        "candidate_sha256": file_sha256(stage_dir / "authoring_candidates.json"),
+        "promotion_allowed": False,
+    }
+    _write_json(stage_dir / "review_record.json", review)
+    package_body = {
+        "schema_version": "verification_package",
+        "project_id": project["project_id"],
+        "configuration_id": configuration["configuration_id"],
+        "round_id": 1,
+        "input_hashes": manifest["input_hashes"],
+        "asset_library": assets.snapshot(),
+        "obligations": obligations,
+        "bindings": bindings,
+        "monitors": monitors,
+        "review": {
+            "review_record_sha256": file_sha256(stage_dir / "review_record.json"),
+            "reviewer": "none_specflow_experiment",
+            "reviewed_at": authored_at,
+            "semantic_intent_decisions": [],
+        },
+    }
+    package = dict(package_body)
+    package["package_id"] = "s2pkg_" + canonical_sha256(package_body)[:24]
+    _write_json(stage_dir / "verification_package.json", package)
+    manifest["review_state"] = "direct_submission"
+    _write_json(workspace.manifest_path, manifest)
+    return write_stage_outcome(
+        stage_dir,
+        get_stage_spec("asset_authoring"),
+        {
+            "success": True,
+            "status": "completed",
+            "method": "two_stage_specflow",
+            "model_calls": 2,
+            "package_id": package["package_id"],
+            "verification_package_sha256": file_sha256(
+                stage_dir / "verification_package.json"
+            ),
+        },
+        source_state=manifest,
+    )
+
+
+def _validate_extracted_intents(
+    rows: list[Mapping[str, Any]],
+    clauses: list[Mapping[str, Any]],
+    count: int,
+) -> list[Dict[str, Any]]:
+    allowed_fields = {
+        "clause_locator",
+        "family",
+        "temporal_kind",
+        "min_cycles",
+        "max_cycles",
+        "relation",
+        "archetype_hint",
+        "support_status",
+    }
+    locators = {row["locator"] for row in clauses}
+    if len(rows) != count:
+        raise AuthoringError("incomplete_obligation_set", f"expected {count} intents")
+    normalized = []
+    for row in rows:
+        if set(row) != allowed_fields or row.get("clause_locator") not in locators:
+            raise AuthoringError("invalid_obligation_intent", "intent fields or clause differ")
+        if row.get("support_status") != "supported":
+            raise AuthoringError("unsupported_obligation", str(row.get("support_status")))
+        minimum, maximum = row.get("min_cycles"), row.get("max_cycles")
+        if (
+            not isinstance(minimum, int)
+            or isinstance(minimum, bool)
+            or not isinstance(maximum, int)
+            or isinstance(maximum, bool)
+            or minimum < 0
+            or maximum < minimum
+        ):
+            raise AuthoringError("invalid_temporal_bound", str((minimum, maximum)))
+        normalized.append(dict(row))
+    return normalized
+
+
+def _validate_instances(
+    rows: list[Mapping[str, Any]],
+    indexed: list[Mapping[str, Any]],
+    semantic_objects: list[Mapping[str, Any]],
+    archetypes: Mapping[str, Mapping[str, Any]],
+) -> list[Dict[str, Any]]:
+    refs = {row["obligation_ref"] for row in indexed}
+    intents = {row["obligation_ref"]: row for row in indexed}
+    objects = {row["object_id"] for row in semantic_objects}
+    if len(rows) != len(refs):
+        raise AuthoringError("incomplete_instantiation_set", "one instance per obligation")
+    normalized = []
+    seen = set()
+    for row in rows:
+        if set(row) != {"obligation_ref", "archetype_id", "bindings", "slots"}:
+            raise AuthoringError("invalid_instantiation", "instance fields differ")
+        ref = row.get("obligation_ref")
+        if ref not in refs or ref in seen or row.get("archetype_id") not in archetypes:
+            raise AuthoringError("invalid_instantiation", str(ref))
+        if row["archetype_id"] != intents[ref]["archetype_hint"]:
+            raise AuthoringError(
+                "invalid_instantiation", "archetype differs from extracted intent"
+            )
+        bindings = row.get("bindings")
+        if not isinstance(bindings, list) or not bindings:
+            raise AuthoringError("invalid_instantiation", "bindings are empty")
+        roles = set()
+        for binding in bindings:
+            if (
+                not isinstance(binding, Mapping)
+                or set(binding) != {"role", "object_id"}
+                or not isinstance(binding["role"], str)
+                or not binding["role"].strip()
+                or binding["role"] in roles
+                or binding["object_id"] not in objects
+            ):
+                raise AuthoringError("invalid_instantiation", "binding selection is invalid")
+            roles.add(binding["role"])
+        slots = row.get("slots")
+        expected_slots = {
+            "lhs_role",
+            "rhs_role",
+            "guard_role",
+            "trigger_role",
+            "response_role",
+            "use_expected_literal",
+            "expected_literal",
+            "use_lookup_table",
+            "selector_roles",
+            "lookup_values",
+            "bound",
+        }
+        if not isinstance(slots, Mapping) or set(slots) != expected_slots:
+            raise AuthoringError("invalid_instantiation", "slot fields differ")
+        required_roles = {slots["lhs_role"]}
+        if not slots["use_expected_literal"] and not slots["use_lookup_table"]:
+            required_roles.add(slots["rhs_role"])
+        if slots["use_lookup_table"]:
+            required_roles.update(slots["selector_roles"])
+            if len(slots["lookup_values"]) < 2:
+                raise AuthoringError("invalid_instantiation", "lookup table is incomplete")
+        for name in ("guard_role", "trigger_role", "response_role"):
+            if slots[name] != "none":
+                required_roles.add(slots[name])
+        if not required_roles <= roles:
+            raise AuthoringError(
+                "invalid_instantiation", str(sorted(required_roles - roles))
+            )
+        seen.add(ref)
+        normalized.append(dict(row))
+    return normalized
+
+
+def _raw_literal(value: Any, value_type: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"op": "literal", "value": value, "type": dict(value_type)}
+
+
+def _raw_object(object_id: str) -> Dict[str, Any]:
+    return {"op": "object_ref", "object_id": object_id}
+
+
+def _raw_compare(
+    relation: str, lhs: Mapping[str, Any], rhs: Mapping[str, Any]
+) -> Dict[str, Any]:
+    return {"op": relation, "lhs": dict(lhs), "rhs": dict(rhs)}
+
+
+def _materialize_two_stage_candidates(
+    *,
+    indexed: list[Mapping[str, Any]],
+    instances: list[Mapping[str, Any]],
+    primary_ids: list[str],
+    scope: Mapping[str, Any],
+    clauses: list[Mapping[str, Any]],
+    public_spec: Mapping[str, Any],
+    configuration: Mapping[str, Any],
+    semantic: Mapping[str, Any],
+    assets: AssetLibrary,
+    adapter_id: str,
+) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]], list[Dict[str, Any]]]:
+    by_ref = {row["obligation_ref"]: row for row in instances}
+    clause_by_id = {row["locator"]: row for row in clauses}
+    object_rows = {row["object_id"]: row for row in semantic["objects"]}
+    object_types = {
+        object_id: {
+            "kind": row["chisel_type"]["kind"],
+            "width": row["chisel_type"]["width"],
+            "signed": row["chisel_type"]["signed"],
+        }
+        for object_id, row in object_rows.items()
+        if row.get("fact_status") == "elaboration_confirmed"
+    }
+    obligations: list[Dict[str, Any]] = []
+    all_bindings: list[Dict[str, Any]] = []
+    monitors: list[Dict[str, Any]] = []
+    bool_type = {"kind": "Bool", "width": 1, "signed": False}
+    for primary_id, intent in zip(primary_ids, indexed):
+        instance = by_ref[intent["obligation_ref"]]
+        archetype_id = instance["archetype_id"]
+        expected_archetype = _selected_monitor_archetype(scope["component_role_hints"])
+        if archetype_id != expected_archetype:
+            raise AuthoringError(
+                "archetype_role_mismatch",
+                f"{archetype_id} cannot provide {sorted(scope['component_role_hints'].values())}",
+            )
+        bindings = materialize_generic_bindings(
+            instance["bindings"],
+            semantic,
+            obligation_id=primary_id,
+            configuration_id=configuration["configuration_id"],
+            adapter_id=adapter_id,
+        )
+        role_objects = {
+            row["semantic_role"]: row["object_id"] for row in bindings
+        }
+        slots = instance["slots"]
+        lhs_id = role_objects[slots["lhs_role"]]
+        lhs = _raw_object(lhs_id)
+        lhs_type = object_types[lhs_id]
+        if slots["use_lookup_table"]:
+            rhs = {
+                "op": "lookup_table",
+                "selectors": [
+                    _raw_object(role_objects[role])
+                    for role in slots["selector_roles"]
+                ],
+                "values": list(slots["lookup_values"]),
+                "type": lhs_type,
+            }
+        elif slots["use_expected_literal"]:
+            literal: Any = slots["expected_literal"]
+            if lhs_type["kind"] == "Bool":
+                if literal not in (0, 1):
+                    raise AuthoringError("type_mismatch", "Bool literal must be 0 or 1")
+                literal = bool(literal)
+            rhs = _raw_literal(literal, lhs_type)
+        else:
+            rhs = _raw_object(role_objects[slots["rhs_role"]])
+        guard = (
+            _raw_literal(True, bool_type)
+            if slots["guard_role"] == "none"
+            else _raw_object(role_objects[slots["guard_role"]])
+        )
+        trigger = (
+            guard
+            if slots["trigger_role"] == "none"
+            else _raw_object(role_objects[slots["trigger_role"]])
+        )
+        relation = _raw_compare(intent["relation"], lhs, rhs)
+        clause = clause_by_id[intent["clause_locator"]]
+        obligation = {
+            "obligation_id": primary_id,
+            "clause_ref": {
+                "spec_sha256": public_spec["spec_sha256"],
+                "locator": clause["locator"],
+                "text_sha256": clause["text_sha256"],
+            },
+            "family": intent["family"],
+            "polarity": "guarantee",
+            "entities": sorted(set(role_objects.values())),
+            "trigger": trigger,
+            "guard": guard,
+            "expected": relation,
+            "temporal": {
+                "kind": intent["temporal_kind"],
+                "min_cycles": intent["min_cycles"],
+                "max_cycles": intent["max_cycles"],
+            },
+            "reset_semantics": "disabled while reset",
+            "observation_roles": sorted(role_objects),
+            "configuration_domain": [configuration["configuration_id"]],
+            "support_status": "candidate",
+            "authoring_provenance": {
+                "kind": "model_call",
+                "ref": intent["obligation_ref"],
+            },
+        }
+        state: list[Dict[str, Any]] = []
+        property_expression = relation
+        if archetype_id == "previous_value":
+            if lhs_type != bool_type:
+                raise AuthoringError("type_mismatch", "previous_value requires Bool lhs")
+            state_id = f"{primary_id}.previous"
+            state = [
+                {
+                    "state_id": state_id,
+                    "type": lhs_type,
+                    "init": _raw_literal(False, bool_type),
+                    "update": lhs,
+                    "clear": _raw_literal(False, bool_type),
+                }
+            ]
+            property_expression = _raw_compare(
+                intent["relation"], lhs, {"op": "previous_value", "state_id": state_id}
+            )
+        elif archetype_id in {"bounded_counter", "lifecycle"}:
+            response = (
+                relation
+                if slots["response_role"] == "none"
+                else _raw_object(role_objects[slots["response_role"]])
+            )
+            width = max(1, int(slots["bound"] + 1).bit_length())
+            uint_type = {"kind": "UInt", "width": width, "signed": False}
+            active_id = f"{primary_id}.active"
+            age_id = f"{primary_id}.age"
+            state = [
+                {
+                    "state_id": active_id,
+                    "type": bool_type,
+                    "init": _raw_literal(False, bool_type),
+                    "update": trigger,
+                    "clear": response,
+                },
+                {
+                    "state_id": age_id,
+                    "type": uint_type,
+                    "init": _raw_literal(0, uint_type),
+                    "update": {
+                        "op": "add",
+                        "lhs": {"op": "previous_value", "state_id": age_id},
+                        "rhs": _raw_literal(1, uint_type),
+                    },
+                    "clear": response,
+                },
+            ]
+            property_expression = {
+                "op": "or",
+                "args": [
+                    response,
+                    {
+                        "op": "bounded_counter_relation",
+                        "counter_state_id": age_id,
+                        "relation": "le",
+                        "bound": slots["bound"],
+                    },
+                ],
+            }
+        properties = []
+        for component_id in scope["component_ids"]:
+            role = scope["component_role_hints"][component_id]
+            expression = property_expression
+            if role == "activation_cover":
+                expression = trigger
+            elif role == "observer_cover":
+                expression = relation
+            elif role == "state_cover":
+                expression = (
+                    {"op": "previous_value", "state_id": state[0]["state_id"]}
+                    if state
+                    else relation
+                )
+            elif role == "assumption_sat":
+                expression = guard
+            properties.append(
+                {
+                    "source_property_id": component_id,
+                    "role": role,
+                    "expression_ir": expression,
+                    "guard_ir": guard,
+                }
+            )
+        monitor = {
+            "monitor_id": f"{primary_id}.monitor",
+            "obligation_id": primary_id,
+            "archetype_id": archetype_id,
+            "archetype_sha256": assets.monitor_archetypes[archetype_id]["sha256"],
+            "binding_refs": [row["binding_id"] for row in bindings],
+            "state": state,
+            "properties": properties,
+            "reset_policy": "disable_while_reset",
+            "overlay": {
+                "strategy": "wrapper",
+                "wrapper_top": "SpecFlowOverlay",
+                "host_scope": "SpecFlowOverlay",
+            },
+            "required_observations": [row["binding_id"] for row in bindings],
+            "configuration_domain": [configuration["configuration_id"]],
+        }
+        obligations.extend(
+            _validate_obligations(
+                [obligation],
+                object_types,
+                clauses,
+                public_spec["spec_sha256"],
+                configuration["configuration_id"],
+                {primary_id},
+                True,
+            )
+        )
+        all_bindings.extend(
+            _validate_bindings(
+                bindings,
+                semantic,
+                {primary_id},
+                configuration["configuration_id"],
+                {adapter_id},
+            )
+        )
+        monitors.extend(
+            _validate_monitors(
+                [monitor],
+                object_types,
+                {primary_id},
+                {row["binding_id"] for row in bindings},
+                assets,
+                configuration["configuration_id"],
+                set(scope["component_ids"]),
+                scope["component_role_hints"],
+                True,
+            )
+        )
+    return obligations, all_bindings, monitors
 
 
 def _request_candidates(

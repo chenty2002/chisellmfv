@@ -1064,6 +1064,40 @@ def _append_terminal_track_p(
     return row_path
 
 
+def _terminal_authoring_state(method_root: Path) -> dict[str, Any]:
+    """Resolve the terminal P1 state after the one external review."""
+
+    state_path = method_root / "task_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("status") != "awaiting_review":
+        return state
+    if state.get("method") != "p1":
+        raise ExperimentContractError("only P1 may await external review")
+    source_run = Path(state["source_run"])
+    manifest = json.loads(
+        (source_run / "manifest.json").read_text(encoding="utf-8")
+    )
+    stage_result = json.loads(
+        (
+            source_run
+            / "stages/01_asset_authoring/stage_result.json"
+        ).read_text(encoding="utf-8")
+    )
+    if (
+        manifest.get("review_state") != "rejected"
+        or stage_result.get("status") != "rejected"
+        or stage_result.get("error_kind") != "review_rejected"
+    ):
+        raise ExperimentContractError(
+            "awaiting-review task has no installed terminal rejection"
+        )
+    terminal = dict(state)
+    terminal["status"] = "rejected"
+    terminal["error"] = stage_result.get("reason")
+    _write_json(state_path, terminal)
+    return terminal
+
+
 def _variant_parameters(family: str, index: int) -> dict[str, Any]:
     if family == "counter":
         rows = {
@@ -1582,9 +1616,7 @@ def run(args: argparse.Namespace) -> None:
             run_dir, args.family, FAMILY_GROUPS[args.family]
         )
         method_root = run_dir / "raw/track_p" / args.family / args.method
-        state = json.loads(
-            (method_root / "task_state.json").read_text(encoding="utf-8")
-        )
+        state = _terminal_authoring_state(method_root)
         row_path = _append_terminal_track_p(
             run_dir, family_entry, method_root, state
         )

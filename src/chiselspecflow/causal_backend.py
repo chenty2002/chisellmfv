@@ -491,6 +491,8 @@ def _make_semantic_request(
     projection: Optional[Mapping[str, Any]] = None,
     semantic_inputs: Optional[list[Mapping[str, Any]]] = None,
 ) -> Any:
+    from verilog_causal_analysis import policy_identity
+
     features = list(_SEMANTIC_FEATURES)
     if projection is not None:
         features.append("endpoint_projection")
@@ -517,8 +519,13 @@ def _make_semantic_request(
         semantic_inputs=[
             dict(row) for row in (semantic_inputs or [])
         ],
+        search_policy=policy_identity("legacy_dfs_v1").to_dict(),
         bounds={
+            "max_signal_depth": config["max_depth"],
             "max_signal_nodes": config["max_nodes"],
+            "max_expanded_nodes": config["max_nodes"],
+            "max_candidate_evaluations": config["max_nodes"] * 8,
+            "max_intervention_evaluations": config["max_nodes"] * 32,
             "max_semantic_nodes": config["max_nodes"],
             "max_edges": config["max_nodes"] * 4,
             "max_seed_count": 8,

@@ -49,6 +49,70 @@ class CompiledOverlay:
     diff_path: Path
 
 
+def materialize_generic_bindings(
+    selections: Sequence[Mapping[str, Any]],
+    semantic_index: Mapping[str, Any],
+    *,
+    obligation_id: str,
+    configuration_id: str,
+    adapter_id: str,
+) -> list[Dict[str, Any]]:
+    """Create ordinary wrapper bindings from confirmed semantic objects.
+
+    The model chooses only a semantic role and object ID.  Compatibility and
+    acquisition fields are deterministic facts, so they are not repeated in
+    the model response.
+    """
+
+    objects = {
+        row.get("object_id"): row
+        for row in semantic_index.get("objects", [])
+        if isinstance(row, Mapping)
+        and row.get("fact_status") == "elaboration_confirmed"
+        and row.get("accessibility") in {"direct", "wrapper"}
+    }
+    rows: list[Dict[str, Any]] = []
+    seen_roles: set[str] = set()
+    for index, selection in enumerate(selections, 1):
+        role = str(selection.get("role", "")).strip()
+        object_id = selection.get("object_id")
+        if not role or role in seen_roles:
+            raise MonitorCompilerError("binding roles must be non-empty and unique")
+        row = objects.get(object_id)
+        if row is None:
+            raise MonitorCompilerError(f"binding object is not confirmed: {object_id}")
+        seen_roles.add(role)
+        chisel_type = row["chisel_type"]
+        clock_reset = row["clock_reset"]
+        rows.append(
+            {
+                "binding_id": f"{obligation_id}.binding.{index:02d}",
+                "obligation_id": obligation_id,
+                "semantic_role": role,
+                "object_id": object_id,
+                "instance_selector": "dut",
+                "configuration_domain": [configuration_id],
+                "compatibility": {
+                    "type": chisel_type["kind"],
+                    "width": chisel_type["width"],
+                    "ownership": row["owner_module"],
+                    "clock": clock_reset["clock_domain"],
+                    "reset": clock_reset["reset_domain"],
+                    "configuration": configuration_id,
+                },
+                "acquisition": {
+                    "strategy": "wrapper",
+                    "host_scope": "SpecFlowOverlay",
+                    "adapter_id": adapter_id,
+                },
+                "rationale": "selected elaboration-confirmed semantic object",
+                "rejected_alternatives": [],
+                "review_state": "candidate",
+            }
+        )
+    return rows
+
+
 def validate_monitor_ir(
     monitor: Mapping[str, Any],
     semantic_index: Mapping[str, Any],
