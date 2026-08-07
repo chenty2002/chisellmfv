@@ -248,8 +248,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     resume.add_argument("--timeout-seconds", type=int, default=300)
     resume.add_argument("--per-property-seconds", type=int, default=60)
     from src.experiments.paper import add_parser as add_experiment_parser
+    from src.experiments.specflow_exp import add_parser as add_specflow_exp_parser
+    from src.experiments.chiselcause_exp import add_parser as add_chiselcause_exp_parser
 
     add_experiment_parser(subparsers)
+    add_specflow_exp_parser(subparsers)
+    add_chiselcause_exp_parser(subparsers)
     return parser.parse_args(argv)
 
 
@@ -259,11 +263,25 @@ def main() -> None:
         "specflow": main_specflow,
         "run": main_coupledl2_run,
         "experiment": _main_experiment,
+        "specflow-exp": _main_specflow_experiment,
+        "chiselcause-exp": _main_chiselcause_experiment,
     }[args.command](args)
 
 
 def _main_experiment(args: argparse.Namespace) -> None:
     from src.experiments.paper import run
+
+    run(args)
+
+
+def _main_specflow_experiment(args: argparse.Namespace) -> None:
+    from src.experiments.specflow_exp import run
+
+    run(args)
+
+
+def _main_chiselcause_experiment(args: argparse.Namespace) -> None:
+    from src.experiments.chiselcause_exp import run
 
     run(args)
 

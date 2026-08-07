@@ -1,491 +1,209 @@
-# ChiseLLMFV
+# ChiselLMFV
 
-ChiseLLMFV is an LLM-assisted formal-verification workflow for Chisel
-hardware. The current checkout is centered on the refactored CoupledL2 flow:
-it creates an isolated run workspace, gives the model only workspace-scoped
-tools, records every stage with machine-readable artifacts, and delegates
-build/proof checks to deterministic EDA commands.
+ChiselLMFV 是面向论文实验的 Chisel 形式化验证项目。当前代码只保留 SpecFlow、CoupledL2 确定性验证和 Chisel-aware VerilogCausalAnalysis（VCA）三部分。
 
-The repository also keeps the earlier VIS-style benchmark workflow, the
-JasperGold quality evaluator, and the Verilog-to-Chisel converter. Treat
-`python main.py run ...` as the primary entry point for new CoupledL2 work.
+项目只维护一个当前合同，不保留并行 `v*` API、历史 reader 或兼容路径。
 
-## What This Version Provides
-
-- Preflight-gated CoupledL2 workflow:
-  `bind_properties -> invoke_verification -> waveform_explanation`, with
-  `propose_bugfix` as an explicit run-local proposal stage.
-- CoupledL2 run isolation under `runs/<timestamp>-<case>-<id>/`.
-- Stage-local context files, bounded model inputs, source snapshots, stage
-  results, hash-bound handoff files, and run cost summaries. Agent-only
-  operation/tool-result ledgers are produced where a stage actually uses the
-  generic agent loop.
-- Repository-owned property assets for CoupledL2: the model selects a strict
-  `property_schema`, template, binding candidates, and bounded parameters; Python
-  resolves indexed IDs, renders repository-owned templates, labels elaborated
-  RTL properties, and records one immutable property package.
-- Stage 3 is dispatched directly to the deterministic build/formal backend and
-  makes no model call. Stage 4 can explain deterministic CEX evidence. Stage 5
-  can only emit an unapplied `repair_proposal.json` plus unified diff inside the
-  run directory; it cannot edit copied design source.
-- Dual-model routing through `CHISELLMFV_LLM_MODEL_PRO` and
-  `CHISELLMFV_LLM_MODEL_FLASH`, with `CHISELLMFV_LLM_MODEL` as a fallback.
-
-## Repository Layout
+## 当前流程
 
 ```text
-.
-|-- main.py                         # CLI: run, formal, quality, v2c
-|-- init.sh                         # uv-based environment bootstrap
-|-- pyproject.toml
-|-- requirements.txt
-|-- .env.example
-|-- optimization.md                 # CoupledL2 optimization plan
-|-- refactor.md                     # CoupledL2 refactor plan
-|-- src/
-|   |-- coupledl2/                  # CoupledL2 config, workspace, indexing, backend
-|   |-- core/                       # workflow loop, tools, records, prompts, LLM routing
-|   |-- causal_analysis/            # bridge to VerilogCausalAnalysis
-|   |-- utils/
-|   `-- verilog2chisel/
-|-- src/coupledl2/context_assets/
-|   |-- skills/                     # stage-specific guidance installed into each run
-|   `-- rules/
-|-- tests/                          # repo-owned regression tests for the refactor
-|-- CoupledL2-Verification/         # expected local source for CoupledL2 cases
-|-- VerilogCausalAnalysis/          # waveform/causal-analysis backend
-|-- chisel/                         # legacy Chisel benchmark workspace
-|-- verilog/                        # legacy JasperGold workspace
-|-- verilog2chisel/                 # Verilog-to-Chisel workspace
-`-- log/vis_chisel_formal/          # legacy public experiment artifacts, if present
+SpecFlow
+  asset_authoring       一次 typed authoring
+  compile_verify        确定性编译与 JasperGold
+  diagnose              确定性 CEX 投影、VCA、源候选排序
+
+CoupledL2
+  preflight
+  bind_properties       一次完整 binding manifest
+  invoke_verification   确定性 JasperGold
 ```
 
-## Requirements
+SpecFlow 的资产审阅只发生一次，用于批准将要验证的 run-local property package。诊断阶段不调用模型、不进行第二次审阅，也不生成修订或补丁。
 
-The Python package requires Python 3.10 or newer. The bootstrap script creates
-a project-local `.venv` with Python 3.11 when possible.
-
-For the full CoupledL2 flow, install or expose these tools on `PATH`:
-
-- `git`
-- `uv`
-- Java and `sbt`
-- CoupledL2's Scala/Mill build toolchain, as required by the selected case
-- Cadence JasperGold as `jg`
-- GTKWave utilities, especially `vcd2fst`, when counterexample traces are used
-- optional: Graphviz and `hdlConvertor` for causal analysis
-
-## Setup
-
-```bash
-git clone <repo-url> chisellmfv
-cd chisellmfv
-
-bash init.sh
-cp -n .env.example .env
-$EDITOR .env
-```
-
-Set at least:
-
-```bash
-CHISELLMFV_LLM_API_KEY=<your-api-key>
-```
-
-Optional LLM settings:
-
-```bash
-CHISELLMFV_LLM_BASE_URL=<optional-api-base-url>
-CHISELLMFV_LLM_MODEL=<single-model-fallback>
-CHISELLMFV_LLM_MODEL_PRO=<main-agent-model>
-CHISELLMFV_LLM_MODEL_FLASH=<helper-model>
-CHISELLMFV_LLM_EXTRA_BODY=<optional-json-extra-body>
-```
-
-When `CHISELLMFV_LLM_MODEL_PRO` and `CHISELLMFV_LLM_MODEL_FLASH` are set, PRO
-is used for stage agent loops, source edits, completion decisions, diagnosis,
-and repairs. FLASH is used for lower-risk helper work such as compaction,
-retrieval assistance, summaries, lint-style checks, and failure
-preclassification.
-
-If native Python wheels are unavailable on your platform:
-
-```bash
-source .venv/bin/activate
-
-cd chisel/pylibfst-cache
-make install
-cd -
-
-bash scripts/install_hdlConvertor.sh
-```
-
-## CoupledL2 Workflow
-
-### Case Layout
-
-`main.py run` expects a CoupledL2 case directory. The case should contain at
-least:
+## 目录
 
 ```text
-<case>/
-|-- Chisel/
-|   |-- Makefile
-|   `-- src/test/scala/coupledl2/VerifyTop.scala
-`-- Verilog/
-    `-- setup.sh
+main.py                         CLI
+experiment.md                   唯一论文实验方案
+implementation.md               唯一持续迭代计划
+src/chiselspecflow/             SpecFlow
+src/coupledl2/                  CoupledL2
+src/core/                       共享 artifact、预算和模型客户端
+VerilogCausalAnalysis/          structural baseline 与当前 Chisel-aware VCA
+benchmark/synth/                Wit-HW Chisel 语料
+runs/reference/                 两组保留的参考验收证据
+tests/                          当前合同的聚焦回归
 ```
 
-The workflow copies the case into a new run directory. The original case is
-not edited by the model-facing tools.
+`runs/` 和 `log/` 不进入 Git。正式论文实验必须写入新的 experiment ID；`runs/reference/` 只用于核对历史输入和命令，不能作为新结果。
 
-### Preflight A New Run
+## 论文 experiment runner
 
-Preflight copies and cleans the case, installs the selected property profile's
-stable marker, generates indexes, performs the baseline build, and rejects
-residual source or generated CL2 assertions before any LLM call:
+`experiment.md` 的正式入口先执行 9.1/9.2 准备门：
 
 ```bash
-.venv/bin/python main.py run \
-  --case CoupledL2-Verification/<case-name> \
-  --property-profile write_read_poc \
-  --preflight-only
+rtk codex-run /home/chenty/llm/eda-agent/chisellmfv/.venv/bin/python main.py \
+  experiment prepare \
+  --model <exact-model> \
+  --url <exact-chat-completions-url> \
+  --max-output-tokens 32768
 ```
 
-Useful options:
+该命令不调用模型或 formal。它创建唯一
+`runs/specflow-experiments/<YYYYMMDD-HHMMSS>-paper/`，验证 10 个 family 的
+`project.json`/`cfg_000.json`，固定两个 CoupledL2 case，生成 hash-bound
+`corpus.json`、`config.json`、四个唯一 JSONL ledger 和原始产物目录。
+模型、URL 或预算缺失时直接停止，不写默认值；产物只保存 API key 的环境
+变量名，不保存 key。
 
-```text
---mode small
---input-mode coupledl2asl1
---property-profile write_read_poc|mshr_wait_bound_poc
---run-root runs
-```
+后续任务 row 只能通过 `experiment record` 追加，重复 task/method 会被拒绝。
+CoupledL2 exact CEX 必须通过 `experiment convert-vcd` 调用 `vcd2fst`；转换
+失败记录为 `incomplete`，不得借用历史 FST。
 
-The current checked-in configuration accepts `small` mode and
-`coupledl2asl1` input mode.
+## 环境
 
-### Run A New Workflow
+Python 3.10+。所有本地构建、Chisel、JasperGold 和测试命令通过项目工具链运行：
 
 ```bash
-.venv/bin/python main.py run \
-  --case CoupledL2-Verification/<case-name> \
-  --property-profile write_read_poc \
-  --full \
-  --max-tokens 160000
+rtk codex-run <command> [args...]
+rtk codex-run bash -lc '<shell command>'
 ```
 
-Fresh runs can execute only `bind_properties` as a single stage; later stages
-must resume a run whose predecessor handoff succeeded:
+模型配置只使用一组变量：
 
 ```bash
-.venv/bin/python main.py run \
-  --case CoupledL2-Verification/<case-name> \
+CHISELLMFV_LLM_API_KEY=
+CHISELLMFV_LLM_URL=
+CHISELLMFV_LLM_BASE_URL=
+CHISELLMFV_LLM_MODEL=
+CHISELLMFV_LLM_EXTRA_BODY=
+```
+
+不支持旧变量名、双模型路由或运行中切换模型。
+
+## SpecFlow
+
+### 1. Authoring
+
+```bash
+rtk codex-run /home/chenty/llm/eda-agent/chisellmfv/.venv/bin/python main.py \
+  specflow start \
+  --project-contract benchmark/synth/counter/specflow/project.json \
+  --spec benchmark/synth/counter/specflow/spec.md \
+  --config benchmark/synth/counter/specflow/configs/cfg_000.json \
+  --suite-ledger benchmark/synth/SPECIFICATIONS.sha256 \
+  --run-root runs/specflow
+```
+
+该步骤只接受一次模型提交。无效提交直接失败。
+
+### 2. 安装资产审阅
+
+```bash
+rtk codex-run /home/chenty/llm/eda-agent/chisellmfv/.venv/bin/python main.py \
+  specflow review \
+  --run <run_dir> \
+  --review-record <review_record.json>
+```
+
+审阅记录必须绑定实际 artifact hash。
+
+### 3. 编译与验证
+
+```bash
+rtk codex-run /home/chenty/llm/eda-agent/chisellmfv/.venv/bin/python main.py \
+  specflow resume \
+  --run <run_dir> \
+  --through compile_verify
+```
+
+Stage 2 不调用模型。JasperGold 的 missing、timeout、tool error 和 CEX 分别记录，不从退出码推断 proof。
+
+### 4. 定位
+
+```bash
+rtk codex-run env PYTHONPATH=.:VerilogCausalAnalysis/src \
+  /home/chenty/llm/eda-agent/chisellmfv/.venv/bin/python main.py \
+  specflow resume \
+  --run <run_dir> \
+  --through diagnose
+```
+
+该步骤不调用模型。它从 exact CEX 生成：
+
+- `evidence_projection.json`
+- `causal_graph_manifest.json`
+- `causal_source_projection.json`
+- `root_cause_result.json`
+- `source_ranking.json`
+- `final_verdict.json`
+
+`source_ranking` 是可评测候选排序，不是形式化根因证明。
+
+## CoupledL2
+
+### Preflight
+
+```bash
+rtk codex-run /home/chenty/llm/eda-agent/chisellmfv/.venv/bin/python main.py \
+  run \
+  --case CoupledL2-Verification/code/CaseStudy_1/XiangShan-CoupledL2-deadlock-v0 \
   --property-profile mshr_wait_bound_poc \
-  --stage bind_properties \
-  --max-tokens 160000
-```
-
-If `invoke_verification` proves all assertions, the workflow stops without
-running counterexample diagnosis or repair.
-
-The current repository-owned property profiles are case-specific:
-
-- `write_read_poc` targets `XiangShan-CoupledL2-write_read`;
-- `mshr_wait_bound_poc`, `tilelink_gold_poc`, and
-  `tl_grant_probe_serialization_poc` target
-  `XiangShan-CoupledL2-deadlock-v0`.
-
-Each checked-in profile has a hash-bound review record with `reviewer: codex`
-and `review_status: approved`. This approves the repository asset version; it
-does not make a formal result successful or non-vacuous. Each run must still
-pass exact-property accounting, formal execution, and the semantic-evidence
-gate.
-
-### Token, Tool-Result, and Workspace Boundaries
-
-For the active CoupledL2 flow, this generic agent protocol applies to Stage 4
-diagnosis. Stage 2 uses the narrower `submit_binding_manifest` contract, Stage
-3 has no model turn, and Stage 5 uses the narrower
-`submit_repair_proposal` contract. Where `complete_stage` is available, the
-workflow validates it with the deterministic local gate.
-
-Every model tool result has two views:
-
-- The complete raw JSON result is persisted first under the stage-local
-  `tool_results/` directory.
-- A valid, bounded `tool_result.v2` view containing the raw artifact reference
-  is added to model history. Agent stages limit one visible result to 6,000
-  estimated tokens and one turn's combined results to 10,000 estimated tokens.
-
-Agent-stage workspace access applies separate discovery, explicit-read, and
-write rules.
-`list_files` is shallow and bounded by default, and recursive discovery plus
-`rg` exclude system caches, build outputs such as `out/` and `target/`, and
-generated output. Explicit bounded browsing or text reads can still inspect
-generated RTL and build evidence. `edit_file` is restricted to source and text
-configuration files under `case/`; attempts to modify caches, generated RTL,
-build output, or workflow control artifacts return a structured
-`path_policy_denied` result.
-
-FLASH context compaction and the shared PRO/FLASH run token ledger remain in
-effect for generic agent work. Tool-result limiting occurs before compaction,
-so raw results never enter model history. The bounded Stage 2 manifest call and
-deterministic Stage 3 do not use that generic loop.
-
-### Resume A Verified Handoff
-
-Resume uses the existing workspace and validates its hash plus the predecessor
-handoff before starting the requested stage:
-
-```bash
-.venv/bin/python main.py run \
-  --resume-run runs/<timestamp>-<case-name>-<id> \
-  --stage invoke_verification \
-  --max-tokens 160000
-```
-
-Valid stages are `bind_properties`, `invoke_verification`,
-`waveform_explanation`, and `propose_bugfix`. `waveform_explanation` additionally
-requires a Stage 3 counterexample path.
-
-## CoupledL2 Run Artifacts
-
-Each run is written under:
-
-```text
-runs/<timestamp>-<case-name>-<id>/
-```
-
-Important files:
-
-```text
-manifest.json
-indexes/build_contract.json
-indexes/formal_surface.json
-indexes/tl_signal_index.json
-indexes/observer_index.json
-logs/events.jsonl
-results/preflight/preflight_result.json
-results/preflight/baseline_build_result.json
-results/run_cost_summary.json
-results/final_result.json
-results/by_stage/02_bind_properties/
-results/by_stage/03_invoke_verification/
-results/by_stage/04_waveform_explanation/
-results/by_stage/05_propose_bugfix/
-```
-
-Agent stage directories may contain:
-
-```text
-operations.jsonl               # model tool operations for agent stages
-tool_results/                  # complete raw JSON results referenced by bounded views
-context_compactions.jsonl      # FLASH compaction attempts and budget decisions
-stage_events.jsonl             # machine-readable stage events
-source_snapshot/               # source snapshots used by deterministic render/audit
-snapshot_manifest_before.json
-snapshot_manifest_after.json
-```
-
-Every active stage instead has the following common completion records:
-
-```text
-stage_result.json              # normalized result plus artifact contract
-handoff.json                   # artifact paths and hashes only
-```
-
-Stage-specific artifacts include:
-
-| Stage | Typical artifacts |
-|---|---|
-| `bind_properties` | `stage_inputs.json`, `binding_manifest.json`, `property_package.json` (including the V4 operation/observation contracts), `assertion_delta.json`, render/build audit files |
-| `invoke_verification` | `property_result_map.json` (V4), `semantic_evidence.json`, `proof_events.jsonl`, `jaspergold.log`, traces |
-| `waveform_explanation` | `transaction_trace.json`, `state_trace.json`, `wait_chain.json`, `diagnosis_evidence.json`, `diagnosis.json`, `counterexample_analysis.md` |
-| `propose_bugfix` | unapplied `repair_proposal.json`, `repair_proposal.patch` |
-
-Downstream stages validate earlier `handoff.json` files before execution;
-bounded predecessor references may also be included in an agent stage's
-`stage_inputs.json`. Successful Stage 2 rendering refreshes the indexes and
-binds workspace/index hashes into the handoff. Every successful stage is
-validated against the single `StageSpec.artifact_contract`, and handoffs store
-only artifact paths and hashes. `run_cost_summary.json` aggregates
-PRO, FLASH, context compaction, token budget, stage tool-budget use,
-raw/model-visible tool-result token reduction, and local-gate outcomes.
-
-## Legacy Formal Workflow
-
-The `formal` command remains available for the VIS-style Chisel benchmark
-workspace under `chisel/extra_bench` and `benchmark/vis-chisel`.
-
-Run the full workflow for one target:
-
-```bash
-.venv/bin/python main.py formal --full --target gigamax
-```
-
-Run one stage:
-
-```bash
-.venv/bin/python main.py formal \
-  --stage write_assertions \
-  --target gigamax
-```
-
-Run a comma-separated target list:
-
-```bash
-.venv/bin/python main.py formal \
-  --full \
-  --targets gigamax,s1269,arbiter_arbiter_le
-```
-
-Run counterexample diagnosis from an existing trace:
-
-```bash
-.venv/bin/python main.py formal \
-  --stage waveform_explanation \
-  --target gigamax \
-  --waveform chisel/extra_bench/gigamax/generated/<counterexample>.fst
-```
-
-## JasperGold Quality Evaluation
-
-Run the checked-in counter smoke configuration:
-
-```bash
-.venv/bin/python main.py quality --counter --stages build,assertions
-```
-
-Run all quality dimensions on the smoke case:
-
-```bash
-.venv/bin/python main.py quality \
-  --counter \
-  --all \
-  --max-mutants 1
-```
-
-Evaluate a custom emitted SystemVerilog candidate:
-
-```bash
-.venv/bin/python main.py quality \
-  --case-id my_case \
-  --candidate-id run_001 \
-  --workdir verilog/extra_bench/my_case \
-  --dut-sv TestTop.sv \
-  --extra-sv ResetCounter.sv \
-  --top MyTop \
-  --clock clock \
-  --reset reset \
-  --expected-inputs clock,reset \
-  --expected-outputs io_out \
-  --trace-signals io_out \
-  --stages build,assertions,assumptions,non_vacuity,mutation,repair_regression,sec,xprop \
-  --max-mutants 3 \
-  --jg-timeout 240
-```
-
-Quality records are written under:
-
-```text
-reports/jg/<case-id>/quality_record.json
-```
-
-## Verilog-To-Chisel Conversion
-
-Place exactly one Verilog/SystemVerilog source under
-`verilog2chisel/verilog/<target>/`:
-
-```bash
-mkdir -p verilog2chisel/verilog/mydesign
-cp my_design.v verilog2chisel/verilog/mydesign/
-```
-
-Sidecar files such as `label.txt` may exist in the target directory, but v2c
-does not send them to the model. Conversion is source-only: it uses the
-`.v/.sv` text, deterministic source facts, and the generic VIS conversion
-rules in `src/verilog2chisel/context_assets/vis_conversion_rules.md`.
-
-Run preflight without an LLM call:
-
-```bash
-.venv/bin/python main.py v2c \
-  --target mydesign \
   --preflight-only
 ```
 
-Convert with bounded repair and publish only after local gates pass:
+### Binding
 
 ```bash
-CHISELLMFV_LLM_MODEL=deepseek-v4-pro \
-CHISELLMFV_LLM_EXTRA_BODY='{"thinking":{"type":"disabled"}}' \
-.venv/bin/python main.py v2c \
-  --target mydesign \
-  --max-iterations 5 \
-  --publish
+rtk codex-run /home/chenty/llm/eda-agent/chisellmfv/.venv/bin/python main.py \
+  run \
+  --case CoupledL2-Verification/code/CaseStudy_1/XiangShan-CoupledL2-deadlock-v0 \
+  --property-profile mshr_wait_bound_poc \
+  --stage bind_properties
 ```
 
-Successful conversion writes:
+模型必须一次提交全部 slot 和参数。系统不会自动补绑定、修参数、复用旧 manifest 或再次调用模型。
 
-```text
-verilog2chisel/runs/<timestamp>-<target>/
-verilog2chisel/chisel/mydesign/
-verilog2chisel/generated/mydesign/
-chisel/extra_bench/mydesign/          # only with --publish
-```
-
-Each run directory records `manifest.json`, `input_summary.json`,
-`prompt_bundle.json`, `operations.jsonl`, `model_requests.jsonl`,
-`model_responses.jsonl`, `compile_attempts.jsonl`, `lint_result.json`,
-`stage_result.json`, `run_cost_summary.json`, plus successful `chisel/` and
-`generated/` snapshots.
-
-The converted target can then be checked through the legacy formal workflow
-after publishing:
+### Formal
 
 ```bash
-.venv/bin/python main.py formal --full --target mydesign
+rtk codex-run /home/chenty/llm/eda-agent/chisellmfv/.venv/bin/python main.py \
+  run \
+  --resume-run <run_dir> \
+  --stage invoke_verification
 ```
 
-## Development Checks
+CoupledL2 的 `run` 入口到此结束。CEX 的论文定位实验走 SpecFlow/VCA 的确定性 `diagnose` 合同。
 
-The complete repository test tree includes legacy workflow coverage and is not
-currently a clean acceptance signal for the simplified CoupledL2 flow. It can
-still be run for migration work with:
+## VCA 公共接口
+
+当前 Chisel-aware 方法：
+
+```python
+from verilog_causal_analysis import (
+    make_request,
+    build_causal_graph,
+    prepare_causal_session,
+)
+```
+
+结构基线：
+
+```python
+from verilog_causal_analysis import (
+    make_structural_request,
+    build_structural_graph,
+    prepare_structural_analysis,
+)
+```
+
+两者是论文方法与基线，不是软件版本。生产诊断只使用当前 Chisel-aware 接口。
+
+## 测试
 
 ```bash
-rtk codex-run pytest -q tests
+rtk codex-run env PYTHONPATH=.:VerilogCausalAnalysis/src \
+  /home/chenty/llm/eda-agent/chisellmfv/.venv/bin/python -m pytest -q
 ```
 
-For the active simplified CoupledL2 contract:
-
-```bash
-rtk codex-run pytest -q tests/test_coupledl2_simplification.py
-```
-
-The broader test tree still contains historical CoupledL2 tests for retired
-`write_assertions`, `property_category`, campaign, AutoVerify patching, and old
-artifact/handoff contracts. Do not restore those production interfaces merely
-to satisfy the historical tests; rewrite or remove the tests when migrating
-that older coverage.
-
-Syntax-check edited Python modules with:
-
-```bash
-rtk codex-run python -m compileall -q src/core src/coupledl2
-git diff --check
-```
-
-Avoid bare repo-root `pytest` if this checkout contains unrelated external
-trees or submodules that are not part of the current feature signal.
-
-## Cleaning Generated State
-
-Remove generated runtime artifacts:
-
-```bash
-bash scripts/reset_data.sh
-```
-
-This deletes `log/`. Do not run it if you need to preserve checked-in public
-experiment artifacts in this checkout.
+单元测试通过只证明当前 Python 合同。JasperGold、真实 FST、CoupledL2 和论文指标必须分别由新生成的原始 artifact 支持。
