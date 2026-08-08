@@ -26,7 +26,10 @@ from src.chiselspecflow.elaboration import elaborate_baseline
 
 CASE_SCHEMA = "chiselcause_case.v1"
 CASES_SCHEMA = "chiselcause_cases.v1"
-RESULT_SCHEMA = "chiselcause_result.v1"
+RESULT_SCHEMA = "chiselcause_result.v2"
+SEARCH_TRACE_SCHEMA = "chiselcause_search_trace.v1"
+METRICS_SCHEMA = "chiselcause_source_metrics.v3"
+ABSOLUTE_BUDGET_CHECKPOINTS = (1, 5, 10, 25, 50, 100, 200)
 METHODS = ("d0", "d1", "d2", "d3")
 SEARCH_POLICY_ALIASES = {
     "CS0": "legacy_scalar_best_first_v1",
@@ -36,6 +39,12 @@ SEARCH_POLICY_ALIASES = {
     "H2": "chisel_hybrid_best_first_v1",
 }
 SEARCH_POLICY_IDS = tuple(SEARCH_POLICY_ALIASES.values())
+POLICY_COMPARISON_ARMS = {
+    policy_id: tuple(
+        arm for arm, resolved in SEARCH_POLICY_ALIASES.items() if resolved == policy_id
+    )
+    for policy_id in dict.fromkeys(SEARCH_POLICY_IDS)
+}
 COUPLEDL2_CASES = {
     "deadlock-v0": {
         "endpoint": "VerifyTop.coupledL2.slices_0.mshrCtl._assert_1",
@@ -101,9 +110,12 @@ RESULT_FIELDS = {
     "status",
     "input_identity",
     "source_ranking",
+    "search_trace",
+    "work",
     "metrics",
     "runtime_seconds",
     "peak_rss_bytes",
+    "termination_reason",
     "failure_reason",
 }
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -737,7 +749,7 @@ def run_localization(args: argparse.Namespace) -> Path:
     ):
         raise ChiselCauseExperimentError("case/method result already exists")
 
-    from verilog_causal_analysis import build_causal_graph, build_source_ranking, make_request, policy_identity
+    from verilog_causal_analysis import build_source_ranking, make_request, policy_identity, prepare_causal_session
     from verilog_causal_analysis.cycle_waveform import CycleAlignedWaveform
     from verilog_causal_analysis.identity import sha256_file
 
@@ -796,9 +808,13 @@ def run_localization(args: argparse.Namespace) -> Path:
         bounds={
             "max_signal_depth": min(args.max_nodes, 256),
             "max_signal_nodes": args.max_nodes,
-            "max_expanded_nodes": args.max_nodes,
-            "max_candidate_evaluations": args.max_nodes * 8,
-            "max_intervention_evaluations": args.max_nodes * 32,
+            "max_expanded_nodes": args.max_expanded_nodes or args.max_nodes,
+            "max_candidate_evaluations": (
+                args.max_candidate_evaluations or args.max_nodes * 8
+            ),
+            "max_intervention_evaluations": (
+                args.max_intervention_evaluations or args.max_nodes * 32
+            ),
             "max_semantic_nodes": args.max_semantic_nodes,
             "max_edges": args.max_edges,
             "max_seed_count": 8,
@@ -813,11 +829,14 @@ def run_localization(args: argparse.Namespace) -> Path:
     )
     started = time.perf_counter()
     before_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    graph = build_causal_graph(request, top_module="ChiselCauseMiter")
+    with prepare_causal_session(request, top_module="ChiselCauseMiter") as session:
+        graph = session.build()
+        search_trace = session.search_trace
     runtime = time.perf_counter() - started
     peak_rss = max(before_rss, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
     _write_json(method_dir / "causal_graph.json", graph)
     _write_json(method_dir / "request.json", request.to_dict())
+    _write_search_trace(method_dir / "search_trace.jsonl", search_trace, policy_id)
     elaboration_path = run_dir / case["faulty_variant"]["elaboration"]["path"]
     ranking = build_source_ranking(
         graph,
@@ -828,6 +847,7 @@ def run_localization(args: argparse.Namespace) -> Path:
     )
     _write_json(method_dir / "source_ranking.json", ranking)
     complete = graph["status"] == "complete" and ranking["status"] == "complete"
+    summary = graph["search_summary"]
     row = {
         "schema_version": RESULT_SCHEMA,
         "case_id": args.case_id,
@@ -837,17 +857,32 @@ def run_localization(args: argparse.Namespace) -> Path:
             "case_sha256": _canonical_sha256(case),
             "request_sha256": request.request_sha256,
             "graph_sha256": _sha256(method_dir / "causal_graph.json"),
+            "source_ranking_sha256": _sha256(method_dir / "source_ranking.json"),
+            "search_trace_sha256": _sha256(method_dir / "search_trace.jsonl"),
             "search_policy_id": policy_id,
+            "comparison_arms": list(POLICY_COMPARISON_ARMS[policy_id]),
             "policy_sha256": request.search_policy.policy_sha256,
         },
         "source_ranking": _artifact(run_dir, method_dir / "source_ranking.json"),
+        "search_trace": _artifact(run_dir, method_dir / "search_trace.jsonl"),
+        "work": {
+            "graph_nodes": len(graph["signal_nodes"]) + len(graph["semantic_nodes"]),
+            "graph_signal_nodes": len(graph["signal_nodes"]),
+            "graph_semantic_nodes": len(graph["semantic_nodes"]),
+            "graph_edges": len(graph["edges"]),
+            "expanded_nodes": summary["expanded_nodes"],
+            "candidate_evaluations": summary["candidate_evaluations"],
+            "intervention_evaluations": summary["intervention_evaluations"],
+        },
         "metrics": None,
         "runtime_seconds": round(runtime, 6),
         "peak_rss_bytes": peak_rss,
+        "termination_reason": summary["termination_reason"],
         "failure_reason": None if complete else "graph_or_source_projection_incomplete",
     }
     validate_result(row)
     _append_jsonl(run_dir / "results.jsonl", row)
+    _write_tables(run_dir)
     _write_report(run_dir)
     return method_dir / "source_ranking.json"
 
@@ -1083,14 +1118,14 @@ def score(args: argparse.Namespace) -> Path:
     results = _read_jsonl(run_dir / "results.jsonl")
     matches = [
         row for row in results
-        if row["case_id"] == args.case_id and row["method"] == "d2"
+        if row["case_id"] == args.case_id and row["method"] == args.method
         and (
             policy_id is None
             or row.get("input_identity", {}).get("search_policy_id") == policy_id
         )
     ]
     if len(matches) != 1:
-        raise ChiselCauseExperimentError("one completed D2 result is required before score")
+        raise ChiselCauseExperimentError("one method/policy result is required before score")
     result = matches[0]
     ranking_path = run_dir / result["source_ranking"]["path"]
     ranking = _read_json(ranking_path)
@@ -1099,25 +1134,247 @@ def score(args: argparse.Namespace) -> Path:
         row for row in ranking["ordering"]
         if row["file"] == target["path"] and row["line"] == target["line"]
     ]
-    gold_rank = ranked[0]["rank"] if len(ranked) == 1 else None
+    evaluation = _evaluate_source_ranking(ranking, target)
+    gold_rank = evaluation["gold_rank"]
+    gold_row = ranked[0] if gold_rank is not None else None
+    trace = (
+        _read_jsonl(run_dir / result["search_trace"]["path"])
+        if result.get("search_trace") is not None
+        else []
+    )
+    first_gold = _first_gold_work(gold_row, trace)
+    checkpoints = _budget_checkpoint_metrics(
+        run_dir=run_dir,
+        result=result,
+        ranking=ranking,
+        target=target,
+        trace=trace,
+        checkpoints=ABSOLUTE_BUDGET_CHECKPOINTS,
+        enabled=evaluation["evaluation_status"] == "complete" and args.method == "d2",
+    )
     metrics = {
-        "schema_version": "chiselcause_source_metrics.v1",
+        "schema_version": METRICS_SCHEMA,
         "case_id": args.case_id,
+        "method": args.method,
         "bug_id": args.bug_id,
         "gold_source": {"file": target["path"], "line": target["line"]},
-        "gold_rank": gold_rank,
-        "reciprocal_rank": round(1.0 / gold_rank, 6) if gold_rank else 0.0,
-        "top_1": bool(gold_rank and gold_rank <= 1),
-        "top_3": bool(gold_rank and gold_rank <= 3),
-        "top_5": bool(gold_rank and gold_rank <= 5),
+        **evaluation,
+        "nodes_to_first_gold": first_gold["expanded_nodes"],
+        "interventions_to_first_gold": first_gold["intervention_evaluations"],
+        "budget_checkpoints": checkpoints,
         "ranking_sha256": _sha256(ranking_path),
+        "gold_manifest_sha256": _sha256(Path(args.gold).resolve()),
     }
     metrics_path = ranking_path.with_name("metrics.json")
     _write_json(metrics_path, metrics)
     result["metrics"] = _artifact(run_dir, metrics_path)
+    result["input_identity"]["gold_manifest_sha256"] = metrics["gold_manifest_sha256"]
+    result["input_identity"]["bug_id"] = args.bug_id
     _write_jsonl(run_dir / "results.jsonl", results)
+    _write_tables(run_dir)
     _write_report(run_dir)
     return metrics_path
+
+
+def _evaluate_source_ranking(
+    ranking: Mapping[str, Any], target: Mapping[str, Any]
+) -> dict[str, Any]:
+    matches = [
+        row
+        for row in ranking["ordering"]
+        if row["file"] == target["path"] and row["line"] == target["line"]
+    ]
+    gold_row = matches[0] if len(matches) == 1 else None
+    gold_reachable = bool(
+        gold_row is not None
+        and gold_row.get("positive_authoritative_evidence") is True
+    )
+    complete_graph = ranking.get("complete_graph") is True
+    complete_projection = ranking.get("complete_source_projection") is True
+    if not complete_graph:
+        status, reason = "incomplete", "graph_incomplete"
+    elif not complete_projection:
+        status, reason = "incomplete", "source_projection_incomplete"
+    elif not matches:
+        status, reason = "gold_unreachable", "gold_not_in_statement_universe"
+    elif len(matches) != 1:
+        status, reason = "gold_unreachable", "gold_location_ambiguous"
+    elif not gold_reachable:
+        status, reason = (
+            "gold_unreachable",
+            "gold_without_positive_authoritative_evidence",
+        )
+    else:
+        status, reason = "complete", None
+    evaluable = status == "complete"
+    rank = gold_row["rank"] if evaluable else None
+    position = gold_row["position"] if evaluable else None
+    count = int(ranking["statement_candidate_count"])
+    return {
+        "evaluation_status": status,
+        "evaluation_reason": reason,
+        "complete_graph": complete_graph,
+        "complete_source_projection": complete_projection,
+        "statement_candidate_count": count,
+        "authoritative_candidate_count": int(
+            ranking["authoritative_candidate_count"]
+        ),
+        "positive_authoritative_candidate_count": int(
+            ranking["positive_authoritative_candidate_count"]
+        ),
+        "gold_reachable": gold_reachable,
+        "gold_statement_id": gold_row.get("statement_id") if gold_row else None,
+        "gold_rank": rank,
+        "gold_position": position,
+        "tie_size": gold_row["tie_size"] if evaluable else None,
+        "mrr": round(1.0 / rank, 6) if evaluable else None,
+        "exam_percent": round(100.0 * position / count, 6) if evaluable else None,
+        "top_1": rank <= 1 if evaluable else None,
+        "top_3": rank <= 3 if evaluable else None,
+        "top_5": rank <= 5 if evaluable else None,
+        "top_10": rank <= 10 if evaluable else None,
+    }
+
+
+def _write_search_trace(path: Path, events: Sequence[Mapping[str, Any]], policy_id: str) -> None:
+    rows = [
+        {
+            "schema_version": SEARCH_TRACE_SCHEMA,
+            "search_policy_id": policy_id,
+            **dict(event),
+        }
+        for event in events
+    ]
+    _write_jsonl(path, rows)
+
+
+def _first_gold_work(
+    gold_row: Mapping[str, Any] | None, trace: Sequence[Mapping[str, Any]]
+) -> dict[str, int | None]:
+    if gold_row is None:
+        return {"expanded_nodes": None, "intervention_evaluations": None}
+    evidence = set(gold_row.get("evidence_node_ids", ()))
+    for event in trace:
+        observed = {
+            event.get("node_id"),
+            event.get("parent_node_id"),
+            event.get("target_node_id"),
+            event.get("edge_id"),
+        }
+        if evidence.intersection(observed):
+            cumulative = event["cumulative"]
+            return {
+                "expanded_nodes": cumulative["expanded_nodes"],
+                "intervention_evaluations": cumulative["intervention_evaluations"],
+            }
+    return {"expanded_nodes": None, "intervention_evaluations": None}
+
+
+def _budget_checkpoint_metrics(
+    *,
+    run_dir: Path,
+    result: Mapping[str, Any],
+    ranking: Mapping[str, Any],
+    target: Mapping[str, Any],
+    trace: Sequence[Mapping[str, Any]],
+    checkpoints: Sequence[int],
+    enabled: bool,
+) -> list[dict[str, Any]]:
+    expanded = int((result.get("work") or {}).get("expanded_nodes", 0))
+    rows = []
+    for checkpoint in checkpoints:
+        if not enabled:
+            rows.append({"expanded_nodes": checkpoint, "status": "not_applicable", "gold_rank": None, "mrr": None})
+            continue
+        if checkpoint > expanded:
+            rows.append({"expanded_nodes": checkpoint, "status": "not_reached", "gold_rank": None, "mrr": None})
+            continue
+        evidence = set()
+        for event in trace:
+            if int(event["cumulative"]["expanded_nodes"]) > checkpoint:
+                continue
+            evidence.update(
+                value
+                for value in (
+                    event.get("node_id"),
+                    event.get("parent_node_id"),
+                    event.get("target_node_id"),
+                    event.get("edge_id"),
+                )
+                if value is not None
+            )
+        discovered = [
+            row
+            for row in ranking["ordering"]
+            if evidence.intersection(row.get("evidence_node_ids", ()))
+        ]
+        gold_positions = [
+            index
+            for index, row in enumerate(discovered, 1)
+            if row["file"] == target["path"] and row["line"] == target["line"]
+        ]
+        gold_rank = gold_positions[0] if len(gold_positions) == 1 else None
+        rows.append(
+            {
+                "expanded_nodes": checkpoint,
+                "status": "complete",
+                "gold_rank": gold_rank,
+                "mrr": round(1.0 / gold_rank, 6) if gold_rank else 0.0,
+            }
+        )
+    return rows
+
+
+def _write_tables(run_dir: Path) -> None:
+    result_rows = _read_jsonl(run_dir / "results.jsonl")
+    smoke_rows = []
+    budget_rows = []
+    for result in result_rows:
+        metrics = (
+            _read_json(run_dir / result["metrics"]["path"])
+            if result.get("metrics") is not None
+            else None
+        )
+        base_smoke = {
+                "case_id": result["case_id"],
+                "method": result["method"],
+                "search_policy_id": result.get("input_identity", {}).get("search_policy_id"),
+                "status": result["status"],
+                "termination_reason": result.get("termination_reason"),
+                "work": result.get("work"),
+                "runtime_seconds": result["runtime_seconds"],
+                "peak_rss_bytes": result["peak_rss_bytes"],
+                "gold_rank": metrics.get("gold_rank") if metrics else None,
+                "gold_position": metrics.get("gold_position") if metrics else None,
+                "tie_size": metrics.get("tie_size") if metrics else None,
+                "gold_reachable": metrics.get("gold_reachable") if metrics else None,
+                "evaluation_status": metrics.get("evaluation_status") if metrics else None,
+                "evaluation_reason": metrics.get("evaluation_reason") if metrics else None,
+                "mrr": metrics.get("mrr") if metrics else None,
+                "exam_percent": metrics.get("exam_percent") if metrics else None,
+                "top_1": metrics.get("top_1") if metrics else None,
+                "top_3": metrics.get("top_3") if metrics else None,
+                "top_5": metrics.get("top_5") if metrics else None,
+                "top_10": metrics.get("top_10") if metrics else None,
+            }
+        arms = result.get("input_identity", {}).get("comparison_arms") or [None]
+        smoke_rows.extend({**base_smoke, "comparison_arm": arm} for arm in arms)
+        if metrics:
+            for checkpoint in metrics["budget_checkpoints"]:
+                base_budget = {
+                        "case_id": result["case_id"],
+                        "method": result["method"],
+                        "search_policy_id": result.get("input_identity", {}).get("search_policy_id"),
+                        **checkpoint,
+                    }
+                budget_rows.extend(
+                    {**base_budget, "comparison_arm": arm} for arm in arms
+                )
+    _write_json(
+        run_dir / "tables" / "localization_smoke.json",
+        {"schema_version": "chiselcause_localization_smoke.v1", "rows": smoke_rows},
+    )
+    _write_jsonl(run_dir / "tables" / "budget_curve.jsonl", budget_rows)
 
 
 def _freeze_schemas(run_dir: Path) -> None:
@@ -1203,11 +1460,15 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
         help="local-search policy ID or CS0/CS1/H0/H1/H2 alias",
     )
     run_parser.add_argument("--max-nodes", type=int, default=240)
+    run_parser.add_argument("--max-expanded-nodes", type=int)
+    run_parser.add_argument("--max-candidate-evaluations", type=int)
+    run_parser.add_argument("--max-intervention-evaluations", type=int)
     run_parser.add_argument("--max-semantic-nodes", type=int, default=480)
     run_parser.add_argument("--max-edges", type=int, default=960)
     score_parser = actions.add_parser("score")
     score_parser.add_argument("--run", required=True)
     score_parser.add_argument("--case-id", required=True)
+    score_parser.add_argument("--method", choices=("d0", "d1", "d2"), default="d2")
     score_parser.add_argument("--bug-id", required=True)
     score_parser.add_argument("--gold", required=True)
     score_parser.add_argument("--search-policy")

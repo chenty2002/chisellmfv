@@ -45,6 +45,8 @@ SPECFLOW_RESULT_FIELDS = frozenset(
         "faulty_cex_count",
         "non_vacuous_count",
         "valid_bug_detecting_property_count",
+        "property_funnel",
+        "funnel_failure",
         "model_calls",
         "input_tokens",
         "output_tokens",
@@ -84,6 +86,56 @@ def validate_specflow_result(row: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("SpecFlow result counts must be non-negative integers")
     if row["valid_bug_detecting_property_count"] > row["generated_property_count"]:
         raise ValueError("valid property count exceeds generated count")
+    funnel = row["property_funnel"]
+    if not isinstance(funnel, list):
+        raise ValueError("SpecFlow property funnel must be a list")
+    ids = [item.get("property_id") for item in funnel if isinstance(item, dict)]
+    if len(ids) != len(funnel) or len(set(ids)) != len(ids):
+        raise ValueError("SpecFlow property funnel IDs must be exact and unique")
+    required_gates = {
+        "property_id",
+        "authoring_success",
+        "executable_on_clean",
+        "executable_on_faulty",
+        "clean_proven",
+        "clean_non_vacuous",
+        "faulty_exact_cex",
+        "valid_detection",
+        "clean_false_alarm",
+        "classification",
+    }
+    if any(set(item) != required_gates for item in funnel):
+        raise ValueError("SpecFlow property funnel fields differ")
+    if any(
+        item["valid_detection"]
+        != all(
+            item[gate]
+            for gate in (
+                "authoring_success",
+                "executable_on_clean",
+                "executable_on_faulty",
+                "clean_proven",
+                "clean_non_vacuous",
+                "faulty_exact_cex",
+            )
+        )
+        for item in funnel
+    ):
+        raise ValueError("SpecFlow valid detection is not conjunctive")
+    expected_counts = {
+        "generated_property_count": len(funnel),
+        "compiled_on_clean": sum(item["executable_on_clean"] for item in funnel),
+        "compiled_on_faulty": sum(item["executable_on_faulty"] for item in funnel),
+        "clean_proven_count": sum(item["clean_proven"] for item in funnel),
+        "clean_cex_count": sum(item["clean_false_alarm"] for item in funnel),
+        "faulty_cex_count": sum(item["faulty_exact_cex"] for item in funnel),
+        "non_vacuous_count": sum(item["clean_non_vacuous"] for item in funnel),
+        "valid_bug_detecting_property_count": sum(
+            item["valid_detection"] for item in funnel
+        ),
+    }
+    if any(row[name] != value for name, value in expected_counts.items()):
+        raise ValueError("SpecFlow funnel counts do not match exact property rows")
     return row
 
 

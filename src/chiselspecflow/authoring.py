@@ -771,12 +771,6 @@ def _materialize_two_stage_candidates(
     for primary_id, intent in zip(primary_ids, indexed):
         instance = by_ref[intent["obligation_ref"]]
         archetype_id = instance["archetype_id"]
-        expected_archetype = _selected_monitor_archetype(scope["component_role_hints"])
-        if archetype_id != expected_archetype:
-            raise AuthoringError(
-                "archetype_role_mismatch",
-                f"{archetype_id} cannot provide {sorted(scope['component_role_hints'].values())}",
-            )
         bindings = materialize_generic_bindings(
             instance["bindings"],
             semantic,

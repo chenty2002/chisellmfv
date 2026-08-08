@@ -120,6 +120,7 @@ def render_direct_harness(
     *,
     top: str,
     formal: Mapping[str, Any],
+    baseline: Mapping[str, Any],
     semantic_index: Mapping[str, Any],
     properties: Sequence[Mapping[str, str]],
 ) -> str:
@@ -127,10 +128,17 @@ def render_direct_harness(
 
     ports = []
     seen = set()
+    elaborated_ports = {
+        row["name"]
+        for row in baseline.get("objects", [])
+        if row.get("owner_module") == top
+        and row.get("direction") in {"input", "output", "inout"}
+    }
     for row in semantic_index.get("objects", []):
         if (
             row.get("owner_module") != top
             or row.get("direction") not in {"input", "output", "inout"}
+            or row.get("name") not in elaborated_ports
             or row.get("name") in seen
         ):
             continue
@@ -176,6 +184,7 @@ def run_direct_sva_formal(
         render_direct_harness(
             top=baseline["top"],
             formal=project["formal"],
+            baseline=baseline,
             semantic_index=semantic,
             properties=properties,
         ),

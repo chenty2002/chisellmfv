@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from src.experiments.paper import (
@@ -40,6 +41,42 @@ DIFFICULTY = {
 }
 DEVELOPMENT_EXPOSED = frozenset({"counter", "fsm_16", "i2c", "led_controller"})
 METHODS = ("s0", "s1", "s2")
+DIAGNOSTIC_PROPERTIES = {
+    "counter": {
+        "property_id": "A3_COUNTER_INCREMENT",
+        "sva": """A3_COUNTER_INCREMENT__assert: assert property (
+  @(posedge clock) disable iff (reset)
+  enable |=> counter_out == ($past(counter_out) + 4'd1));
+A3_COUNTER_INCREMENT__activation: cover property (
+  @(posedge clock) !reset && enable);""",
+    },
+    "fsm_16": {
+        "property_id": "A3_FSM_S7_11",
+        "sva": """A3_FSM_S7_11__assert: assert property (
+  @(posedge clock) disable iff (reset)
+  (state == 4'd7 && input1 && input2) |=> state == 4'd0);
+A3_FSM_S7_11__activation: cover property (
+  @(posedge clock) !reset && state == 4'd7 && input1 && input2);""",
+    },
+    "i2c": {
+        "property_id": "A3_I2C_ACK_PULSE",
+        "sva": """A3_I2C_ACK_PULSE__assert: assert property (
+  @(posedge clock) disable iff (wb_rst_i || !arst_i)
+  dut.byte_controller.bit_controller.cmd_ack
+  |=> !dut.byte_controller.bit_controller.cmd_ack);
+A3_I2C_ACK_PULSE__activation: cover property (
+  @(posedge clock) dut.byte_controller.bit_controller.cmd_ack);""",
+    },
+    "led_controller": {
+        "property_id": "A3_LED_GO_EXPIRED",
+        "sva": """A3_LED_GO_EXPIRED__assert: assert property (
+  @(posedge clock) disable iff (reset)
+  (dut.state == 2'd1 && $signed(dut.count) >= 32'sd6)
+  |-> lights == 3'b010);
+A3_LED_GO_EXPIRED__activation: cover property (
+  @(posedge clock) !reset && dut.state == 2'd1 && $signed(dut.count) >= 32'sd6);""",
+    },
+}
 
 
 class SpecFlowExperimentError(ValueError):
@@ -173,6 +210,7 @@ def run_task(args: argparse.Namespace) -> Path:
         )
 
     row = _empty_row(task, args.method, method_root)
+    authored_property_ids: list[str] = []
     author_started = time.monotonic()
     client: Any = None
     try:
@@ -189,6 +227,7 @@ def run_task(args: argparse.Namespace) -> Path:
                 method_root / "authoring",
                 max_tokens=config["model"]["method_budgets"]["s0"][0],
             )
+            authored_property_ids = [item["property_id"] for item in properties]
             row["generated_property_count"] = len(properties)
             row["authoring_seconds"] = time.monotonic() - author_started
             formal_started = time.monotonic()
@@ -210,6 +249,9 @@ def run_task(args: argparse.Namespace) -> Path:
                 row,
                 summarize_direct_sva(clean_result),
                 summarize_direct_sva(faulty_result),
+                authored_property_ids,
+                clean_executable=clean_result.get("execution_status") != "compile_error",
+                faulty_executable=faulty_result.get("execution_status") != "compile_error",
             )
             row["status"] = _s0_status(clean_result, faulty_result)
             if row["status"] == "compile_error":
@@ -239,6 +281,14 @@ def run_task(args: argparse.Namespace) -> Path:
                 for monitor in package["monitors"]
                 for prop in monitor["properties"]
             )
+            authored_property_ids = sorted(
+                {
+                    prop["source_property_id"]
+                    for monitor in package["monitors"]
+                    for prop in monitor["properties"]
+                    if prop["role"] == "primary_assertion"
+                }
+            )
             row["obligation_families"] = sorted(
                 {item["family"] for item in package["obligations"]}
             )
@@ -266,6 +316,7 @@ def run_task(args: argparse.Namespace) -> Path:
                 _typed_evidence(faulty_workspace.run_dir),
                 clean_outcome,
                 faulty_outcome,
+                authored_property_ids,
             )
             row["status"] = (
                 "completed"
@@ -279,6 +330,22 @@ def run_task(args: argparse.Namespace) -> Path:
         row["artifact_paths"]["error"] = f"{type(exc).__name__}: {exc}"
         if row["authoring_seconds"] == 0.0:
             row["authoring_seconds"] = time.monotonic() - author_started
+    if not row["property_funnel"] and authored_property_ids:
+        row["property_funnel"] = [
+            _property_funnel_row(
+                property_id,
+                {},
+                {},
+                clean_executable=False,
+                faulty_executable=False,
+                typed=args.method != "s0",
+            )
+            for property_id in authored_property_ids
+        ]
+    if row["status"] in {"authoring_error", "compile_error"}:
+        row["funnel_failure"] = "authoring_type_failure"
+    elif row["status"] == "tool_error":
+        row["funnel_failure"] = "formal_tool_failure"
     if client is not None:
         usage = client.get_token_usage()
         row["model_calls"] = int(usage.get("llm_calls", 0))
@@ -291,6 +358,138 @@ def run_task(args: argparse.Namespace) -> Path:
     score(run_dir)
     write_report(run_dir)
     return row_path
+
+
+def run_diagnostic(args: argparse.Namespace) -> Path:
+    """Run one A3 property without adding it to S0/S1/S2 results."""
+
+    from src.chiselspecflow.config import SpecFlowRunConfig
+    from src.chiselspecflow.preflight import prepare_workspace
+    from src.experiments.direct_sva import run_direct_sva_formal, summarize_direct_sva
+
+    run_dir = Path(args.run).resolve()
+    config = _read_json(run_dir / "config.json")
+    task = _task(run_dir, args.bug_id)
+    family = task["family"]
+    if family not in DIAGNOSTIC_PROPERTIES or task["faulty_variant"]["variant_index"] != 1:
+        raise SpecFlowExperimentError("A3 accepts only the four development bug-1 cases")
+    repo = _repo_from_run(run_dir)
+    diagnostic_root = run_dir / "raw" / args.bug_id / "diagnostic"
+    diagnostic_root.mkdir(parents=True, exist_ok=False)
+    property_row = dict(DIAGNOSTIC_PROPERTIES[family])
+    property_path = diagnostic_root / "diagnostic_property.json"
+    _write_json(property_path, property_row)
+    source = task["public_inputs"]
+    expected, primary = SELECTED_AUTHORING_SCOPE[family]
+
+    def workspace(name: str, configuration: Path):
+        return prepare_workspace(
+            SpecFlowRunConfig(
+                project_contract=repo / source["project"]["path"],
+                specification=repo / source["specification"]["path"],
+                configuration=configuration,
+                run_root=diagnostic_root,
+                opaque_task_id=f"{args.bug_id}-diagnostic-{name}",
+                expected_property_ids=(expected,),
+                component_ids=(primary,),
+            ),
+            diagnostic_root / name,
+            repo / "benchmark/synth/SPECIFICATIONS.sha256",
+        )
+
+    status = "running"
+    failure_reason = None
+    gates = _property_funnel_row(
+        property_row["property_id"],
+        {},
+        {},
+        clean_executable=False,
+        faulty_executable=False,
+        typed=False,
+    )
+    try:
+        faulty_config = _write_variant_config(
+            repo, diagnostic_root, task, clean=False
+        )
+        clean_config = _write_variant_config(repo, diagnostic_root, task, clean=True)
+        faulty_workspace = workspace("faulty", faulty_config)
+        faulty_result = run_direct_sva_formal(
+            faulty_workspace,
+            [property_row],
+            diagnostic_root / "faulty_formal",
+            **config["formal"],
+        )
+        clean_workspace = workspace("clean", clean_config)
+        clean_result = run_direct_sva_formal(
+            clean_workspace,
+            [property_row],
+            diagnostic_root / "clean_formal",
+            **config["formal"],
+        )
+        gates = _property_funnel_row(
+            property_row["property_id"],
+            summarize_direct_sva(clean_result).get(property_row["property_id"], {}),
+            summarize_direct_sva(faulty_result).get(property_row["property_id"], {}),
+            clean_executable=clean_result.get("execution_status") != "compile_error",
+            faulty_executable=faulty_result.get("execution_status") != "compile_error",
+            typed=False,
+        )
+        status = _s0_status(clean_result, faulty_result)
+        if status != "completed":
+            failure_reason = status
+    except Exception as exc:
+        status = _failure_status(exc)
+        failure_reason = f"{type(exc).__name__}: {exc}"
+
+    result = {
+        "schema_version": "specflow_capability_diagnostic.v1",
+        "bug_id": args.bug_id,
+        "family": family,
+        "status": status,
+        "capability_available": status == "completed" and gates["valid_detection"],
+        "gates": gates,
+        "failure_reason": failure_reason,
+        "identity": {
+            "property_sha256": hashlib.sha256(property_path.read_bytes()).hexdigest(),
+            "clean_configuration_id": "paper_clean",
+            "faulty_configuration_id": "paper_bug_01",
+        },
+        "artifacts": {
+            "property": str(property_path.relative_to(run_dir)),
+            "clean_formal": str((diagnostic_root / "clean_formal").relative_to(run_dir)),
+            "faulty_formal": str((diagnostic_root / "faulty_formal").relative_to(run_dir)),
+        },
+        "scope": {
+            "model_calls": 0,
+            "included_in_main_results": False,
+            "repository_asset": False,
+        },
+    }
+    result_path = diagnostic_root / "diagnostic_result.json"
+    _write_json(result_path, result)
+    _write_capability_table(run_dir)
+    return result_path
+
+
+def _write_capability_table(run_dir: Path) -> None:
+    rows = [
+        _read_json(path)
+        for path in sorted(run_dir.glob("raw/*/diagnostic/diagnostic_result.json"))
+    ]
+    _write_json(
+        run_dir / "tables/capability_smoke.json",
+        {
+            "schema_version": "specflow_capability_smoke.v1",
+            "expected_families": sorted(DIAGNOSTIC_PROPERTIES),
+            "completed_families": sorted(
+                row["family"] for row in rows if row["status"] == "completed"
+            ),
+            "available_families": sorted(
+                row["family"] for row in rows if row["capability_available"]
+            ),
+            "rows": rows,
+        },
+    )
 
 
 def score(run_dir: Path) -> None:
@@ -312,6 +511,52 @@ def score(run_dir: Path) -> None:
         "schema_version": "specflow_template_reuse",
         "templates": template_reuse_summary(rows),
     }
+    funnel_properties = [
+        {
+            "bug_id": row["bug_id"],
+            "family": row["family"],
+            "method": row["method"],
+            **item,
+        }
+        for row in rows
+        for item in row["property_funnel"]
+    ]
+    table0 = {
+        "schema_version": "specflow_property_funnel.v1",
+        "properties": funnel_properties,
+        "task_failures": [
+            {
+                "bug_id": row["bug_id"],
+                "family": row["family"],
+                "method": row["method"],
+                "failure": row["funnel_failure"],
+            }
+            for row in rows
+            if row["funnel_failure"] is not None
+        ],
+        "gate_counts": {
+            gate: sum(item[gate] for item in funnel_properties)
+            for gate in (
+                "authoring_success",
+                "executable_on_clean",
+                "executable_on_faulty",
+                "clean_proven",
+                "clean_non_vacuous",
+                "faulty_exact_cex",
+                "valid_detection",
+            )
+        },
+        "classification_counts": {
+            classification: sum(
+                item["classification"] == classification
+                for item in funnel_properties
+            )
+            for classification in sorted(
+                {item["classification"] for item in funnel_properties}
+            )
+        },
+    }
+    _write_json(run_dir / "tables/table0_property_funnel.json", table0)
     _write_json(run_dir / "tables/table1_family_results.json", table1)
     _write_json(run_dir / "tables/table2_method_ablation.json", table2)
     _write_json(run_dir / "tables/table3_template_reuse.json", table3)
@@ -321,12 +566,18 @@ def write_report(run_dir: Path) -> None:
     run_dir = Path(run_dir)
     rows = _load_results(run_dir) if (run_dir / "results.jsonl").is_file() else []
     scheduled = 41 * len(METHODS)
+    properties = [item for row in rows for item in row["property_funnel"]]
     lines = [
         "# SpecFlow bug-level experiment",
         "",
         f"- Result rows: {len(rows)}/{scheduled}",
         f"- Completed rows: {sum(row['status'] == 'completed' for row in rows)}",
         f"- Failed/incomplete rows: {sum(row['status'] != 'completed' for row in rows)}",
+        f"- Authored properties: {len(properties)}",
+        f"- Executable on clean/faulty: {sum(item['executable_on_clean'] and item['executable_on_faulty'] for item in properties)}",
+        f"- Clean proven and non-vacuous: {sum(item['clean_proven'] and item['clean_non_vacuous'] for item in properties)}",
+        f"- Faulty exact CEX: {sum(item['faulty_exact_cex'] for item in properties)}",
+        f"- Valid detections: {sum(item['valid_detection'] for item in properties)}",
         "",
         "## Method summary",
         "",
@@ -370,6 +621,9 @@ def add_parser(
     run_parser.add_argument("--method", choices=METHODS, required=True)
     run_parser.add_argument("--model")
     run_parser.add_argument("--url")
+    diagnose_parser = actions.add_parser("diagnose")
+    diagnose_parser.add_argument("--run", required=True)
+    diagnose_parser.add_argument("--bug-id", required=True)
     score_parser = actions.add_parser("score")
     score_parser.add_argument("--run", required=True)
     report_parser = actions.add_parser("report")
@@ -381,6 +635,8 @@ def run(args: argparse.Namespace) -> None:
         path = prepare(args)
     elif args.specflow_exp_action == "run":
         path = run_task(args)
+    elif args.specflow_exp_action == "diagnose":
+        path = run_diagnostic(args)
     elif args.specflow_exp_action == "score":
         path = Path(args.run).resolve()
         score(path)
@@ -409,6 +665,8 @@ def _empty_row(task: Mapping[str, Any], method: str, method_root: Path) -> dict[
         "faulty_cex_count": 0,
         "non_vacuous_count": 0,
         "valid_bug_detecting_property_count": 0,
+        "property_funnel": [],
+        "funnel_failure": None,
         "model_calls": 0,
         "input_tokens": 0,
         "output_tokens": 0,
@@ -425,37 +683,24 @@ def _score_s0(
     row: dict[str, Any],
     clean: Mapping[str, Mapping[str, Any]],
     faulty: Mapping[str, Mapping[str, Any]],
+    property_ids: Sequence[str],
+    *,
+    clean_executable: bool,
+    faulty_executable: bool,
 ) -> None:
-    ids = sorted(set(clean) | set(faulty))
-    row["compiled_on_clean"] = sum(
-        clean.get(pid, {}).get("primary_assertion", {}).get("status") != "tool_error"
-        for pid in ids
-        if "primary_assertion" in clean.get(pid, {})
-    )
-    row["compiled_on_faulty"] = sum(
-        faulty.get(pid, {}).get("primary_assertion", {}).get("status") != "tool_error"
-        for pid in ids
-        if "primary_assertion" in faulty.get(pid, {})
-    )
-    for property_id in ids:
-        clean_rows = clean.get(property_id, {})
-        faulty_rows = faulty.get(property_id, {})
-        clean_primary = clean_rows.get("primary_assertion", {})
-        activation = clean_rows.get("activation_cover", {})
-        faulty_primary = faulty_rows.get("primary_assertion", {})
-        proven = clean_primary.get("status") == "proven"
-        clean_cex = clean_primary.get("status") == "cex"
-        non_vacuous = activation.get("status") == "covered"
-        faulty_cex = (
-            faulty_primary.get("status") == "cex" and faulty_primary.get("trace_path")
+    _require_exact_property_ids(property_ids, clean, faulty)
+    row["property_funnel"] = [
+        _property_funnel_row(
+            property_id,
+            clean.get(property_id, {}),
+            faulty.get(property_id, {}),
+            clean_executable=clean_executable,
+            faulty_executable=faulty_executable,
+            typed=False,
         )
-        row["clean_proven_count"] += int(proven)
-        row["clean_cex_count"] += int(clean_cex)
-        row["non_vacuous_count"] += int(non_vacuous)
-        row["faulty_cex_count"] += int(bool(faulty_cex))
-        row["valid_bug_detecting_property_count"] += int(
-            proven and non_vacuous and bool(faulty_cex)
-        )
+        for property_id in property_ids
+    ]
+    _record_funnel_counts(row)
 
 
 def _score_typed(
@@ -464,32 +709,115 @@ def _score_typed(
     faulty: Mapping[str, Mapping[str, Any]],
     clean_outcome: Mapping[str, Any],
     faulty_outcome: Mapping[str, Any],
+    property_ids: Sequence[str],
 ) -> None:
-    generated = row["generated_property_count"]
-    row["compiled_on_clean"] = generated if clean_outcome.get("execution_status") != "compile_error" else 0
-    row["compiled_on_faulty"] = generated if faulty_outcome.get("execution_status") != "compile_error" else 0
-    for property_id in sorted(set(clean) | set(faulty)):
-        clean_row = clean.get(property_id, {})
-        faulty_row = faulty.get(property_id, {})
-        proven = clean_row.get("primary_status") == "proven"
-        clean_cex = clean_row.get("primary_status") == "cex"
-        non_vacuous = clean_row.get("evidence_status") == "complete"
-        faulty_cex = (
-            faulty_row.get("primary_status") == "cex" and faulty_row.get("trace_path")
+    _require_exact_property_ids(property_ids, clean, faulty)
+    row["property_funnel"] = [
+        _property_funnel_row(
+            property_id,
+            clean.get(property_id, {}),
+            faulty.get(property_id, {}),
+            clean_executable=clean_outcome.get("execution_status") != "compile_error",
+            faulty_executable=faulty_outcome.get("execution_status") != "compile_error",
+            typed=True,
         )
-        row["clean_proven_count"] += int(proven)
-        row["clean_cex_count"] += int(clean_cex)
-        row["non_vacuous_count"] += int(non_vacuous)
-        row["faulty_cex_count"] += int(bool(faulty_cex))
-        row["valid_bug_detecting_property_count"] += int(
-            proven and non_vacuous and bool(faulty_cex)
+        for property_id in property_ids
+    ]
+    _record_funnel_counts(row)
+
+
+def _property_funnel_row(
+    property_id: str,
+    clean: Mapping[str, Any],
+    faulty: Mapping[str, Any],
+    *,
+    clean_executable: bool,
+    faulty_executable: bool,
+    typed: bool,
+) -> dict[str, Any]:
+    clean_primary = clean if typed else clean.get("primary_assertion", {})
+    faulty_primary = faulty if typed else faulty.get("primary_assertion", {})
+    clean_status = clean_primary.get("primary_status" if typed else "status")
+    faulty_status = faulty_primary.get("primary_status" if typed else "status")
+    non_vacuous = (
+        clean_primary.get("evidence_status") == "complete"
+        if typed
+        else clean.get("activation_cover", {}).get("status") == "covered"
+    )
+    faulty_exact_cex = bool(
+        faulty_status == "cex" and faulty_primary.get("trace_path")
+    )
+    clean_proven = clean_status == "proven"
+    clean_cex = clean_status == "cex"
+    valid = bool(
+        clean_executable
+        and faulty_executable
+        and clean_proven
+        and non_vacuous
+        and faulty_exact_cex
+    )
+    if not clean_executable or not faulty_executable:
+        classification = "authoring_type_failure"
+    elif valid:
+        classification = "valid_detection"
+    elif clean_cex and faulty_exact_cex:
+        classification = "faulty_sensitive_clean_false_alarm"
+    elif clean_proven and not non_vacuous:
+        classification = "non_vacuity_failure"
+    elif clean_proven and non_vacuous:
+        classification = "clean_valid_not_fault_sensitive"
+    elif clean_cex:
+        classification = "clean_false_alarm"
+    else:
+        classification = "incomplete_evidence"
+    return {
+        "property_id": property_id,
+        "authoring_success": True,
+        "executable_on_clean": bool(clean_executable),
+        "executable_on_faulty": bool(faulty_executable),
+        "clean_proven": clean_proven,
+        "clean_non_vacuous": non_vacuous,
+        "faulty_exact_cex": faulty_exact_cex,
+        "valid_detection": valid,
+        "clean_false_alarm": clean_cex,
+        "classification": classification,
+    }
+
+
+def _record_funnel_counts(row: dict[str, Any]) -> None:
+    items = row["property_funnel"]
+    row["compiled_on_clean"] = sum(item["executable_on_clean"] for item in items)
+    row["compiled_on_faulty"] = sum(item["executable_on_faulty"] for item in items)
+    row["clean_proven_count"] = sum(item["clean_proven"] for item in items)
+    row["clean_cex_count"] = sum(item["clean_false_alarm"] for item in items)
+    row["faulty_cex_count"] = sum(item["faulty_exact_cex"] for item in items)
+    row["non_vacuous_count"] = sum(item["clean_non_vacuous"] for item in items)
+    row["valid_bug_detecting_property_count"] = sum(
+        item["valid_detection"] for item in items
+    )
+
+
+def _require_exact_property_ids(
+    property_ids: Sequence[str],
+    clean: Mapping[str, Any],
+    faulty: Mapping[str, Any],
+) -> None:
+    authored = set(property_ids)
+    unexpected = (set(clean) | set(faulty)) - authored
+    if len(authored) != len(property_ids) or unexpected:
+        raise SpecFlowExperimentError(
+            f"property evidence does not exact-join authored IDs: {sorted(unexpected)}"
         )
 
 
 def _typed_evidence(run_dir: Path) -> dict[str, dict[str, Any]]:
     path = Path(run_dir) / "stages/02_compile_verify/semantic_evidence.json"
     value = _read_json(path)
-    return {row["source_property_id"]: row for row in value.get("properties", [])}
+    rows = value.get("properties", [])
+    result = {row["source_property_id"]: row for row in rows}
+    if len(result) != len(rows):
+        raise SpecFlowExperimentError("duplicate exact property ID in semantic evidence")
+    return result
 
 
 def _direct_context(workspace: Any) -> dict[str, Any]:

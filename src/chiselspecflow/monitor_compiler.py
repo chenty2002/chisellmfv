@@ -369,20 +369,21 @@ def render_overlay(
         lines.extend("  " + line for line in unit.state_lines)
         for row in unit.property_rows:
             label = row["expected_label"]
+            predicate_name = f"{label}_predicate"
             role = row["role"]
             lines.append(f"  // {label} {row['source_property_id']} {role}")
-            anchor_line = len(lines) + 1
             if role == "primary_assertion":
                 predicate = f"((!({row['guard']})) || ({row['expression']}))"
-                lines.append(f"  assert({predicate}, \"{label}\")")
-                kind = "assert"
-            elif role == "assumption_sat":
-                predicate = f"(({row['guard']}) && ({row['expression']}))"
-                lines.append(f"  cover({predicate})")
-                kind = "cover"
             else:
                 predicate = f"(({row['guard']}) && ({row['expression']}))"
-                lines.append(f"  cover({predicate})")
+            lines.append(f"  val {predicate_name} = WireInit({predicate})")
+            lines.append(f"  dontTouch({predicate_name})")
+            anchor_line = len(lines) + 1
+            if role == "primary_assertion":
+                lines.append(f"  assert({predicate_name}, \"{label}\")")
+                kind = "assert"
+            else:
+                lines.append(f"  cover({predicate_name})")
                 kind = "cover"
             properties.append(
                 {
