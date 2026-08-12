@@ -25,7 +25,7 @@ from verilog_causal_analysis.identity import stable_set_sha256
 
 def _candidate_payload() -> dict:
     return {
-        "schema_version": "rtl_candidate_universe.v1",
+        "schema_version": "rtl_candidate_universe.v2",
         "rtl_set_sha256": "a" * 64,
         "candidates": [
             {
@@ -33,6 +33,8 @@ def _candidate_payload() -> dict:
                 "statement_id": "stmt_1",
                 "line_start": 3,
                 "line_end": 3,
+                "statement_kind": "assignment",
+                "executable": True,
                 "snippet_sha256": "b" * 64,
             },
             {
@@ -40,6 +42,8 @@ def _candidate_payload() -> dict:
                 "statement_id": "stmt_2",
                 "line_start": 4,
                 "line_end": 4,
+                "statement_kind": "conditional_guard",
+                "executable": True,
                 "snippet_sha256": "c" * 64,
             },
         ],
@@ -49,14 +53,24 @@ def _candidate_payload() -> dict:
 def _graph() -> dict:
     return {
         "identity": {"rtl_set_sha256": "a" * 64},
-        "semantic_nodes": [],
+        "semantic_nodes": [
+            {
+                "semantic_id": "activation_1",
+                "type": "rtl_statement_activation",
+                "artifact_id": "rtl_0001",
+                "statement_id": "stmt_1",
+                "target_node_id": "dst",
+                "cycle": 2,
+                "activation_status": "active_exact",
+            }
+        ],
         "signal_nodes": [{"node_id": "dst", "cycle": 2}],
         "edges": [
             {
                 "edge_id": "edge_1",
                 "dst_node_id": "dst",
                 "dependency_type": "sequential",
-                "contribution_evidence": {"status": "supported", "score": 0.75},
+                "contribution_evidence": {"status": "unsupported", "score": 0.0},
                 "rtl_evidence": {
                     "artifact_id": "rtl_0001",
                     "statement_id": "stmt_1",
@@ -64,7 +78,18 @@ def _graph() -> dict:
                     "line_end": 3,
                     "snippet_sha256": "b" * 64,
                 },
-            }
+            },
+            {
+                "edge_id": "activation_edge_1",
+                "src_semantic_id": "activation_1",
+                "dst_node_id": "dst",
+                "relation": "active_statement_write",
+                "artifact_id": "rtl_0001",
+                "statement_id": "stmt_1",
+                "target_node_id": "dst",
+                "cycle": 2,
+                "activation_status": "active_exact",
+            },
         ],
     }
 
@@ -144,13 +169,21 @@ def test_coverage_and_exact_gold_evaluator_fail_closed(tmp_path: Path) -> None:
 
     candidates = _candidate_payload()
     review = {
+        "schema_version": "verilogcause_gold_review.v1",
         "review_status": "approved",
         "reviewer": "codex",
         "rtl_set_sha256": "a" * 64,
         "gold_representable": True,
         "gold": [{"artifact_id": "rtl_0001", "statement_id": "stmt_1"}],
     }
-    gold, representable = join_reviewed_gold(candidates, review)
+    review["proposal_sha256"] = "e" * 64
+    review["candidates_sha256"] = "f" * 64
+    gold, representable = join_reviewed_gold(
+        candidates,
+        review,
+        proposal_sha256="e" * 64,
+        candidates_sha256="f" * 64,
+    )
     metrics = set_valued_metrics(
         {("rtl_0001", "stmt_1"): 1.0, ("rtl_0001", "stmt_2"): 1.0},
         gold,
@@ -159,7 +192,12 @@ def test_coverage_and_exact_gold_evaluator_fail_closed(tmp_path: Path) -> None:
     assert metrics["gold_rank"] == 1.5 and metrics["tie_size"] == 2
     assert set_valued_metrics({}, set(), representable=False)["exam_percent"] == 100.0
     with pytest.raises(VerilogCauseError, match="RTL hash mismatch"):
-        join_reviewed_gold(candidates, review | {"rtl_set_sha256": "d" * 64})
+        join_reviewed_gold(
+            candidates,
+            review | {"rtl_set_sha256": "d" * 64},
+            proposal_sha256="e" * 64,
+            candidates_sha256="f" * 64,
+        )
 
 
 def test_exact_relation_features_and_failed_gate_do_not_train() -> None:
@@ -231,3 +269,62 @@ def test_exact_relation_features_and_failed_gate_do_not_train() -> None:
         ]
     )
     assert pairwise["by_family"]["alu"]["win_rate"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("case_id", "family", "signal", "dut_signal", "cycle", "correct", "faulty"),
+    [
+        ("alu_3", "alu", "zero", "testbench.DUT.zero", 0, 1, 0),
+        ("fsm_16-1", "fsm_16", "state_out", "testbench.DUT.state", 4, 0, 1),
+    ],
+)
+def test_cycle_end_oracle_phase_and_gold_blind_pool(
+    tmp_path: Path,
+    case_id: str,
+    family: str,
+    signal: str,
+    dut_signal: str,
+    cycle: int,
+    correct: int,
+    faulty: int,
+) -> None:
+    cases = {
+        row["case_id"]: row
+        for row in discover_cases(
+            Path("benchmark/Wit-HW/buggy_designs"), [family]
+        )
+    }
+    rows = verilogcause._prepare_case(cases[case_id], tmp_path / "run", 120)
+    case = rows[0]
+    traces = rows[1:]
+    trigger = next(row for row in traces if row["workload_id"] == "trigger")
+    endpoint = trigger["failure_endpoint"]
+
+    assert (endpoint["signal"], endpoint["cycle"]) == (signal, cycle)
+    assert (int(endpoint["correct"], 2), int(endpoint["faulty"], 2)) == (
+        correct,
+        faulty,
+    )
+    assert trigger["oracle"]["endpoint_sampling"] == (
+        "cycle_end_before_next_rising"
+    )
+    assert trigger["oracle"]["first_divergence"] == endpoint
+    rtl = json.loads(
+        (
+            tmp_path
+            / "run"
+            / "cases"
+            / case_id
+            / "model_inputs"
+            / "rtl_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    request = verilogcause._vca_request(tmp_path / "run", trigger, rtl)
+    assert (request.endpoint.signal, request.endpoint.cycle) == (dut_signal, cycle)
+    assert len(traces) == 4
+    assert case["contrast_status"] == "contrast_complete"
+    assert set(case["simulation"]["compile_once"]) == {
+        "correct",
+        "original_faulty",
+        "sanitized_faulty",
+    }

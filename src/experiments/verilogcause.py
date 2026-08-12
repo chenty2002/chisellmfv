@@ -63,6 +63,8 @@ VCA_BOUNDS = {
     "max_waitfor_edges": 960,
     "max_scc_candidates": 8,
 }
+_DUT_CLOCK = "testbench.DUT.clk"
+_ENDPOINT_SAMPLING = "cycle_end_before_next_rising"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
@@ -266,7 +268,6 @@ def _copy_compile_inputs(
     destination: Path,
     sources: Sequence[Path],
     testbench: Path,
-    workload: Path,
     *,
     sanitize: bool,
 ) -> list[dict[str, Any]]:
@@ -295,7 +296,6 @@ def _copy_compile_inputs(
             }
         )
     shutil.copyfile(testbench, destination / "testbench.sv")
-    shutil.copyfile(workload, destination / "workload.in")
     (destination / "file_list.txt").write_text(
         "".join(f"{row['compile_name']}\n" for row in copied) + "testbench.sv\n",
         encoding="utf-8",
@@ -338,22 +338,74 @@ def _run_command(
     return record
 
 
-def _simulate(directory: Path, *, trace: bool, timeout: float) -> dict[str, Any]:
+def _compile(directory: Path, timeout: float) -> dict[str, Any]:
     compile_command = ["verilator", *VERILATOR_FLAGS]
-    if trace:
-        compile_command.insert(-2, "+define+DUMP_TRACE=1")
+    compile_command.insert(-2, "+define+DUMP_TRACE=1")
     compile_result = _run_command(compile_command, directory, "compile.log", timeout)
     if compile_result["returncode"] != 0:
         raise PreparationError("compile_error", f"Verilator compile failed in {directory}")
+    return compile_result
+
+
+def _run_trace(
+    binary: Path, directory: Path, workload: bytes, timeout: float
+) -> dict[str, Any]:
+    directory.mkdir(parents=True, exist_ok=False)
+    (directory / "workload.in").write_bytes(workload)
     simulation_result = _run_command(
-        ["./obj_dir/Vtestbench"], directory, "simulation.log", timeout
+        [str(binary.resolve())], directory, "simulation.log", timeout
     )
     if simulation_result["returncode"] != 0:
         raise PreparationError("simulation_error", f"simulation failed in {directory}")
     output = directory / "output-signals.txt"
     if not output.is_file():
         raise PreparationError("simulation_error", f"missing simulator output in {directory}")
-    return {"compile": compile_result, "simulation": simulation_result}
+    vcd = directory / "dump.vcd"
+    coverage = directory / "coverage.dat"
+    if not vcd.is_file() or not coverage.is_file():
+        raise PreparationError("simulation_error", f"trace or coverage is missing in {directory}")
+    fst = directory / "dump.fst"
+    conversion = _run_command(
+        ["vcd2fst", "dump.vcd", "dump.fst"], directory, "vcd2fst.log", timeout
+    )
+    if conversion["returncode"] != 0 or not fst.is_file():
+        raise PreparationError("trace_conversion_error", f"vcd2fst failed in {directory}")
+    return {"simulation": simulation_result, "conversion": conversion}
+
+
+def _workload_pool(
+    trigger: Path, input_signals: dict[str, int]
+) -> list[dict[str, Any]]:
+    raw = trigger.read_bytes()
+    if not raw or raw.endswith((b"\n", b"\r")) or b"\r" in raw:
+        raise VerilogCauseError("trigger must be non-empty LF-separated bytes without a trailing newline")
+    rows = raw.split(b"\n")
+    widths = tuple(input_signals.values())
+    if any(
+        len(cells := row.split(b",")) != len(widths)
+        or any(len(cell) != width or set(cell) - {48, 49} for cell, width in zip(cells, widths))
+        for row in rows
+    ):
+        raise VerilogCauseError("trigger row does not match metadata input widths")
+    zero = b",".join(b"0" * width for width in input_signals.values())
+    one = b",".join(b"1" * width for width in input_signals.values())
+    proposals = (
+        ("trigger", raw),
+        ("first_vector", rows[0]),
+        ("all_zero", b"\n".join([zero] * len(rows))),
+        ("all_one", b"\n".join([one] * len(rows))),
+    )
+    result = []
+    seen = set()
+    for workload_id, payload in proposals:
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest in seen:
+            continue
+        seen.add(digest)
+        result.append(
+            {"workload_id": workload_id, "payload": payload, "sha256": digest}
+        )
+    return result
 
 
 def compare_outputs(correct: Path, faulty: Path) -> dict[str, Any]:
@@ -390,6 +442,76 @@ def compare_outputs(correct: Path, faulty: Path) -> dict[str, Any]:
                     },
                 }
     return {"outcome": "passing", "failure_endpoint": None}
+
+
+def _output_signals(path: Path) -> list[str]:
+    with path.open(encoding="utf-8", newline="") as stream:
+        header = next(csv.reader(stream, skipinitialspace=True), [])
+    signals = [cell.strip() for cell in header]
+    if len(signals) < 2 or signals[0] != "time" or len(signals) != len(set(signals)):
+        raise VerilogCauseError(f"invalid output header: {path}")
+    return signals[1:]
+
+
+def _waveform_endpoint_signal(waveform: Any, public_signal: str) -> str:
+    public = [
+        row
+        for name, row in waveform.signals.by_name.items()
+        if re.sub(r"\s*\[\d+:\d+\]$", "", name) == f"testbench.{public_signal}"
+    ]
+    if len(public) != 1:
+        raise VerilogCauseError(f"public endpoint is not exact: {public_signal}")
+    aliases = [
+        name
+        for name, row in waveform.signals.by_name.items()
+        if row.handle == public[0].handle and name.startswith("testbench.DUT.")
+    ]
+    if len(aliases) != 1:
+        raise VerilogCauseError(f"DUT endpoint alias is not exact: {public_signal}")
+    return aliases[0]
+
+
+def compare_waveforms(
+    correct_fst: Path, faulty_fst: Path, public_signals: Sequence[str]
+) -> dict[str, Any]:
+    from verilog_causal_analysis.cycle_waveform import CycleAlignedWaveform
+
+    with CycleAlignedWaveform(
+        str(correct_fst), _DUT_CLOCK, exact_clock=True
+    ) as correct, CycleAlignedWaveform(
+        str(faulty_fst), _DUT_CLOCK, exact_clock=True
+    ) as faulty:
+        if correct.get_cycle_count() != faulty.get_cycle_count():
+            raise VerilogCauseError("waveforms have different DUT clock cycle counts")
+        signal_pairs = [
+            (
+                signal,
+                _waveform_endpoint_signal(correct, signal),
+                _waveform_endpoint_signal(faulty, signal),
+            )
+            for signal in public_signals
+        ]
+        for cycle in range(correct.get_cycle_count()):
+            for public, correct_signal, faulty_signal in signal_pairs:
+                expected = correct.get_signal_value(correct_signal, cycle)
+                observed = faulty.get_signal_value(faulty_signal, cycle)
+                if expected != observed:
+                    endpoint = {
+                        "signal": public,
+                        "cycle": cycle,
+                        "correct": expected,
+                        "faulty": observed,
+                    }
+                    return {
+                        "outcome": "failing",
+                        "failure_endpoint": endpoint,
+                        "first_divergence": endpoint,
+                    }
+    return {
+        "outcome": "passing",
+        "failure_endpoint": None,
+        "first_divergence": None,
+    }
 
 
 def read_line_coverage(path: Path, allowed_sources: set[str]) -> list[dict[str, Any]]:
@@ -463,25 +585,57 @@ def propose_gold(
     }
 
 
+def _candidate_universe(
+    candidates: dict[str, Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    if candidates.get("schema_version") != "rtl_candidate_universe.v2":
+        raise VerilogCauseError("candidate schema is not rtl_candidate_universe.v2")
+    if not candidates.get("rtl_set_sha256"):
+        raise VerilogCauseError("candidate RTL hash is missing")
+    required = {
+        "artifact_id",
+        "statement_id",
+        "line_start",
+        "line_end",
+        "statement_kind",
+        "executable",
+        "snippet_sha256",
+    }
+    universe = {}
+    for candidate in candidates.get("candidates", []):
+        if not required <= candidate.keys() or candidate["executable"] is not True:
+            raise VerilogCauseError("candidate contract is incomplete")
+        key = (candidate["artifact_id"], candidate["statement_id"])
+        if key in universe:
+            raise VerilogCauseError("candidate identity is duplicated")
+        universe[key] = candidate
+    return universe
+
+
 def join_reviewed_gold(
-    candidates: dict[str, Any], review: dict[str, Any]
+    candidates: dict[str, Any],
+    review: dict[str, Any],
+    *,
+    proposal_sha256: str,
+    candidates_sha256: str,
 ) -> tuple[set[tuple[str, str]], bool]:
+    universe = _candidate_universe(candidates)
+    if review.get("schema_version") != "verilogcause_gold_review.v1":
+        raise VerilogCauseError("gold review schema is not verilogcause_gold_review.v1")
+    if review.get("proposal_sha256") != proposal_sha256:
+        raise VerilogCauseError("gold review/proposal hash mismatch")
+    if review.get("candidates_sha256") != candidates_sha256:
+        raise VerilogCauseError("gold review/candidates hash mismatch")
     if review.get("review_status") != "approved" or review.get("reviewer") != "codex":
         raise VerilogCauseError("gold is not approved by Codex")
     rtl_hash = candidates.get("rtl_set_sha256")
     if not rtl_hash or review.get("rtl_set_sha256") != rtl_hash:
         raise VerilogCauseError("gold/candidate RTL hash mismatch")
-    universe = set()
-    for row in candidates.get("candidates", []):
-        key = (row.get("artifact_id"), row.get("statement_id"))
-        if None in key or key in universe:
-            raise VerilogCauseError("candidate identity is missing or duplicated")
-        universe.add(key)
     representable = review.get("gold_representable")
     gold = {
         (row.get("artifact_id"), row.get("statement_id")) for row in review.get("gold", [])
     }
-    if representable is True and (not gold or not gold <= universe):
+    if representable is True and (not gold or not gold <= universe.keys()):
         raise VerilogCauseError("representable gold does not exactly join candidates")
     if representable is False and gold:
         raise VerilogCauseError("unrepresentable gold must not name a candidate")
@@ -502,19 +656,70 @@ def resolve_rtl_evidence(
     if _rtl_set_hash(candidates) != _rtl_set_hash(graph):
         raise VerilogCauseError("candidate/graph RTL hash mismatch")
     if any(
-        "source_provenance" in str(node.get("kind", node.get("semantic_kind", ""))).lower()
+        "source_provenance"
+        in str(
+            node.get("type", node.get("kind", node.get("semantic_kind", "")))
+        ).lower()
         for node in graph.get("semantic_nodes", [])
     ):
         raise VerilogCauseError("native graph contains Chisel source provenance")
-    universe = {}
-    for candidate in candidates.get("candidates", []):
-        key = (candidate.get("artifact_id"), candidate.get("statement_id"))
-        if None in key or key in universe:
-            raise VerilogCauseError("candidate identity is missing or duplicated")
-        universe[key] = candidate
+    universe = _candidate_universe(candidates)
     result: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    semantic_nodes = {
+        node.get("semantic_id"): node
+        for node in graph.get("semantic_nodes", [])
+        if node.get("semantic_id")
+    }
+    signal_nodes = {
+        node.get("node_id"): node
+        for node in graph.get("signal_nodes", [])
+        if node.get("node_id")
+    }
     seen_edges = set()
     for edge in graph.get("edges", []):
+        relation = edge.get("relation")
+        if relation in {"active_statement_write", "active_guard"}:
+            required = (
+                "artifact_id",
+                "statement_id",
+                "target_node_id",
+                "cycle",
+                "activation_status",
+            )
+            if any(edge.get(field) is None for field in required):
+                raise VerilogCauseError("statement activation relation is incomplete")
+            if edge.get("dst_node_id") != edge["target_node_id"]:
+                raise VerilogCauseError("statement activation target identity drift")
+            target = signal_nodes.get(edge["target_node_id"])
+            if target is None or target.get("cycle") != edge["cycle"]:
+                raise VerilogCauseError("statement activation target cycle drift")
+            semantic = semantic_nodes.get(edge.get("src_semantic_id"))
+            if semantic is None or semantic.get("type") != "rtl_statement_activation":
+                raise VerilogCauseError("statement activation semantic node is missing")
+            if edge["activation_status"] not in {
+                "active_exact",
+                "ambiguous",
+                "unavailable",
+            }:
+                raise VerilogCauseError("unknown statement activation status")
+            key = (edge["artifact_id"], edge["statement_id"])
+            if key not in universe:
+                raise VerilogCauseError(f"graph references unknown candidate: {key}")
+            for field in (
+                "artifact_id",
+                "statement_id",
+                "target_node_id",
+                "cycle",
+                "activation_status",
+            ):
+                if semantic.get(field) != edge[field]:
+                    raise VerilogCauseError("statement activation semantic identity drift")
+            edge_id = edge.get("edge_id")
+            if not edge_id or edge_id in seen_edges:
+                raise VerilogCauseError("graph edge identity is missing or duplicated")
+            seen_edges.add(edge_id)
+            result[key].append(edge)
+            continue
         evidence = edge.get("rtl_evidence") or {}
         if not evidence.get("statement_id"):
             continue
@@ -590,10 +795,31 @@ def aggregate_features(
             nodes = {row["node_id"]: row.get("cycle") for row in trace["graph"].get("signal_nodes", [])}
             failure_cycle = trace["failure_cycle"]
             mapped = mapping.get(key, [])
-            mapped_count += len(mapped)
+            activation = [
+                edge
+                for edge in mapped
+                if edge.get("relation")
+                in {"active_statement_write", "active_guard"}
+            ]
+            active_exact = [
+                edge
+                for edge in activation
+                if edge.get("activation_status") == "active_exact"
+                and isinstance(edge.get("cycle"), int)
+                and edge["cycle"] <= failure_cycle
+            ]
+            mapped_count += len(activation)
             usable = []
-            active = []
             for edge in mapped:
+                if edge.get("relation") in {
+                    "active_statement_write",
+                    "active_guard",
+                }:
+                    if edge.get("activation_status") != "active_exact":
+                        unavailable.append(
+                            f"activation_{edge.get('activation_status', 'unavailable')}"
+                        )
+                    continue
                 contribution = edge.get("contribution_evidence") or {}
                 score = contribution.get("score", edge.get("contribution_score"))
                 cycle = nodes.get(edge.get("dst_node_id"))
@@ -603,16 +829,26 @@ def aggregate_features(
                 if cycle > failure_cycle:
                     continue
                 usable.append((edge, float(score), cycle))
-                if contribution.get("status") == "supported" and score > 0:
-                    active.append((edge, float(score), cycle))
             usable_count += len(usable)
             sequential_count += sum(edge.get("dependency_type") == "sequential" for edge, _, _ in usable)
-            per_trace_coverage.append(len(usable) / len(mapped) if mapped else 0.0)
-            present.append(bool(active))
-            support_values.extend(score for _, score, _ in active)
-            proximity.append(max((1 / (1 + failure_cycle - cycle) for _, _, cycle in active), default=0.0))
-            if active:
-                offsets.append(min(failure_cycle - cycle for _, _, cycle in active))
+            per_trace_coverage.append(1.0 if active_exact else 0.0)
+            present.append(bool(active_exact))
+            supported = [
+                (edge, score, cycle)
+                for edge, score, cycle in usable
+                if (edge.get("contribution_evidence") or {}).get("status")
+                == "supported"
+                and score > 0
+            ]
+            support_values.extend(score for _, score, _ in supported)
+            proximity.append(
+                max(
+                    (1 / (1 + failure_cycle - cycle) for _, _, cycle in supported),
+                    default=0.0,
+                )
+            )
+            if supported:
+                offsets.append(min(failure_cycle - cycle for _, _, cycle in supported))
         stability = 1 / (1 + pstdev(offsets)) if len(offsets) >= 2 else 0.0
         result[key] = {
             "relation_applicable": mapped_count > 0,
@@ -668,6 +904,8 @@ def relation_gate(case_rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             failures.append(f"{case_id}:contrast_incomplete")
         if not row.get("graph_complete"):
             failures.append(f"{case_id}:graph_incomplete")
+        if row.get("activation_diagnostic_count"):
+            failures.append(f"{case_id}:activation_not_exact")
     return {
         "decision": "failed_stop" if failures else "continue_to_train",
         "failures": failures,
@@ -757,22 +995,52 @@ def _prepare_case(case: dict[str, Any], run: Path, timeout: float) -> list[dict[
     case_dir = run / "cases" / case["case_id"]
     private = case_dir / "evaluator_private"
     model = case_dir / "model_inputs"
-    correct_dir = private / "correct"
-    original_dir = private / "original_faulty"
-    sanitized_dir = model / "sanitized_faulty"
+    correct_build = private / "build_correct"
+    original_build = private / "build_original_faulty"
+    sanitized_build = model / "build_sanitized_faulty"
     correct_sources = _compile_sources(case, "correct_design")
     faulty_sources = _compile_sources(case, "buggy_design")
     _copy_compile_inputs(
-        correct_dir, correct_sources, case["testbench"], case["bug_trigger_input"], sanitize=False
+        correct_build, correct_sources, case["testbench"], sanitize=False
     )
     _copy_compile_inputs(
-        original_dir, faulty_sources, case["testbench"], case["bug_trigger_input"], sanitize=False
+        original_build, faulty_sources, case["testbench"], sanitize=False
     )
     sanitized_manifest = _copy_compile_inputs(
-        sanitized_dir, faulty_sources, case["testbench"], case["bug_trigger_input"], sanitize=True
+        sanitized_build, faulty_sources, case["testbench"], sanitize=True
     )
-    if _sha256(case["bug_trigger_input"]) != _sha256(sanitized_dir / "workload.in"):
-        raise PreparationError("input_drift", "workload byte copy changed")
+    workload_dir = case_dir / "workloads"
+    workload_dir.mkdir()
+    workloads = _workload_pool(case["bug_trigger_input"], case["input_signals"])
+    for workload in workloads:
+        path = workload_dir / f"{workload['workload_id']}.in"
+        path.write_bytes(workload["payload"])
+        workload["path"] = path
+    workload_records = [
+        {
+            "workload_id": row["workload_id"],
+            "sha256": row["sha256"],
+            "artifact": _artifact(row["path"], run),
+        }
+        for row in workloads
+    ]
+    workload_pool_sha256 = _canonical_sha256(
+        [
+            {"workload_id": row["workload_id"], "sha256": row["sha256"]}
+            for row in workloads
+        ]
+    )
+    workload_pool_path = model / "workload_pool.json"
+    _write_json(
+        workload_pool_path,
+        {
+            "schema_version": "verilogcause_workload_pool.v1",
+            "generator": "trigger_first_zero_one_sha256_deduplicated",
+            "input_widths": case["input_signals"],
+            "workload_pool_sha256": workload_pool_sha256,
+            "workloads": workload_records,
+        },
+    )
     rtl_set_sha256 = _canonical_sha256(
         [
             {
@@ -798,40 +1066,133 @@ def _prepare_case(case: dict[str, Any], run: Path, timeout: float) -> list[dict[
         propose_gold(
             case["correct_design"],
             case["buggy_design"],
-            sanitized_dir / sanitized_manifest[0]["compile_name"],
+            sanitized_build / sanitized_manifest[0]["compile_name"],
             rtl_set_sha256,
         ),
     )
-    correct_commands = _simulate(correct_dir, trace=False, timeout=timeout)
-    original_commands = _simulate(original_dir, trace=False, timeout=timeout)
-    sanitized_commands = _simulate(sanitized_dir, trace=True, timeout=timeout)
-    equivalent = compare_outputs(
-        original_dir / "output-signals.txt", sanitized_dir / "output-signals.txt"
-    )
-    if equivalent["outcome"] != "passing":
-        raise PreparationError("sanitizer_mismatch", "sanitizer changed external output")
-    comparison = compare_outputs(
-        correct_dir / "output-signals.txt", sanitized_dir / "output-signals.txt"
-    )
-    vcd = sanitized_dir / "dump.vcd"
-    coverage = sanitized_dir / "coverage.dat"
-    if not vcd.is_file() or not coverage.is_file():
-        raise PreparationError("simulation_error", "faulty trace or coverage is missing")
-    fst = sanitized_dir / "dump.fst"
-    conversion = _run_command(["vcd2fst", "dump.vcd", "dump.fst"], sanitized_dir, "vcd2fst.log", timeout)
-    if conversion["returncode"] != 0 or not fst.is_file():
-        raise PreparationError("trace_conversion_error", "vcd2fst failed")
+    compile_commands = {
+        "correct": _compile(correct_build, timeout),
+        "original_faulty": _compile(original_build, timeout),
+        "sanitized_faulty": _compile(sanitized_build, timeout),
+    }
     allowed_sources = {row["compile_name"] for row in sanitized_manifest}
-    coverage_rows = read_line_coverage(coverage, allowed_sources)
-    coverage_json = sanitized_dir / "line_coverage.json"
-    _write_json(
-        coverage_json,
-        {
-            "schema_version": "verilogcause_line_coverage.v1",
-            "allowed_sources": sorted(allowed_sources),
-            "rows": coverage_rows,
-        },
+    trace_rows = []
+    run_commands: dict[str, dict[str, Any]] = {}
+    for workload in workloads:
+        workload_id = workload["workload_id"]
+        directories = {
+            "correct": private / "traces" / "correct" / workload_id,
+            "original_faulty": private / "traces" / "original_faulty" / workload_id,
+            "sanitized_faulty": model / "traces" / workload_id,
+        }
+        commands = {
+            "correct": _run_trace(
+                correct_build / "obj_dir" / "Vtestbench",
+                directories["correct"],
+                workload["payload"],
+                timeout,
+            ),
+            "original_faulty": _run_trace(
+                original_build / "obj_dir" / "Vtestbench",
+                directories["original_faulty"],
+                workload["payload"],
+                timeout,
+            ),
+            "sanitized_faulty": _run_trace(
+                sanitized_build / "obj_dir" / "Vtestbench",
+                directories["sanitized_faulty"],
+                workload["payload"],
+                timeout,
+            ),
+        }
+        run_commands[workload_id] = commands
+        outputs = {
+            name: directory / "output-signals.txt"
+            for name, directory in directories.items()
+        }
+        public_signals = _output_signals(outputs["correct"])
+        if any(
+            _output_signals(outputs[name]) != public_signals
+            for name in ("original_faulty", "sanitized_faulty")
+        ):
+            raise PreparationError("simulation_error", "output headers differ")
+        fsts = {name: directory / "dump.fst" for name, directory in directories.items()}
+        equivalent = compare_waveforms(
+            fsts["original_faulty"], fsts["sanitized_faulty"], public_signals
+        )
+        if equivalent["outcome"] != "passing":
+            raise PreparationError(
+                "sanitizer_mismatch", "sanitizer changed cycle-end external output"
+            )
+        comparison = compare_waveforms(
+            fsts["correct"], fsts["sanitized_faulty"], public_signals
+        )
+        sanitized_dir = directories["sanitized_faulty"]
+        coverage_json = sanitized_dir / "line_coverage.json"
+        _write_json(
+            coverage_json,
+            {
+                "schema_version": "verilogcause_line_coverage.v1",
+                "allowed_sources": sorted(allowed_sources),
+                "rows": read_line_coverage(
+                    sanitized_dir / "coverage.dat", allowed_sources
+                ),
+            },
+        )
+        oracle = {
+            "endpoint_sampling": _ENDPOINT_SAMPLING,
+            "clock": {"signal": _DUT_CLOCK, "edge": "rising"},
+            "correct_fst_sha256": _sha256(fsts["correct"]),
+            "faulty_fst_sha256": _sha256(fsts["sanitized_faulty"]),
+            "first_divergence": comparison["first_divergence"],
+        }
+        trace_rows.append(
+            {
+                "record_type": "trace",
+                "schema_version": "verilogcause_manifest.v1",
+                "case_id": case["case_id"],
+                "workload_id": workload_id,
+                "trace_id": _canonical_sha256(
+                    {
+                        "case_id": case["case_id"],
+                        "workload_sha256": workload["sha256"],
+                        "rtl_set_sha256": rtl_set_sha256,
+                        "simulator": "verilator",
+                    }
+                ),
+                "status": "complete",
+                **comparison,
+                "oracle": oracle,
+                "workload": _artifact(workload["path"], run),
+                "correct_output_sha256": _sha256(outputs["correct"]),
+                "faulty_output_sha256": _sha256(outputs["sanitized_faulty"]),
+                "oracle_only_traces": {
+                    "correct_fst": _artifact(fsts["correct"], run),
+                    "original_faulty_fst": _artifact(fsts["original_faulty"], run),
+                },
+                "sanitizer_equivalence": {
+                    "endpoint_sampling": _ENDPOINT_SAMPLING,
+                    "clock": {"signal": _DUT_CLOCK, "edge": "rising"},
+                    "original_faulty_fst_sha256": _sha256(fsts["original_faulty"]),
+                    "sanitized_faulty_fst_sha256": _sha256(
+                        fsts["sanitized_faulty"]
+                    ),
+                    "equivalent": True,
+                },
+                "coverage": _artifact(coverage_json, run),
+                "vcd": _artifact(sanitized_dir / "dump.vcd", run),
+                "fst": _artifact(fsts["sanitized_faulty"], run),
+                "simulation_command": commands["sanitized_faulty"]["simulation"],
+                "vca_graph": None,
+            }
+        )
+    has_failing = any(row["outcome"] == "failing" for row in trace_rows)
+    has_passing = any(row["outcome"] == "passing" for row in trace_rows)
+    contrast_status = (
+        "contrast_complete" if has_failing and has_passing else "contrast_incomplete"
     )
+    for row in trace_rows:
+        row["contrast_status"] = contrast_status
     case_row = {
         "record_type": "case",
         "schema_version": "verilogcause_manifest.v1",
@@ -839,7 +1200,12 @@ def _prepare_case(case: dict[str, Any], run: Path, timeout: float) -> list[dict[
         "design_id": case["family"],
         "family_id": case["family"],
         "sequential": case["sequential"],
-        "status": "gold_review_pending",
+        "status": (
+            "gold_review_pending"
+            if contrast_status == "contrast_complete"
+            else "contrast_incomplete"
+        ),
+        "contrast_status": contrast_status,
         "rtl_set_sha256": rtl_set_sha256,
         "gold_review_status": "pending",
         "gold_representable": None,
@@ -849,38 +1215,18 @@ def _prepare_case(case: dict[str, Any], run: Path, timeout: float) -> list[dict[
             "original_faulty": _artifact(case["buggy_design"], run),
             "gold_proposal": _artifact(gold_path, run),
         },
-        "model_inputs": {"rtl_manifest": _artifact(rtl_manifest_path, run)},
+        "model_inputs": {
+            "rtl_manifest": _artifact(rtl_manifest_path, run),
+            "workload_pool": _artifact(workload_pool_path, run),
+        },
+        "workload_pool_sha256": workload_pool_sha256,
         "simulation": {
-            "correct": correct_commands,
-            "original_faulty": original_commands,
-            "sanitized_faulty": sanitized_commands,
+            "compile_once": compile_commands,
+            "workloads": run_commands,
             "sanitizer_output_equivalent": True,
         },
     }
-    trace_row = {
-        "record_type": "trace",
-        "schema_version": "verilogcause_manifest.v1",
-        "case_id": case["case_id"],
-        "trace_id": _canonical_sha256(
-            {
-                "case_id": case["case_id"],
-                "workload_sha256": _sha256(sanitized_dir / "workload.in"),
-                "rtl_set_sha256": rtl_set_sha256,
-                "simulator": "verilator",
-            }
-        ),
-        "status": "complete",
-        **comparison,
-        "workload": _artifact(sanitized_dir / "workload.in", run),
-        "correct_output_sha256": _sha256(correct_dir / "output-signals.txt"),
-        "faulty_output_sha256": _sha256(sanitized_dir / "output-signals.txt"),
-        "coverage": _artifact(coverage_json, run),
-        "vcd": _artifact(vcd, run),
-        "fst": _artifact(fst, run),
-        "simulation_command": sanitized_commands["simulation"],
-        "vca_graph": None,
-    }
-    return [case_row, trace_row]
+    return [case_row, *trace_rows]
 
 
 def prepare(run: Path, corpus: Path, families: Sequence[str], timeout: float) -> Path:
@@ -907,10 +1253,17 @@ def prepare(run: Path, corpus: Path, families: Sequence[str], timeout: float) ->
                 "vca_commit": _git_head(Path("VerilogCausalAnalysis")),
             },
             "simulator": {"name": "verilator", "version": version, "flags": list(VERILATOR_FLAGS)},
-            "trace_generation": {"seed": 0, "budget_per_case": 1, "source": "metadata_bug_trigger"},
+            "trace_generation": {
+                "seed": 0,
+                "budget_per_case": 4,
+                "source": "gold_blind_trigger_first_zero_one",
+                "deduplication": "sha256",
+                "endpoint_sampling": _ENDPOINT_SAMPLING,
+                "clock": {"signal": _DUT_CLOCK, "edge": "rising"},
+            },
             "sanitized_rtl_policy": "strip_all_comments_preserve_noncomment_bytes_and_newlines",
             "gold_review_policy": "proposal_then_codex_review",
-            "candidate_schema": "rtl_candidate_universe.v1",
+            "candidate_schema": "rtl_candidate_universe.v2",
             "feature_schema": list(FEATURES),
             "split_policy": ["lobo", "lodo", "lofo"],
             "tie_policy": "average_rank",
@@ -941,6 +1294,7 @@ def prepare(run: Path, corpus: Path, families: Sequence[str], timeout: float) ->
                     "design_id": case["family"],
                     "family_id": case["family"],
                     "status": getattr(exc, "status", "preparation_error"),
+                    "contrast_status": "contrast_incomplete",
                     "reason": str(exc),
                     "gold_review_status": "pending",
                 },
@@ -951,47 +1305,31 @@ def prepare(run: Path, corpus: Path, families: Sequence[str], timeout: float) ->
     return run
 
 
-def _exact_dut_signal(fst: Path, public_signal: str) -> str:
-    import pylibfst
-
-    reader = pylibfst.lib.fstReaderOpen(str(fst).encode())
-    if reader == pylibfst.ffi.NULL:
-        raise VerilogCauseError(f"cannot open FST: {fst}")
-    try:
-        _, signals = pylibfst.get_scopes_signals2(reader)
-        public = [
-            row
-            for name, row in signals.by_name.items()
-            if re.sub(r"\s*\[\d+:\d+\]$", "", name)
-            == f"testbench.{public_signal}"
-        ]
-        if len(public) != 1:
-            raise VerilogCauseError(
-                f"public endpoint is not exact: {public_signal}"
-            )
-        aliases = [
-            name
-            for name, row in signals.by_name.items()
-            if row.handle == public[0].handle and name.startswith("testbench.DUT.")
-        ]
-        if len(aliases) != 1:
-            raise VerilogCauseError(
-                f"DUT endpoint alias is not exact: {public_signal}"
-            )
-        if "testbench.DUT.clk" not in signals.by_name:
-            raise VerilogCauseError("DUT clock is not exact")
-        return aliases[0]
-    finally:
-        pylibfst.lib.fstReaderClose(reader)
-
-
 def _vca_request(run: Path, trace: dict[str, Any], rtl: dict[str, Any]):
     from verilog_causal_analysis import make_request, policy_identity
+    from verilog_causal_analysis.cycle_waveform import CycleAlignedWaveform
 
     fst = run / trace["fst"]["path"]
+    oracle = trace.get("oracle") or {}
+    if (
+        _sha256(fst) != trace["fst"]["sha256"]
+        or
+        oracle.get("endpoint_sampling") != _ENDPOINT_SAMPLING
+        or oracle.get("clock") != {"signal": _DUT_CLOCK, "edge": "rising"}
+        or oracle.get("faulty_fst_sha256") != trace["fst"]["sha256"]
+    ):
+        raise VerilogCauseError("trace endpoint sampling contract is incomplete")
+    with CycleAlignedWaveform(str(fst), _DUT_CLOCK, exact_clock=True) as waveform:
+        endpoint_signal = _waveform_endpoint_signal(
+            waveform, trace["failure_endpoint"]["signal"]
+        )
+        if waveform.get_signal_value(
+            endpoint_signal, trace["failure_endpoint"]["cycle"]
+        ) != trace["failure_endpoint"]["faulty"]:
+            raise VerilogCauseError("VCA endpoint differs from faulty oracle value")
     return make_request(
         trace={
-            "artifact_id": f"trace_{trace['case_id']}",
+            "artifact_id": f"trace_{trace['trace_id']}",
             "path": str(fst.resolve()),
             "format": "fst",
             "sha256": trace["fst"]["sha256"],
@@ -1013,11 +1351,9 @@ def _vca_request(run: Path, trace: dict[str, Any], rtl: dict[str, Any]):
                 "temporal_interval",
             ],
         },
-        clock={"signal": "testbench.DUT.clk", "edge": "rising"},
+        clock={"signal": _DUT_CLOCK, "edge": "rising"},
         endpoint={
-            "signal": _exact_dut_signal(
-                fst, trace["failure_endpoint"]["signal"]
-            ),
+            "signal": endpoint_signal,
             "cycle": trace["failure_endpoint"]["cycle"],
             "projection": None,
         },
@@ -1033,22 +1369,39 @@ def build_candidates(run: Path) -> None:
     from verilog_causal_analysis import build_rtl_candidates
 
     rows = _read_jsonl(run / "manifest.jsonl")
-    traces = {
-        row["case_id"]: row for row in rows if row["record_type"] == "trace"
-    }
+    incomplete = [
+        row["case_id"]
+        for row in rows
+        if row["record_type"] == "case"
+        and row.get("contrast_status") != "contrast_complete"
+    ]
+    if incomplete:
+        raise VerilogCauseError(f"contrast pool is incomplete: {sorted(incomplete)}")
+    traces: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for trace in (row for row in rows if row["record_type"] == "trace"):
+        traces[trace["case_id"]].append(trace)
     for row in rows:
         if row["record_type"] != "case" or row["status"] != "gold_review_pending":
             continue
         case_id = row["case_id"]
+        failing = sorted(
+            (trace for trace in traces[case_id] if trace["outcome"] == "failing"),
+            key=lambda trace: (trace["workload_id"], trace["trace_id"]),
+        )
+        if not failing:
+            raise VerilogCauseError(f"no failing trace for candidates: {case_id}")
         model = run / "cases" / case_id / "model_inputs"
         rtl = json.loads((model / "rtl_manifest.json").read_text(encoding="utf-8"))
-        request = _vca_request(run, traces[case_id], rtl)
+        request = _vca_request(run, failing[0], rtl)
         candidates = build_rtl_candidates(request)
+        if candidates.get("schema_version") != "rtl_candidate_universe.v2":
+            raise VerilogCauseError("VCA did not produce rtl_candidate_universe.v2")
         path = model / "rtl_candidates.json"
         _write_json(path, candidates)
         row["candidate_universe"] = _artifact(path, run)
         row["vca_request_sha256"] = request.request_sha256
-        traces[case_id]["vca_endpoint_signal"] = request.endpoint.signal
+        row["candidate_trace_id"] = failing[0]["trace_id"]
+        failing[0]["vca_endpoint_signal"] = request.endpoint.signal
     _write_jsonl(run / "manifest.jsonl", rows)
 
 
@@ -1056,15 +1409,34 @@ def pilot(run: Path) -> dict[str, Any]:
     from verilog_causal_analysis import build_causal_graph
 
     rows = _read_jsonl(run / "manifest.jsonl")
-    traces = {
-        row["case_id"]: row for row in rows if row["record_type"] == "trace"
-    }
+    traces: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for trace in (row for row in rows if row["record_type"] == "trace"):
+        traces[trace["case_id"]].append(trace)
     samples = []
     labels = []
     diagnostic_rows = []
     for case in (row for row in rows if row["record_type"] == "case"):
         case_id = case["case_id"]
-        trace = traces[case_id]
+        case_traces = traces[case_id]
+        if case.get("contrast_status") != "contrast_complete":
+            diagnostic_rows.append(
+                {
+                    "case_id": case_id,
+                    "family": case["family_id"],
+                    "status": "contrast_incomplete",
+                    "gold_representable": None,
+                    "gold_reachable": False,
+                    "has_failing_trace": any(
+                        trace["outcome"] == "failing" for trace in case_traces
+                    ),
+                    "has_passing_trace": any(
+                        trace["outcome"] == "passing" for trace in case_traces
+                    ),
+                    "graph_complete": False,
+                    "activation_diagnostic_count": 0,
+                }
+            )
+            continue
         root = run / "cases" / case_id
         model = root / "model_inputs"
         private = root / "evaluator_private"
@@ -1075,37 +1447,75 @@ def pilot(run: Path) -> dict[str, Any]:
         if not review_path.is_file():
             raise VerilogCauseError(f"missing Codex gold review: {case_id}")
         review = json.loads(review_path.read_text(encoding="utf-8"))
-        gold, representable = join_reviewed_gold(candidates, review)
-        request = _vca_request(run, trace, rtl)
-        graph = build_causal_graph(request)
-        graph_path = model / "causal_graph.json"
-        _write_json(graph_path, graph)
-
-        coverage = json.loads(
-            (run / trace["coverage"]["path"]).read_text(encoding="utf-8")
+        gold, representable = join_reviewed_gold(
+            candidates,
+            review,
+            proposal_sha256=case["oracle_only_inputs"]["gold_proposal"]["sha256"],
+            candidates_sha256=_sha256(candidates_path),
         )
-        hit_lines = {
-            (source["artifact_id"], row["line"])
-            for source in rtl["sources"]
-            for row in coverage["rows"]
-            if row["source"] == source["compile_name"] and row["count"] > 0
-        }
-        executed = [
-            (row["artifact_id"], row["statement_id"])
-            for row in candidates["candidates"]
-            if (row["artifact_id"], row["line_start"]) in hit_lines
-        ]
+        failing = []
+        passing = []
+        activation_diagnostics = []
+        graph_dir = model / "causal_graphs"
+        graph_dir.mkdir()
+        for trace in case_traces:
+            coverage = json.loads(
+                (run / trace["coverage"]["path"]).read_text(encoding="utf-8")
+            )
+            hit_lines = {
+                (source["artifact_id"], coverage_row["line"])
+                for source in rtl["sources"]
+                for coverage_row in coverage["rows"]
+                if coverage_row["source"] == source["compile_name"]
+                and coverage_row["count"] > 0
+            }
+            executed = [
+                (candidate["artifact_id"], candidate["statement_id"])
+                for candidate in candidates["candidates"]
+                if (candidate["artifact_id"], candidate["line_start"]) in hit_lines
+            ]
+            if trace["outcome"] == "passing":
+                passing.append({"executed_candidates": executed})
+                continue
+            request = _vca_request(run, trace, rtl)
+            graph = build_causal_graph(request)
+            graph_path = graph_dir / f"{trace['trace_id']}.json"
+            _write_json(graph_path, graph)
+            trace["vca_graph"] = _artifact(graph_path, run)
+            trace["vca_endpoint_signal"] = request.endpoint.signal
+            bad_diagnostics = [
+                row
+                for row in graph.get("diagnostics", [])
+                if "activation" in str(row.get("code", ""))
+                and any(
+                    word in str(row).lower()
+                    for word in ("ambiguous", "unavailable")
+                )
+            ]
+            bad_diagnostics.extend(
+                edge
+                for edge in graph.get("edges", [])
+                if edge.get("relation")
+                in {"active_statement_write", "active_guard"}
+                and edge.get("activation_status") in {"ambiguous", "unavailable"}
+            )
+            activation_diagnostics.extend(bad_diagnostics)
+            failing.append(
+                {
+                    "graph": graph,
+                    "failure_cycle": trace["failure_endpoint"]["cycle"],
+                    "executed_candidates": executed,
+                }
+            )
         aggregate = aggregate_features(
             candidates,
-            [{
-                "graph": graph,
-                "failure_cycle": trace["failure_endpoint"]["cycle"],
-                "executed_candidates": executed,
-            }],
-            [],
+            failing,
+            passing,
         )
         mapped_gold = {
-            key for key in gold if aggregate[key]["relation_applicable"]
+            key
+            for key in gold
+            if aggregate[key]["features"]["causal_trace_coverage"] > 0
         }
         for candidate in candidates["candidates"]:
             key = (candidate["artifact_id"], candidate["statement_id"])
@@ -1143,7 +1553,6 @@ def pilot(run: Path) -> dict[str, Any]:
                 "candidate_universe": _artifact(candidates_path, run),
             }
         )
-        trace["vca_graph"] = _artifact(graph_path, run)
         diagnostic_rows.append(
             {
                 "case_id": case_id,
@@ -1151,9 +1560,12 @@ def pilot(run: Path) -> dict[str, Any]:
                 "status": "complete",
                 "gold_representable": representable,
                 "gold_reachable": reachable,
-                "has_failing_trace": trace["outcome"] == "failing",
-                "has_passing_trace": False,
-                "graph_complete": graph["status"] == "complete",
+                "has_failing_trace": bool(failing),
+                "has_passing_trace": bool(passing),
+                "graph_complete": all(
+                    trace["graph"]["status"] == "complete" for trace in failing
+                ),
+                "activation_diagnostic_count": len(activation_diagnostics),
             }
         )
 
@@ -1216,9 +1628,14 @@ def pilot(run: Path) -> dict[str, Any]:
         "graph_complete_count": sum(row["graph_complete"] for row in diagnostic_rows),
         "zero_pass_count": sum(not row["has_passing_trace"] for row in diagnostic_rows),
         "zero_fail_count": sum(not row["has_failing_trace"] for row in diagnostic_rows),
+        "activation_diagnostic_count": sum(
+            row["activation_diagnostic_count"] for row in diagnostic_rows
+        ),
         "relation_coverage": {
-            "all_candidate": fmean(
-                row["features"]["relation_coverage"] for row in samples
+            "all_candidate": (
+                fmean(row["features"]["relation_coverage"] for row in samples)
+                if samples
+                else None
             ),
             "gold_only": (
                 fmean(row["features"]["relation_coverage"] for row in gold_samples)
@@ -1285,7 +1702,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not families:
         parser.error("--families must not be empty")
     run = prepare(Path(args.run), Path(args.corpus), families, args.timeout_seconds)
-    print(json.dumps({"run": str(run), "decision": "stop_for_codex_gold_review"}, sort_keys=True))
+    case_rows = [
+        row
+        for row in _read_jsonl(run / "manifest.jsonl")
+        if row["record_type"] == "case"
+    ]
+    decision = (
+        "stop_for_codex_gold_review"
+        if case_rows
+        and all(row.get("contrast_status") == "contrast_complete" for row in case_rows)
+        else "failed_stop"
+    )
+    print(json.dumps({"run": str(run), "decision": decision}, sort_keys=True))
 
 
 if __name__ == "__main__":

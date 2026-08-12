@@ -1071,10 +1071,11 @@ Wit-HW testbench 在 `@(posedge clk)` 立即 `$fwrite`。组合输出记录的�
 
 - `rtl_candidate_universe.v2` 新增 `conditional_guard`，继续使用 `(artifact_id, statement_id)` identity；
 - semantic graph 复用已有 `semantic_nodes/edges`，不增加第二套 graph：
-  - `semantic_nodes.type=rtl_statement_activation`；
-  - relation 只增加 `active_statement_write` 和 `active_guard`；
-  - 每条 relation 必须含 exact `artifact_id/statement_id/target_node_id/cycle/activation_status`；
+  - `semantic_nodes.type=rtl_statement_activation`，节点携带 exact `semantic_id/artifact_id/statement_id/target_node_id/cycle/activation_status`；
+  - relation 只增加 `active_statement_write` 和 `active_guard`，从 activation semantic node 指向对应 signal node；
+  - 每条 relation 必须重复 exact `artifact_id/statement_id/target_node_id/cycle/activation_status`，且 `dst_node_id == target_node_id`；
 - manifest 明确记录 `endpoint_sampling=cycle_end_before_next_rising` 和 workload-pool hash；
+- manifest 中 trace 以 `(case_id, trace_id)` 唯一标识，每条 failing trace 写独立 graph 路径；candidate universe 每 case 只构建一次，并确定性使用排序后的第一条 failing trace 组成 VCA request；
 - `causal_trace_coverage` 改为每条 failing trace 中 candidate 是否存在 `active_exact` statement relation；input contribution 不再决定 statement 是否存在；
 - 旧 v1 artifact 不加 compatibility reader，新的 W3-R 只读 v2 contract。
 
@@ -1231,4 +1232,9 @@ VCA R2 candidate commit
 
 #### 18.7 当前状态与下一步
 
-本节完成的是 artifact-grounded 诊断和实施合同，尚未实施 R1–R4，也没有产生新的效果证据。下一步从 R0 开始；最先应实现 R1 的 FST 同相位 oracle 和 R2 的完整 statement records，两条工作线可并行。任何实现都必须保留 v5 和现有 dirty worktree，不覆盖旧 run。
+##### 2026-08-12：R0 完成，R1–R4 并行实施中
+
+- 进度：已按本节冻结 `rtl_candidate_universe.v2`、`rtl_statement_activation`、`active_statement_write/active_guard`、`cycle_end_before_next_rising` 和固定四 workload 合同；未增加兼容 reader、调度器、重试或新模型；
+- 并行决策：parent 仅串行实施 R1→R4，VCA 仅串行实施 R2→R3；两条工作线不交叉写文件，集成者负责最终 gitlink、focused checks、fresh W3-R 和文档结论；
+- 当前结论：v5 仍是 `failed_stop/do_not_train` 的历史诊断证据；R0 只冻结接口，不产生新的 candidate、relation 或效果证据；
+- 下一步：两条实现线完成后先做接口审计和根因回归，再创建不带新版本号的 fresh W3-R run root；任何 gate 失败都保留 `failed_stop`，不进入 R6/W4。
