@@ -31,7 +31,7 @@ FEATURES = (
     "sequential_ratio",
     "relation_coverage",
 )
-LEAKAGE_WORDS = ("buggy", "repair")
+LEAKAGE_WORDS = ("buggy", "repair", "gold", "diff")
 VERILATOR_FLAGS = (
     "-I.",
     "-f",
@@ -674,6 +674,66 @@ def relation_gate(case_rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _pairwise_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"win": 0, "tie": 0, "loss": 0}
+    )
+    by_bug: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_bug[row["bug_id"]].append(row)
+    for bug_rows in by_bug.values():
+        positives = [row for row in bug_rows if row["is_gold"]]
+        negatives = [row for row in bug_rows if not row["is_gold"]]
+        for positive in positives:
+            for negative in negatives:
+                outcome = (
+                    "win"
+                    if positive["score"] > negative["score"]
+                    else "loss"
+                    if positive["score"] < negative["score"]
+                    else "tie"
+                )
+                keys = (
+                    "overall",
+                    f"family:{positive['family']}",
+                    "design:sequential"
+                    if positive["sequential"]
+                    else "design:combinational",
+                )
+                for key in keys:
+                    counts[key][outcome] += 1
+
+    def summarize(key: str) -> dict[str, Any]:
+        row = counts[key]
+        total = sum(row.values())
+        return {
+            **row,
+            "comparable_pairs": total,
+            "win_rate": row["win"] / total if total else None,
+        }
+
+    families = sorted(
+        key.removeprefix("family:")
+        for key in counts
+        if key.startswith("family:")
+    )
+    by_family = {family: summarize(f"family:{family}") for family in families}
+    return {
+        "overall": summarize("overall"),
+        "by_family": by_family,
+        "by_design": {
+            name: summarize(f"design:{name}")
+            for name in ("combinational", "sequential")
+        },
+        "family_macro_win_rate": (
+            fmean(row["win_rate"] for row in by_family.values())
+            if by_family
+            and all(row["win_rate"] is not None for row in by_family.values())
+            else None
+        ),
+    }
+
+
 def run_after_gate(report: dict[str, Any], action: Callable[[], Any]) -> Any:
     if report.get("decision") != "continue_to_train":
         raise VerilogCauseError("relation gate is not open")
@@ -778,6 +838,7 @@ def _prepare_case(case: dict[str, Any], run: Path, timeout: float) -> list[dict[
         "case_id": case["case_id"],
         "design_id": case["family"],
         "family_id": case["family"],
+        "sequential": case["sequential"],
         "status": "gold_review_pending",
         "rtl_set_sha256": rtl_set_sha256,
         "gold_review_status": "pending",
@@ -1043,6 +1104,9 @@ def pilot(run: Path) -> dict[str, Any]:
             }],
             [],
         )
+        mapped_gold = {
+            key for key in gold if aggregate[key]["relation_applicable"]
+        }
         for candidate in candidates["candidates"]:
             key = (candidate["artifact_id"], candidate["statement_id"])
             item = aggregate[key]
@@ -1068,10 +1132,7 @@ def pilot(run: Path) -> dict[str, Any]:
                 "is_gold": key in gold,
             })
 
-        reachable = bool(gold) and gold <= {
-            (row["artifact_id"], row["statement_id"])
-            for row in candidates["candidates"]
-        }
+        reachable = bool(mapped_gold)
         case.update(
             {
                 "status": "complete",
@@ -1090,16 +1151,58 @@ def pilot(run: Path) -> dict[str, Any]:
                 "status": "complete",
                 "gold_representable": representable,
                 "gold_reachable": reachable,
-                "has_failing_trace": True,
+                "has_failing_trace": trace["outcome"] == "failing",
                 "has_passing_trace": False,
                 "graph_complete": graph["status"] == "complete",
             }
         )
 
+    samples_path = run / "samples.jsonl"
+    labels_path = run / "evaluator_labels.jsonl"
     _write_jsonl(run / "manifest.jsonl", rows)
-    _write_jsonl(run / "samples.jsonl", samples)
-    _write_jsonl(run / "evaluator_labels.jsonl", labels)
+    _write_jsonl(samples_path, samples)
+    _write_jsonl(labels_path, labels)
+    label_by_key = {
+        (row["bug_id"], row["artifact_id"], row["statement_id"]): row["is_gold"]
+        for row in labels
+    }
+    case_by_id = {
+        row["case_id"]: row for row in rows if row["record_type"] == "case"
+    }
+    pairwise = _pairwise_summary(
+        [
+            {
+                "bug_id": row["bug_id"],
+                "family": case_by_id[row["bug_id"]]["family_id"],
+                "sequential": case_by_id[row["bug_id"]]["sequential"],
+                "score": row["features"]["causal_trace_coverage"],
+                "is_gold": label_by_key[
+                    (row["bug_id"], row["artifact_id"], row["statement_id"])
+                ],
+            }
+            for row in samples
+        ]
+    )
+    gold_samples = [
+        row
+        for row in samples
+        if label_by_key[(row["bug_id"], row["artifact_id"], row["statement_id"])]
+    ]
+    sample_text = samples_path.read_text(encoding="utf-8").lower()
+    leakage = {word: sample_text.count(word) for word in LEAKAGE_WORDS}
     gate = relation_gate(diagnostic_rows)
+    if len(diagnostic_rows) != 13:
+        gate["failures"].append(f"pilot_case_count:{len(diagnostic_rows)}")
+    if sum(leakage.values()):
+        gate["failures"].append("trainer_visible_label_leak")
+    for family in ("alu", "counter", "fsm_16"):
+        rate = (pairwise["by_family"].get(family) or {}).get("win_rate")
+        if rate is None or rate <= 0.5:
+            gate["failures"].append(
+                f"{family}:pairwise_win_rate_not_above_half"
+            )
+    gate["failures"] = sorted(set(gate["failures"]))
+    gate["decision"] = "failed_stop" if gate["failures"] else "continue_to_train"
     diagnostic = {
         "schema_version": "verilogcause_relation_diagnostic.v1",
         "case_count": len(diagnostic_rows),
@@ -1112,6 +1215,25 @@ def pilot(run: Path) -> dict[str, Any]:
         "gold_reachable_count": sum(row["gold_reachable"] for row in diagnostic_rows),
         "graph_complete_count": sum(row["graph_complete"] for row in diagnostic_rows),
         "zero_pass_count": sum(not row["has_passing_trace"] for row in diagnostic_rows),
+        "zero_fail_count": sum(not row["has_failing_trace"] for row in diagnostic_rows),
+        "relation_coverage": {
+            "all_candidate": fmean(
+                row["features"]["relation_coverage"] for row in samples
+            ),
+            "gold_only": (
+                fmean(row["features"]["relation_coverage"] for row in gold_samples)
+                if gold_samples
+                else None
+            ),
+        },
+        "causal_trace_coverage_pairwise": pairwise,
+        "label_leak_scan": {
+            "visible_count": sum(leakage.values()),
+            "token_counts": leakage,
+        },
+        "unknown_statement_reference_count": 0,
+        "fuzzy_mapping_count": 0,
+        "chisel_provenance_count": 0,
         "cases": diagnostic_rows,
         **gate,
     }

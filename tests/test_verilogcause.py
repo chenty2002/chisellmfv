@@ -211,3 +211,23 @@ def test_exact_relation_features_and_failed_gate_do_not_train() -> None:
     with pytest.raises(VerilogCauseError, match="gate is not open"):
         run_after_gate(report, train)
     assert report["decision"] == "failed_stop" and not called
+
+    pairwise = verilogcause._pairwise_summary(
+        [
+            {
+                "bug_id": "case",
+                "family": "alu",
+                "sequential": False,
+                "score": 1.0,
+                "is_gold": True,
+            },
+            {
+                "bug_id": "case",
+                "family": "alu",
+                "sequential": False,
+                "score": 0.0,
+                "is_gold": False,
+            },
+        ]
+    )
+    assert pairwise["by_family"]["alu"]["win_rate"] == 1.0
