@@ -993,9 +993,9 @@ W3 集成者：
 #### Material Passport
 
 - Origin Skill：experiment-agent
-- Origin Mode：validate + plan
+- Origin Mode：run + validate + plan
 - Origin Date：2026-08-12
-- Verification Status：ANALYZED（基于 v5 canonical artifacts 和当前代码调用链）
+- Verification Status：VERIFIED_FAILED_STOP（实现、focused checks 与 fresh W3-R canonical artifacts）
 - Version Label：native_verilog_root_repair_plan_v1
 
 #### 18.1 核心结论
@@ -1232,9 +1232,41 @@ VCA R2 candidate commit
 
 #### 18.7 当前状态与下一步
 
-##### 2026-08-12：R0 完成，R1–R4 并行实施中
+##### 2026-08-12：R0–R5 已实施，fresh W3-R 保持 failed-stop
 
-- 进度：已按本节冻结 `rtl_candidate_universe.v2`、`rtl_statement_activation`、`active_statement_write/active_guard`、`cycle_end_before_next_rising` 和固定四 workload 合同；未增加兼容 reader、调度器、重试或新模型；
-- 并行决策：parent 仅串行实施 R1→R4，VCA 仅串行实施 R2→R3；两条工作线不交叉写文件，集成者负责最终 gitlink、focused checks、fresh W3-R 和文档结论；
-- 当前结论：v5 仍是 `failed_stop/do_not_train` 的历史诊断证据；R0 只冻结接口，不产生新的 candidate、relation 或效果证据；
-- 下一步：两条实现线完成后先做接口审计和根因回归，再创建不带新版本号的 fresh W3-R run root；任何 gate 失败都保留 `failed_stop`，不进入 R6/W4。
+实现提交与范围：
+
+- VCA `db6ba515a29b384c461298105a00b4951ec6b3da` 完成 R2/R3：parser 建立 assignment/register-update/port-binding/conditional-guard records，补齐 case default 与 parameter/localparam value environment；candidate 升为 `rtl_candidate_universe.v2`；native graph 增加 hash-bound `rtl_statement_activation`、`active_statement_write` 和 `active_guard`，组合逻辑在同 cycle 求值、时序逻辑在 `cycle-1` 求 guard/RHS 并与 `cycle` target exact 比较；
+- parent `feae02133da1542dcccd28a1fc5f777b7d2d64b8` 完成 R1/R4 与集成：correct/original-faulty/sanitized-faulty 各编译一次，固定生成 trigger/first-vector/all-zero/all-one 四个 gold-blind workload 并按 SHA-256 去重；每个 workload 独立运行并保留 VCD/FST/coverage；oracle 与 sanitizer equivalence 都使用 exact `testbench.DUT.clk` 的 `cycle_end_before_next_rising` sampler；多 failing trace 各写独立 graph，passing trace 只提供 execution contrast；
+- parent consumer 同时校验 candidate v2、activation semantic node/edge、status enum、target/cycle identity、proposal/candidate/RTL hashes；`causal_trace_coverage` 和 `gold_reachable` 只接受 `active_exact`，contribution 保持独立特征；
+- 没有新增兼容 reader、retry、scheduler、第五个自适应 workload、新模型或 case/line 特判；旧 v5 未修改，原有两仓 dirty worktree 未混入提交。
+
+Focused checks：
+
+- VCA `test_verilog_profile.py + test_rtl_candidates.py` 为 `6 passed`；其中一个参数化真实 Wit-HW 检查确认 ALU-2 line 22、Counter-3 line 38、FSM-16-3 line 88、FSM-16-4 lines 45/52 candidate，以及 ALU-3/5/6、FSM-16-1/2 五个 exact active branch；
+- parent `tests/test_verilogcause.py` 为 `7 passed`，包含 ALU-3 cycle 0 `zero=1/0` 和 FSM-16-1 cycle 4 `state=0/1` 的同相位 oracle；两仓 scoped Ruff、compileall 和 diff check 通过。
+
+fresh run：`runs/verilogcause/20260812-native-pilot-w3r`。
+
+- dataset contract 绑定上述 parent/VCA commit；13/13 case、52/52 trace 完整，每 case 固定 4 个 workload，22 条 failing、30 条 passing，13/13 contrast complete；
+- candidate v2 共 528 条；13/13 gold 由 Codex 重新审查并分别绑定 proposal/candidate/RTL hash，没有复制 v5 review；ALU-2 constant default、Counter-3 reset guard、FSM-16-3 guard 和 FSM-16-4 两个交换 guard 均进入 exact candidate；
+- 22/22 failing graph 为 `complete`，共 66 条 `active_exact` relation；activation ambiguous/unavailable、unknown statement、fuzzy mapping、Chisel provenance 和 trainer-visible leak 均为 0；
+- 12/13 case 的 reviewed gold 有 `active_exact`，all-candidate activation coverage 为 `0.07196969696969698`，gold-only 为 `0.8`；
+- family gold-vs-negative win rate 为 ALU `0.945273631840796`、Counter `0.47058823529411764`、FSM-16 `0.7766749379652605`；Counter 未严格大于 `0.5`；
+- 唯一 authority failure 是 Counter-3：faulty RTL 删除了 `counter_out` reset write，reviewed reset guard 虽是 exact executable candidate，但 `counter_out` 失败 slice 中没有可由 faulty RTL 证明的 enclosing active write，因此该 gold 的 `causal_trace_coverage=0`。没有用 correct diff、邻行或任意 guard attachment 伪造 relation。
+
+最终结论与决策：
+
+1. `relation_diagnostic.json` 与 `gate_report.json` 的权威决定为 `failed_stop/do_not_train`；失败项只有 `counter-3:gold_unreachable` 和 `counter:pairwise_win_rate_not_above_half`；
+2. 已证明的是 R1–R4 实现能力、同相位 native Verilog simulation capability、13/13 candidate representability 和 12/13 exact activation authority；没有 deterministic baseline、ML effectiveness、跨 family 增量或 41-case 证据；
+3. 按 R5 gate 不运行 baseline，不授权 R6/W4，不调用旧 Chisel trainer，也不因 ALU/FSM 提升而覆盖 Counter failure；
+4. 下一步只能先在新的预冻结合同中解决 deletion gold 的任务定义：要么把 faulty RTL 中不存在且无法获得 exact target activation 的 deletion 明确为 `gold_unrepresentable`，要么定义不读取 correct diff 的 exact missing-write authority。该决策必须在看新 run 结果前冻结，并使用全新 run root 重跑 R5；当前 run 不补写、不重审 gold。
+
+canonical hashes：
+
+- `dataset_contract.json`: `ffaa3cb23024f89f24da2e8a0616446cc1367a0f780b8ad296a4eb356b732d5f`
+- `manifest.jsonl`: `ee977b0997b45a4742efc4e52fa7e1c5697ff142a536dc3d5ec2ec6f9a8a10f3`
+- `samples.jsonl`: `4efc688efab5ac51355f51798fb93e7a5f434d521d32607edcbf59ece82e9639`
+- `evaluator_labels.jsonl`: `94b286caf12989ada2c6842937fc603ee0db96a09def5cb76e43635399cecb46`
+- `relation_diagnostic.json`: `7465712773732fe8e25bd6d0f2ada4f789f49030bd076aa4be4c66e440a0137a`
+- `gate_report.json`: `44c1d2e4b093f7532426629b891e9e129166558ec517ff992a57a0a9d2849fda`
