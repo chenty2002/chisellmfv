@@ -254,6 +254,7 @@ def _copy_compile_inputs(
                 "compile_name": name,
                 "path": str(target.resolve()),
                 "sha256": _sha256(target),
+                "bytes": target.stat().st_size,
             }
         )
     shutil.copyfile(testbench, destination / "testbench.sv")
@@ -676,7 +677,14 @@ def _prepare_case(case: dict[str, Any], run: Path, timeout: float) -> list[dict[
     if _sha256(case["bug_trigger_input"]) != _sha256(sanitized_dir / "workload.in"):
         raise PreparationError("input_drift", "workload byte copy changed")
     rtl_set_sha256 = _canonical_sha256(
-        [{"artifact_id": row["artifact_id"], "sha256": row["sha256"]} for row in sanitized_manifest]
+        [
+            {
+                "artifact_id": row["artifact_id"],
+                "sha256": row["sha256"],
+                "bytes": row["bytes"],
+            }
+            for row in sanitized_manifest
+        ]
     )
     rtl_manifest_path = model / "rtl_manifest.json"
     _write_json(

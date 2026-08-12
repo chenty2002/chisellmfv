@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import src.experiments.verilogcause as verilogcause
 from src.experiments.verilogcause import (
     VerilogCauseError,
     aggregate_features,
@@ -19,6 +20,7 @@ from src.experiments.verilogcause import (
     set_valued_metrics,
     trainer_visible_sample,
 )
+from verilog_causal_analysis.identity import stable_set_sha256
 
 
 def _candidate_payload() -> dict:
@@ -93,6 +95,11 @@ def test_metadata_uses_wit_root_and_family_directory(tmp_path: Path) -> None:
 
     assert case["family"] == "nested_family"
     assert case["correct_design"] == (family / "good.v").resolve()
+
+
+def test_rtl_set_hash_matches_vca_identity(tmp_path: Path) -> None:
+    row = {"artifact_id": "rtl_0001", "sha256": "a" * 64, "bytes": 7}
+    assert stable_set_sha256([row]) == verilogcause._canonical_sha256([row])
 
 
 def test_sanitizer_and_output_endpoint_contract(tmp_path: Path) -> None:
