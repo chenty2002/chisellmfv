@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import fmean, pstdev
 from typing import Any, Callable, Sequence
@@ -47,6 +48,21 @@ VERILATOR_FLAGS = (
     "--top",
     "testbench",
 )
+VCA_BOUNDS = {
+    "max_signal_depth": 64,
+    "max_signal_nodes": 480,
+    "max_expanded_nodes": 480,
+    "max_candidate_evaluations": 3840,
+    "max_intervention_evaluations": 15360,
+    "max_semantic_nodes": 480,
+    "max_edges": 960,
+    "max_seed_count": 8,
+    "max_intervals_per_signal": 64,
+    "max_temporal_samples": 4096,
+    "max_waitfor_nodes": 480,
+    "max_waitfor_edges": 960,
+    "max_scc_candidates": 8,
+}
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
@@ -81,6 +97,27 @@ def _write_json(path: Path, value: Any) -> None:
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
+    path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _git_head(path: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout.strip()
 
 
 def _under(root: Path, raw: str, *, field: str) -> Path:
@@ -804,12 +841,28 @@ def prepare(run: Path, corpus: Path, families: Sequence[str], timeout: float) ->
         {
             "schema_version": "verilogcause_dataset_contract.v1",
             "implementation_sha256": _sha256(Path(__file__)),
+            "implementation_identity": {
+                "parent_commit": _git_head(Path.cwd()),
+                "vca_commit": _git_head(Path("VerilogCausalAnalysis")),
+            },
             "simulator": {"name": "verilator", "version": version, "flags": list(VERILATOR_FLAGS)},
             "trace_generation": {"seed": 0, "budget_per_case": 1, "source": "metadata_bug_trigger"},
             "sanitized_rtl_policy": "strip_all_comments_preserve_noncomment_bytes_and_newlines",
             "gold_review_policy": "proposal_then_codex_review",
             "candidate_schema": "rtl_candidate_universe.v1",
             "feature_schema": list(FEATURES),
+            "split_policy": ["lobo", "lodo", "lofo"],
+            "tie_policy": "average_rank",
+            "unreachable_policy": {"mrr": 0, "exam_percent": 100},
+            "methods": [
+                "wit_hw_ochiai",
+                "tarsel",
+                "static_backward",
+                "causal_consistency_rule",
+                "coverage_only",
+                "causal_only",
+                "ml_relation",
+            ],
             "oracle_only_input_policy": ["correct_design", "original_faulty", "source_diff", "gold"],
             "completion_boundary": "stop_for_codex_gold_review",
         },
@@ -837,6 +890,254 @@ def prepare(run: Path, corpus: Path, families: Sequence[str], timeout: float) ->
     return run
 
 
+def _exact_dut_signal(fst: Path, public_signal: str) -> str:
+    import pylibfst
+
+    reader = pylibfst.lib.fstReaderOpen(str(fst).encode())
+    if reader == pylibfst.ffi.NULL:
+        raise VerilogCauseError(f"cannot open FST: {fst}")
+    try:
+        _, signals = pylibfst.get_scopes_signals2(reader)
+        public = [
+            row
+            for name, row in signals.by_name.items()
+            if re.sub(r"\s*\[\d+:\d+\]$", "", name)
+            == f"testbench.{public_signal}"
+        ]
+        if len(public) != 1:
+            raise VerilogCauseError(
+                f"public endpoint is not exact: {public_signal}"
+            )
+        aliases = [
+            name
+            for name, row in signals.by_name.items()
+            if row.handle == public[0].handle and name.startswith("testbench.DUT.")
+        ]
+        if len(aliases) != 1:
+            raise VerilogCauseError(
+                f"DUT endpoint alias is not exact: {public_signal}"
+            )
+        if "testbench.DUT.clk" not in signals.by_name:
+            raise VerilogCauseError("DUT clock is not exact")
+        return aliases[0]
+    finally:
+        pylibfst.lib.fstReaderClose(reader)
+
+
+def _vca_request(run: Path, trace: dict[str, Any], rtl: dict[str, Any]):
+    from verilog_causal_analysis import make_request, policy_identity
+
+    fst = run / trace["fst"]["path"]
+    return make_request(
+        trace={
+            "artifact_id": f"trace_{trace['case_id']}",
+            "path": str(fst.resolve()),
+            "format": "fst",
+            "sha256": trace["fst"]["sha256"],
+            "bytes": trace["fst"]["bytes"],
+        },
+        rtl_files=[
+            {
+                key: source[key]
+                for key in ("artifact_id", "path", "sha256", "bytes")
+            }
+            for source in rtl["sources"]
+        ],
+        semantic_profile={
+            "name": "verilog",
+            "version": "verilog-semantic-profile",
+            "features": [
+                "instance_graph",
+                "register_transition",
+                "temporal_interval",
+            ],
+        },
+        clock={"signal": "testbench.DUT.clk", "edge": "rising"},
+        endpoint={
+            "signal": _exact_dut_signal(
+                fst, trace["failure_endpoint"]["signal"]
+            ),
+            "cycle": trace["failure_endpoint"]["cycle"],
+            "projection": None,
+        },
+        semantic_inputs=[],
+        search_policy=policy_identity().to_dict(),
+        bounds=VCA_BOUNDS,
+        random_seed=0,
+        strict=True,
+    )
+
+
+def build_candidates(run: Path) -> None:
+    from verilog_causal_analysis import build_rtl_candidates
+
+    rows = _read_jsonl(run / "manifest.jsonl")
+    traces = {
+        row["case_id"]: row for row in rows if row["record_type"] == "trace"
+    }
+    for row in rows:
+        if row["record_type"] != "case" or row["status"] != "gold_review_pending":
+            continue
+        case_id = row["case_id"]
+        model = run / "cases" / case_id / "model_inputs"
+        rtl = json.loads((model / "rtl_manifest.json").read_text(encoding="utf-8"))
+        request = _vca_request(run, traces[case_id], rtl)
+        candidates = build_rtl_candidates(request)
+        path = model / "rtl_candidates.json"
+        _write_json(path, candidates)
+        row["candidate_universe"] = _artifact(path, run)
+        row["vca_request_sha256"] = request.request_sha256
+        traces[case_id]["vca_endpoint_signal"] = request.endpoint.signal
+    _write_jsonl(run / "manifest.jsonl", rows)
+
+
+def pilot(run: Path) -> dict[str, Any]:
+    from verilog_causal_analysis import build_causal_graph
+
+    rows = _read_jsonl(run / "manifest.jsonl")
+    traces = {
+        row["case_id"]: row for row in rows if row["record_type"] == "trace"
+    }
+    samples = []
+    labels = []
+    diagnostic_rows = []
+    for case in (row for row in rows if row["record_type"] == "case"):
+        case_id = case["case_id"]
+        trace = traces[case_id]
+        root = run / "cases" / case_id
+        model = root / "model_inputs"
+        private = root / "evaluator_private"
+        rtl = json.loads((model / "rtl_manifest.json").read_text(encoding="utf-8"))
+        candidates_path = model / "rtl_candidates.json"
+        candidates = json.loads(candidates_path.read_text(encoding="utf-8"))
+        review_path = private / "gold_review.json"
+        if not review_path.is_file():
+            raise VerilogCauseError(f"missing Codex gold review: {case_id}")
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+        gold, representable = join_reviewed_gold(candidates, review)
+        request = _vca_request(run, trace, rtl)
+        graph = build_causal_graph(request)
+        graph_path = model / "causal_graph.json"
+        _write_json(graph_path, graph)
+
+        coverage = json.loads(
+            (run / trace["coverage"]["path"]).read_text(encoding="utf-8")
+        )
+        hit_lines = {
+            (source["artifact_id"], row["line"])
+            for source in rtl["sources"]
+            for row in coverage["rows"]
+            if row["source"] == source["compile_name"] and row["count"] > 0
+        }
+        executed = [
+            (row["artifact_id"], row["statement_id"])
+            for row in candidates["candidates"]
+            if (row["artifact_id"], row["line_start"]) in hit_lines
+        ]
+        aggregate = aggregate_features(
+            candidates,
+            [{
+                "graph": graph,
+                "failure_cycle": trace["failure_endpoint"]["cycle"],
+                "executed_candidates": executed,
+            }],
+            [],
+        )
+        for candidate in candidates["candidates"]:
+            key = (candidate["artifact_id"], candidate["statement_id"])
+            item = aggregate[key]
+            samples.append(
+                {
+                    "bug_id": case_id,
+                    **{field: candidate[field] for field in (
+                        "artifact_id",
+                        "statement_id",
+                        "line_start",
+                        "line_end",
+                    )},
+                    "relation_applicable": item["relation_applicable"],
+                    "unavailable_reasons": item["unavailable_reasons"],
+                    "features": item["features"],
+                    "contrast_status": item["contrast_status"],
+                }
+            )
+            labels.append({
+                "bug_id": case_id,
+                "artifact_id": key[0],
+                "statement_id": key[1],
+                "is_gold": key in gold,
+            })
+
+        reachable = bool(gold) and gold <= {
+            (row["artifact_id"], row["statement_id"])
+            for row in candidates["candidates"]
+        }
+        case.update(
+            {
+                "status": "complete",
+                "gold_review_status": "approved",
+                "gold_representable": representable,
+                "gold_reachable": reachable,
+                "gold_review": _artifact(review_path, run),
+                "candidate_universe": _artifact(candidates_path, run),
+            }
+        )
+        trace["vca_graph"] = _artifact(graph_path, run)
+        diagnostic_rows.append(
+            {
+                "case_id": case_id,
+                "family": case["family_id"],
+                "status": "complete",
+                "gold_representable": representable,
+                "gold_reachable": reachable,
+                "has_failing_trace": True,
+                "has_passing_trace": False,
+                "graph_complete": graph["status"] == "complete",
+            }
+        )
+
+    _write_jsonl(run / "manifest.jsonl", rows)
+    _write_jsonl(run / "samples.jsonl", samples)
+    _write_jsonl(run / "evaluator_labels.jsonl", labels)
+    gate = relation_gate(diagnostic_rows)
+    diagnostic = {
+        "schema_version": "verilogcause_relation_diagnostic.v1",
+        "case_count": len(diagnostic_rows),
+        "gold_representable_count": sum(
+            row["gold_representable"] is True for row in diagnostic_rows
+        ),
+        "gold_unrepresentable_count": sum(
+            row["gold_representable"] is False for row in diagnostic_rows
+        ),
+        "gold_reachable_count": sum(row["gold_reachable"] for row in diagnostic_rows),
+        "graph_complete_count": sum(row["graph_complete"] for row in diagnostic_rows),
+        "zero_pass_count": sum(not row["has_passing_trace"] for row in diagnostic_rows),
+        "cases": diagnostic_rows,
+        **gate,
+    }
+    _write_json(run / "relation_diagnostic.json", diagnostic)
+    gate_report = {
+        "schema_version": "verilogcause_gate_report.v1",
+        "decision": gate["decision"],
+        "next_action": (
+            "do_not_train" if gate["decision"] == "failed_stop" else "run_baselines"
+        ),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "artifacts": {
+            name: _artifact(run / name, run)
+            for name in (
+                "dataset_contract.json",
+                "manifest.jsonl",
+                "samples.jsonl",
+                "evaluator_labels.jsonl",
+                "relation_diagnostic.json",
+            )
+        },
+    }
+    _write_json(run / "gate_report.json", gate_report)
+    return gate_report
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Prepare native VerilogCause data")
     actions = parser.add_subparsers(dest="action", required=True)
@@ -845,7 +1146,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     prepare_parser.add_argument("--corpus", required=True)
     prepare_parser.add_argument("--families", required=True)
     prepare_parser.add_argument("--timeout-seconds", type=float, default=120)
+    candidates_parser = actions.add_parser("candidates")
+    candidates_parser.add_argument("--run", required=True)
+    pilot_parser = actions.add_parser("pilot")
+    pilot_parser.add_argument("--run", required=True)
     args = parser.parse_args(argv)
+    if args.action == "candidates":
+        run = Path(args.run).resolve()
+        build_candidates(run)
+        print(json.dumps({"run": str(run), "decision": "stop_for_codex_gold_review"}, sort_keys=True))
+        return
+    if args.action == "pilot":
+        print(json.dumps(pilot(Path(args.run).resolve()), sort_keys=True))
+        return
     families = tuple(item.strip() for item in args.families.split(",") if item.strip())
     if not families:
         parser.error("--families must not be empty")
