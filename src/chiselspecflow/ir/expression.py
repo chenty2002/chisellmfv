@@ -128,6 +128,8 @@ def _validate_node(
     if op == "object_ref":
         _exact(value, {"op", "object_id"}, path)
         object_id = _identifier(value["object_id"], f"{path}.object_id")
+        if object_id == "__formal_reset__":
+            return _checked_type(_with_type(value, _BOOL), _BOOL, declared_result, path)
         if object_id not in object_types:
             raise ExpressionValidationError("unknown_object", object_id)
         result = _parse_type(object_types[object_id], f"object_types[{object_id}]")

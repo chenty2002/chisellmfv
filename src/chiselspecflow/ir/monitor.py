@@ -72,9 +72,9 @@ def validate_monitor(
         or overlay.get("host_scope") != "SpecFlowOverlay"
     ):
         raise MonitorValidationError("observer_strategy_unsupported", str(overlay.get("strategy")))
-    if value["reset_policy"] != "disable_while_reset":
+    if value["reset_policy"] not in {"disable_while_reset", "explicit_reset"}:
         raise MonitorValidationError(
-            "invalid_reset_policy", "the current compiler requires disable_while_reset"
+            "invalid_reset_policy", "reset policy must be disabled or explicit"
         )
     observations = value["required_observations"]
     if not isinstance(observations, list) or not observations or any(ref not in binding_ids for ref in observations):

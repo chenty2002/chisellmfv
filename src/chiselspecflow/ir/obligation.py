@@ -17,6 +17,7 @@ SUPPORTED_FAMILIES = frozenset(
         "stability",
         "cardinality",
         "bounded_response",
+        "algorithmic_reference",
     }
 )
 SUPPORT_STATUSES = frozenset({"candidate", "supported", "unsupported", "ambiguous"})
@@ -76,7 +77,12 @@ def validate_obligation(
     if not isinstance(roles, list) or not roles or any(not isinstance(item, str) or not item for item in roles):
         raise ObligationValidationError("malformed_observation_roles", "at least one role is required")
     temporal = _exact_object(value["temporal"], {"kind", "min_cycles", "max_cycles"}, "temporal")
-    if temporal["kind"] not in {"same_cycle", "next_cycle", "bounded"}:
+    if temporal["kind"] not in {
+        "same_cycle",
+        "next_cycle",
+        "bounded",
+        "reference_relation",
+    }:
         raise ObligationValidationError("unsupported_temporal_kind", str(temporal["kind"]))
     minimum, maximum = temporal["min_cycles"], temporal["max_cycles"]
     if any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in (minimum, maximum)) or minimum > maximum:

@@ -18,83 +18,45 @@ AMBIGUITY_TOOL_NAME = "report_spec_ambiguity"
 
 
 def extract_obligation_tools(
-    clause_ids: Iterable[str],
-    *,
-    count: int,
+    intents: Iterable[Mapping[str, Any]],
 ) -> list[Dict[str, Any]]:
-    """Small Stage-1 experiment schema: intent only, with no IDs or expression IR."""
+    """Let S2 select only reviewed complete intent IDs."""
 
-    candidate = _strict_object(
-        {
-            "clause_locator": _enum(clause_ids),
-            "family": _enum(
-                (
-                    "combinational_mapping",
-                    "reset_initialization",
-                    "state_transition",
-                    "stability",
-                    "cardinality",
-                    "bounded_response",
-                )
-            ),
-            "temporal_kind": _enum(("same_cycle", "next_cycle", "bounded")),
-            "min_cycles": {"type": "integer", "minimum": 0},
-            "max_cycles": {"type": "integer", "minimum": 0},
-            "relation": _enum(("eq", "neq", "ult", "ule", "ugt", "uge")),
-            "archetype_hint": _enum(
-                ("direct_relation", "previous_value", "bounded_counter", "lifecycle")
-            ),
-            "support_status": _enum(("supported", "unsupported", "ambiguous")),
-        }
-    )
+    rows = tuple(intents)
+    variants = [
+        _strict_object({"intent_id": {"type": "string", "const": row["intent_id"]}})
+        for row in rows
+    ]
+    candidate = variants[0] if len(variants) == 1 else {"anyOf": variants}
     tool = _tool("extract_obligations", candidate)
     candidates = tool["parameters"]["properties"]["candidates"]
+    count = len({row["clause_locator"] for row in rows})
     candidates["minItems"] = count
     candidates["maxItems"] = count
     return [tool]
 
 
 def bind_and_instantiate_tools(
-    obligation_refs: Iterable[str],
-    semantic_objects: Iterable[Mapping[str, Any]],
-    archetype_ids: Iterable[str],
+    candidates: Iterable[Mapping[str, Any]],
 ) -> list[Dict[str, Any]]:
-    """Bound model output to object selection and reusable archetype slots."""
+    """Let S2 select only one already-complete formula ID per clause."""
 
-    refs = tuple(obligation_refs)
-    object_ids = tuple(row["object_id"] for row in semantic_objects)
-    binding = _strict_object({"role": _string(), "object_id": _enum(object_ids)})
-    slots = _strict_object(
-        {
-            "lhs_role": _string(),
-            "rhs_role": _string(),
-            "guard_role": _string(),
-            "trigger_role": _string(),
-            "response_role": _string(),
-            "use_expected_literal": {"type": "boolean"},
-            "expected_literal": {"type": "integer"},
-            "use_lookup_table": {"type": "boolean"},
-            "selector_roles": {"type": "array", "maxItems": 8, "items": _string()},
-            "lookup_values": {
-                "type": "array",
-                "maxItems": 256,
-                "items": {"type": "integer"},
-            },
-            "bound": {"type": "integer", "minimum": 0, "maximum": 255},
-        }
-    )
-    candidate = _strict_object(
-        {
-            "obligation_ref": _enum(refs),
-            "archetype_id": _enum(archetype_ids),
-            "bindings": {"type": "array", "minItems": 1, "items": binding},
-            "slots": slots,
-        }
-    )
+    rows = tuple(candidates)
+    variants = []
+    for row in rows:
+        variants.append(
+            _strict_object(
+                {
+                    "candidate_id": {"type": "string", "const": row["candidate_id"]},
+                }
+            )
+        )
+    candidate = variants[0] if len(variants) == 1 else {"anyOf": variants}
     tool = _tool("bind_and_instantiate", candidate)
-    candidates = tool["parameters"]["properties"]["candidates"]
-    candidates["minItems"] = len(refs)
-    candidates["maxItems"] = len(refs)
+    submissions = tool["parameters"]["properties"]["candidates"]
+    obligation_count = len({row["obligation_ref"] for row in rows})
+    submissions["minItems"] = obligation_count
+    submissions["maxItems"] = obligation_count
     return [tool]
 
 

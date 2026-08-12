@@ -2,7 +2,6 @@ package reeds
 
 import chisel3._
 import chisel3.util.HasBlackBoxInline
-import java.nio.file.{Files, Paths}
 
 final class AsyncResetByteArray(
   private val elements: IndexedSeq[UInt],
@@ -183,55 +182,38 @@ class DP_RAM(
   data_out := primitive.io.data_out
 }
 
-private object SourceAsset {
-  private val familyRelative = Paths.get(
-    "..", "..", "Wit-HW", "buggy_designs", "reed_solomon_decoder")
+private object GF256Tables {
+  private def xtime(value: Int): Int =
+    ((value << 1) ^ (if ((value & 0x80) != 0) 0x11d else 0)) & 0xff
 
-  def read(name: String): String = {
-    val path = familyRelative.resolve(name).normalize()
-    require(Files.isRegularFile(path), s"missing immutable ROM source: $path")
-    Files.readString(path)
+  val exponentToValue: IndexedSeq[Int] = {
+    val table = Array.fill(256)(0)
+    var value = 1
+    for (exponent <- 0 until 255) {
+      table(exponent + 1) = value
+      value = xtime(value)
+    }
+    table.toIndexedSeq
+  }
+
+  val valueToExponent: IndexedSeq[Int] = {
+    val table = Array.fill(256)(255)
+    exponentToValue.zipWithIndex.drop(1).foreach { case (value, address) =>
+      table(value) = address - 1
+    }
+    table.toIndexedSeq
   }
 }
 
-private abstract class GFTablePrimitive(fileName: String, sourceModule: String)
-    extends BlackBox with HasBlackBoxInline {
-  val io = IO(new Bundle {
-    val clk = Input(Clock())
-    val re = Input(Bool())
-    val address_read = Input(UInt(8.W))
-    val data_out = Output(UInt(8.W))
-  })
-
-  private val renamed = SourceAsset.read(fileName).replaceFirst(
-    "module\\s+" + sourceModule,
-    "module " + desiredName)
-  setInline(desiredName + ".sv", renamed)
-}
-
-private final class GFDecPrimitive
-  extends GFTablePrimitive("GF_matrix_dec.v", "GF_matrix_dec")
-private final class GFPowPrimitive
-  extends GFTablePrimitive("GF_matrix_ascending_binary.v", "GF_matrix_ascending_binary")
-
-class GF_matrix_dec extends Module {
+abstract class GFTable(values: IndexedSeq[Int]) extends Module {
   val re = IO(Input(Bool()))
   val address_read = IO(Input(UInt(8.W)))
   val data_out = IO(Output(UInt(8.W)))
-  private val primitive = Module(new GFDecPrimitive)
-  primitive.io.clk := clock
-  primitive.io.re := re
-  primitive.io.address_read := address_read
-  data_out := primitive.io.data_out
+  private val output = Reg(UInt(8.W))
+  when(re) { output := VecInit(values.map(_.U(8.W)))(address_read) }
+  data_out := output
 }
 
-class GF_matrix_ascending_binary extends Module {
-  val re = IO(Input(Bool()))
-  val address_read = IO(Input(UInt(8.W)))
-  val data_out = IO(Output(UInt(8.W)))
-  private val primitive = Module(new GFPowPrimitive)
-  primitive.io.clk := clock
-  primitive.io.re := re
-  primitive.io.address_read := address_read
-  data_out := primitive.io.data_out
-}
+class GF_matrix_dec extends GFTable(GF256Tables.exponentToValue)
+
+class GF_matrix_ascending_binary extends GFTable(GF256Tables.valueToExponent)

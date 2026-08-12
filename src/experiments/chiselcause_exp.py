@@ -22,6 +22,7 @@ from src.chiselspecflow.config import (
     load_project_contract,
 )
 from src.chiselspecflow.elaboration import elaborate_baseline
+from src.chiselspecflow.source_index import build_source_index
 
 
 CASE_SCHEMA = "chiselcause_case.v1"
@@ -29,22 +30,10 @@ CASES_SCHEMA = "chiselcause_cases.v1"
 RESULT_SCHEMA = "chiselcause_result.v2"
 SEARCH_TRACE_SCHEMA = "chiselcause_search_trace.v1"
 METRICS_SCHEMA = "chiselcause_source_metrics.v3"
+TRACE_CONTRAST_SCHEMA = "chiselcause_trace_contrast.v1"
 ABSOLUTE_BUDGET_CHECKPOINTS = (1, 5, 10, 25, 50, 100, 200)
 METHODS = ("d0", "d1", "d2", "d3")
-SEARCH_POLICY_ALIASES = {
-    "CS0": "legacy_scalar_best_first_v1",
-    "CS1": "edge_best_first_v1",
-    "H0": "legacy_dfs_v1",
-    "H1": "edge_best_first_v1",
-    "H2": "chisel_hybrid_best_first_v1",
-}
-SEARCH_POLICY_IDS = tuple(SEARCH_POLICY_ALIASES.values())
-POLICY_COMPARISON_ARMS = {
-    policy_id: tuple(
-        arm for arm, resolved in SEARCH_POLICY_ALIASES.items() if resolved == policy_id
-    )
-    for policy_id in dict.fromkeys(SEARCH_POLICY_IDS)
-}
+D2_POLICY_ID = "d2_backward_v1"
 COUPLEDL2_CASES = {
     "deadlock-v0": {
         "endpoint": "VerifyTop.coupledL2.slices_0.mshrCtl._assert_1",
@@ -137,6 +126,10 @@ class FormalToolError(ChiselCauseExperimentError):
     pass
 
 
+class PassingWitnessUnavailable(ChiselCauseExperimentError):
+    pass
+
+
 def prepare(args: argparse.Namespace) -> Path:
     repo = Path(args.repo).resolve()
     project_path = (repo / args.project_contract).resolve()
@@ -177,11 +170,18 @@ def prepare(args: argparse.Namespace) -> Path:
             timeout_seconds=args.timeout_seconds,
             per_property_seconds=args.per_property_seconds,
         )
-    except (UnsupportedInterface, CounterexampleNotTriggered, FormalToolError) as exc:
+    except (
+        UnsupportedInterface,
+        CounterexampleNotTriggered,
+        FormalToolError,
+        PassingWitnessUnavailable,
+    ) as exc:
         if isinstance(exc, UnsupportedInterface):
             status = "unsupported_interface"
         elif isinstance(exc, CounterexampleNotTriggered):
             status = "not_triggered"
+        elif isinstance(exc, PassingWitnessUnavailable):
+            status = "failed_stop"
         else:
             status = "tool_error"
         _append_jsonl(
@@ -273,22 +273,47 @@ def _prepare_case(
     vcd_path = formal_dir / "counterexample.vcd"
     fst_path = formal_dir / "counterexample.fst"
     conversion = _convert_vcd(vcd_path, fst_path)
-    failure = _first_violated_output(
-        vcd_path, interface["outputs"], project.formal["clock"]
+    try:
+        failure = _first_violated_output(
+            vcd_path, interface["outputs"], project.formal["clock"]
+        )
+    except CounterexampleNotTriggered:
+        raise
+    except ChiselCauseExperimentError as exc:
+        raise PassingWitnessUnavailable(
+            f"fixed 1/1 trace budget lacks a clean passing projection: {exc}"
+        ) from exc
+    trace_contrast_path = formal_dir / "trace_contrast.json"
+    _write_json(
+        trace_contrast_path,
+        _build_trace_contrast(
+            run_dir=run_dir,
+            case_id=case_id,
+            vcd_path=vcd_path,
+            fst_path=fst_path,
+            interface=interface,
+            clock=project.formal["clock"],
+            failure=failure,
+        ),
     )
-    diagnosis_wrapper = formal_dir / "diagnosis_wrapper.sv"
+    diagnosis_wrapper = formal_dir / "differential_diagnosis_wrapper.sv"
     diagnosis_wrapper.write_text(
-        _render_diagnosis_wrapper(
+        _render_differential_diagnosis_wrapper(
+            clean_top=f"ChiselCauseClean_{project.generator['top_name']}",
             faulty_top=f"ChiselCauseFaulty_{project.generator['top_name']}",
             interface=interface,
         ),
         encoding="utf-8",
     )
-    rtl_rows = [_artifact(run_dir, faulty_formal_rtl), _artifact(run_dir, diagnosis_wrapper)]
+    rtl_rows = [
+        _artifact(run_dir, clean_formal_rtl),
+        _artifact(run_dir, faulty_formal_rtl),
+        _artifact(run_dir, diagnosis_wrapper),
+    ]
     rtl_set_sha256 = _canonical_sha256(
         [{"path": row["path"], "sha256": row["sha256"]} for row in rtl_rows]
     )
-    diagnosis_endpoint = f"ChiselCauseMiter.faulty_dut.{failure['output']}"
+    diagnosis_endpoint = "ChiselCauseMiter.chiselcause_mismatch_any"
     projection = {
         "schema_version": "assertion_endpoint_projection",
         "endpoint_signal": diagnosis_endpoint,
@@ -317,6 +342,7 @@ def _prepare_case(
             "vcd": _artifact(run_dir, vcd_path),
             "fst": _artifact(run_dir, fst_path),
             "vcd_to_fst": conversion,
+            "trace_contrast": _artifact(run_dir, trace_contrast_path),
             "endpoint_projection": _artifact(run_dir, projection_path),
         },
         "formal": formal,
@@ -422,7 +448,8 @@ def _render_miter(
     clean_connections = _connections(inputs, outputs, "clean")
     faulty_connections = _connections(inputs, outputs, "faulty")
     mismatch_wires = "\n".join(
-        f"  wire mismatch_{row['name']} = clean_{row['name']} !== faulty_{row['name']};"
+        f"  wire mismatch_{row['name']};\n"
+        f"  assign mismatch_{row['name']} = clean_{row['name']} !== faulty_{row['name']};"
         for row in outputs
     )
     mismatch_expression = " | ".join(f"mismatch_{row['name']}" for row in outputs)
@@ -455,25 +482,35 @@ def _render_miter(
 
 def _renamed_design(source: Path, target: Path, modules: Sequence[str], prefix: str) -> Path:
     text = source.read_text(encoding="utf-8")
-    for module in sorted(modules, key=len, reverse=True):
+    declared = re.findall(r"(?m)^\s*module\s+([A-Za-z_$][\w$]*)\b", text)
+    for module in sorted({*modules, *declared}, key=len, reverse=True):
         text = re.sub(rf"\b{re.escape(module)}\b", prefix + module, text)
     target.write_text(text, encoding="utf-8")
     return target
 
 
-def _render_diagnosis_wrapper(*, faulty_top: str, interface: Mapping[str, Any]) -> str:
+def _render_differential_diagnosis_wrapper(
+    *, clean_top: str, faulty_top: str, interface: Mapping[str, Any]
+) -> str:
     inputs = interface["inputs"]
     outputs = interface["outputs"]
-    declarations = [f"  input {_width(row['width'])}{row['name']}" for row in inputs]
-    declarations += [f"  output {_width(row['width'])}{row['name']}" for row in outputs]
-    ports = ",\n".join(declarations)
-    connections = ",\n".join(
-        f"    .{row['name']}({row['name']})" for row in [*inputs, *outputs]
+    ports = ",\n".join(
+        f"  input {_width(row['width'])}{row['name']}" for row in inputs
     )
+    wires = "\n".join(
+        f"  wire {_width(row['width'])}clean_{row['name']};\n"
+        f"  wire {_width(row['width'])}faulty_{row['name']};\n"
+        f"  wire mismatch_{row['name']};\n"
+        f"  assign mismatch_{row['name']} = clean_{row['name']} !== faulty_{row['name']};"
+        for row in outputs
+    )
+    mismatches = " | ".join(f"mismatch_{row['name']}" for row in outputs)
     return (
-        "// Faulty-only hierarchy matching the differential CEX endpoint.\n"
-        f"module ChiselCauseMiter(\n{ports}\n);\n"
-        f"  {faulty_top} faulty_dut (\n{connections}\n  );\n"
+        f"module ChiselCauseMiter(\n{ports}\n);\n{wires}\n"
+        f"  {clean_top} clean_dut (\n{_connections(inputs, outputs, 'clean')}\n  );\n"
+        f"  {faulty_top} faulty_dut (\n{_connections(inputs, outputs, 'faulty')}\n  );\n"
+        "  wire chiselcause_mismatch_any;\n"
+        f"  assign chiselcause_mismatch_any = {mismatches};\n"
         "endmodule\n"
     )
 
@@ -509,6 +546,8 @@ def _load_witness(
             raise ChiselCauseExperimentError(f"witness line {number} width mismatch")
         row = {}
         for signal, value in zip(signals, values):
+            if value == "*":
+                continue
             parsed = int(value, 0)
             if parsed < 0 or parsed >= 2 ** widths[signal]:
                 raise ChiselCauseExperimentError(f"witness value out of range at line {number}")
@@ -527,10 +566,6 @@ def _render_witness(
 ) -> str:
     if not rows:
         return "  // No external witness supplied; JasperGold searches the shared inputs."
-    predicates = [
-        " && ".join(f"({signal} == {value})" for signal, value in row.items())
-        for row in rows
-    ]
     reset_expression = reset if reset_active_high else f"!({reset})"
     width = max(1, len(rows).bit_length())
     lines = [
@@ -540,9 +575,20 @@ def _render_witness(
         f"      chiselcause_witness_cycle <= {width}'d0;",
         f"    else if (chiselcause_witness_cycle < {width}'d{max(0, len(rows) - 1)})",
         f"      chiselcause_witness_cycle <= chiselcause_witness_cycle + {width}'d1;",
-        f"  assume property (@(posedge {clock}) {reset_expression} |-> ({predicates[0]}));",
     ]
-    for index, predicate in enumerate(predicates[1:]):
+    if rows[0]:
+        predicate = " && ".join(
+            f"({signal} == {value})" for signal, value in rows[0].items()
+        )
+        lines.append(
+            f"  assume property (@(posedge {clock}) {reset_expression} |-> ({predicate}));"
+        )
+    for index, row in enumerate(rows[1:]):
+        if not row:
+            continue
+        predicate = " && ".join(
+            f"({signal} == {value})" for signal, value in row.items()
+        )
         lines.append(
             f"  assume property (@(posedge {clock}) !({reset_expression}) && "
             f"chiselcause_witness_cycle == {width}'d{index} |-> ({predicate}));"
@@ -664,6 +710,133 @@ def _first_violated_output(vcd: Path, outputs: Sequence[Mapping[str, Any]], cloc
     raise CounterexampleNotTriggered("CEX VCD contains no public-output mismatch on a rising edge")
 
 
+def _build_trace_contrast(
+    *,
+    run_dir: Path,
+    case_id: str,
+    vcd_path: Path,
+    fst_path: Path,
+    interface: Mapping[str, Any],
+    clock: str,
+    failure: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Record one input-matched faulty/clean trace pair from the differential FST."""
+
+    definitions, samples = _read_vcd(vcd_path)
+    try:
+        clock_code = _unique_vcd_code(definitions, f"ChiselCauseMiter.{clock}")
+        input_codes = {}
+        for row in interface["inputs"]:
+            if row["name"] == clock:
+                continue
+            code = _optional_vcd_code(
+                definitions, f"ChiselCauseMiter.{row['name']}"
+            )
+            if code is not None:
+                input_codes[row["name"]] = code
+        output_codes = {
+            projection: {
+                row["name"]: _unique_vcd_code(
+                    definitions, f"ChiselCauseMiter.{projection}_{row['name']}"
+                )
+                for row in interface["outputs"]
+            }
+            for projection in ("faulty", "clean")
+        }
+    except ChiselCauseExperimentError as exc:
+        raise PassingWitnessUnavailable(
+            f"fixed 1/1 trace budget lacks a clean passing projection: {exc}"
+        ) from exc
+
+    values: dict[str, str] = {}
+    previous_clock = "x"
+    cycle = -1
+    previous: dict[str, str] | None = None
+    observed: dict[str, str] | None = None
+    for _, changes in samples:
+        values.update(changes)
+        current_clock = values.get(clock_code, "x")
+        if previous_clock != "1" and current_clock == "1":
+            cycle += 1
+            snapshot = {
+                name: values.get(code, "x")
+                for name, code in {
+                    **input_codes,
+                    **{
+                        f"{projection}.{name}": code
+                        for projection, codes in output_codes.items()
+                        for name, code in codes.items()
+                    },
+                }.items()
+            }
+            if cycle == int(failure["cycle"]):
+                observed = snapshot
+                break
+            previous = snapshot
+        previous_clock = current_clock
+    if observed is None or any(
+        set(value.lower()) - {"0", "1"} for value in observed.values()
+    ):
+        raise PassingWitnessUnavailable(
+            "fixed 1/1 trace budget lacks a concrete clean passing projection"
+        )
+
+    guard_summary = {
+        "cycle": int(failure["cycle"]),
+        "inputs": {name: observed[name] for name in sorted(input_codes)},
+    }
+    artifact = _artifact(run_dir, fst_path)
+    traces = []
+    for projection, outcome in (("faulty", "failing"), ("clean", "passing")):
+        current_outputs = {
+            name: observed[f"{projection}.{name}"]
+            for name in sorted(output_codes[projection])
+        }
+        previous_outputs = (
+            {
+                name: previous[f"{projection}.{name}"]
+                for name in sorted(output_codes[projection])
+            }
+            if previous is not None
+            else None
+        )
+        state_summary = {
+            "cycle": int(failure["cycle"]),
+            "previous_outputs": previous_outputs,
+            "outputs": current_outputs,
+        }
+        traces.append(
+            {
+                "outcome": outcome,
+                "artifact": {
+                    **artifact,
+                    "projection": f"ChiselCauseMiter.{projection}_dut",
+                },
+                "first_mismatch_cycle": (
+                    int(failure["cycle"]) if outcome == "failing" else None
+                ),
+                "guard_summary": guard_summary,
+                "state_summary": state_summary,
+                "slice_signature": "slice_"
+                + _canonical_sha256(
+                    {
+                        "projection": projection,
+                        "violated_output": failure["output"],
+                        "guard_summary": guard_summary,
+                        "state_summary": state_summary,
+                    }
+                )[:24],
+            }
+        )
+    return {
+        "schema_version": TRACE_CONTRAST_SCHEMA,
+        "case_id": case_id,
+        "status": "complete",
+        "budget": {"failing": 1, "passing": 1},
+        "traces": traces,
+    }
+
+
 def _read_vcd(path: Path) -> tuple[dict[str, str], list[tuple[int, dict[str, str]]]]:
     definitions: dict[str, str] = {}
     scopes: list[str] = []
@@ -707,6 +880,17 @@ def _unique_vcd_code(definitions: Mapping[str, str], suffix: str) -> str:
     return next(iter(matches))
 
 
+def _optional_vcd_code(definitions: Mapping[str, str], suffix: str) -> str | None:
+    matches = {
+        code
+        for name, code in definitions.items()
+        if name == suffix or name.endswith("." + suffix)
+    }
+    if len(matches) > 1:
+        raise ChiselCauseExperimentError(f"VCD signal is ambiguous: {suffix}")
+    return next(iter(matches)) if matches else None
+
+
 def validate_case(row: Mapping[str, Any]) -> None:
     _exact_fields(row, CASE_FIELDS, "case")
     if row["schema_version"] != CASE_SCHEMA or row["status"] != "complete":
@@ -729,11 +913,9 @@ def validate_result(row: Mapping[str, Any]) -> None:
 
 
 def run_localization(args: argparse.Namespace) -> Path:
-    if args.method != "d2":
-        raise ChiselCauseExperimentError("C3 implements only the D2 ChiselCause method")
-    policy_id = _resolve_search_policy(
-        getattr(args, "search_policy", "legacy_dfs_v1")
-    )
+    if args.method not in {"d0", "d1", "d2"}:
+        raise ChiselCauseExperimentError("localization implements D0, D1, and D2")
+    policy_id = D2_POLICY_ID
     run_dir = Path(args.run).resolve()
     cases = _read_json(run_dir / "cases.json")["cases"]
     matches = [row for row in cases if row["case_id"] == args.case_id]
@@ -749,7 +931,14 @@ def run_localization(args: argparse.Namespace) -> Path:
     ):
         raise ChiselCauseExperimentError("case/method result already exists")
 
-    from verilog_causal_analysis import build_source_ranking, make_request, policy_identity, prepare_causal_session
+    from verilog_causal_analysis import (
+        build_source_ranking,
+        build_structural_graph,
+        make_request,
+        make_structural_request,
+        policy_identity,
+        prepare_causal_session,
+    )
     from verilog_causal_analysis.cycle_waveform import CycleAlignedWaveform
     from verilog_causal_analysis.identity import sha256_file
 
@@ -774,76 +963,108 @@ def run_localization(args: argparse.Namespace) -> Path:
         clock = waveform.resolve_signal(case["endpoint_projection"]["clock_signal"])
     if endpoint.resolved_signal is None or clock.resolved_signal is None:
         raise ChiselCauseExperimentError("CEX endpoint or clock is not uniquely present in FST")
-    request = make_request(
-        trace={
+    trace = {
             "artifact_id": "trace_0001",
             "path": str(trace_path),
             "format": "fst",
             "sha256": trace_sha256,
             "bytes": trace_bytes,
-        },
-        rtl_files=rtl_files,
-        semantic_profile={
-            "name": "chisel",
-            "version": "chisel-semantic-profile",
-            "features": [
-                "instance_graph",
-                "compiler_net_normalization",
-                "register_transition",
-                "aggregate",
-                "handshake",
-                "pipeline",
-                "temporal_interval",
-                "source_provenance",
-            ],
-        },
-        clock={"signal": clock.resolved_signal, "edge": "rising"},
-        endpoint={
-            "signal": endpoint.resolved_signal,
-            "cycle": case["cex"]["failure_cycle"],
-            "projection": None,
-        },
-        semantic_inputs=[],
-        search_policy=policy_identity(policy_id).to_dict(),
-        bounds={
-            "max_signal_depth": min(args.max_nodes, 256),
-            "max_signal_nodes": args.max_nodes,
-            "max_expanded_nodes": args.max_expanded_nodes or args.max_nodes,
-            "max_candidate_evaluations": (
-                args.max_candidate_evaluations or args.max_nodes * 8
-            ),
-            "max_intervention_evaluations": (
-                args.max_intervention_evaluations or args.max_nodes * 32
-            ),
-            "max_semantic_nodes": args.max_semantic_nodes,
-            "max_edges": args.max_edges,
-            "max_seed_count": 8,
-            "max_intervals_per_signal": 64,
-            "max_temporal_samples": 64000,
-            "max_waitfor_nodes": args.max_nodes,
-            "max_waitfor_edges": args.max_edges,
-            "max_scc_candidates": 8,
-        },
-        random_seed=0,
-        strict=True,
-    )
+        }
     started = time.perf_counter()
     before_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    with prepare_causal_session(request, top_module="ChiselCauseMiter") as session:
-        graph = session.build()
-        search_trace = session.search_trace
+    if args.method == "d2":
+        request = make_request(
+            trace=trace,
+            rtl_files=rtl_files,
+            semantic_profile={
+                "name": "chisel",
+                "version": "chisel-semantic-profile",
+                "features": [
+                    "instance_graph", "compiler_net_normalization", "register_transition",
+                    "aggregate", "handshake", "pipeline", "temporal_interval", "source_provenance",
+                ],
+            },
+            clock={"signal": clock.resolved_signal, "edge": "rising"},
+            endpoint={"signal": endpoint.resolved_signal, "cycle": case["cex"]["failure_cycle"], "projection": None},
+            semantic_inputs=[],
+            search_policy=policy_identity().to_dict(),
+            bounds={
+                "max_signal_depth": min(args.max_nodes, 256),
+                "max_signal_nodes": args.max_nodes,
+                "max_expanded_nodes": args.max_expanded_nodes or args.max_nodes,
+                "max_candidate_evaluations": args.max_candidate_evaluations or args.max_nodes * 8,
+                "max_intervention_evaluations": args.max_intervention_evaluations or args.max_nodes * 32,
+                "max_semantic_nodes": args.max_semantic_nodes,
+                "max_edges": args.max_edges,
+                "max_seed_count": 8,
+                "max_intervals_per_signal": 64,
+                "max_temporal_samples": 64000,
+                "max_waitfor_nodes": args.max_nodes,
+                "max_waitfor_edges": args.max_edges,
+                "max_scc_candidates": 8,
+            },
+            random_seed=0,
+            strict=True,
+        )
+        with prepare_causal_session(request, top_module="ChiselCauseMiter") as session:
+            graph = session.build()
+            search_trace = session.search_trace
+    else:
+        request = make_structural_request(
+            trace={key: trace[key] for key in ("path", "format", "sha256", "bytes")},
+            rtl_files=rtl_files,
+            clock_signal=clock.resolved_signal,
+            endpoint_signal=endpoint.resolved_signal,
+            endpoint_cycle=case["cex"]["failure_cycle"],
+            search_policy=policy_identity().to_dict(),
+            max_depth=min(args.max_nodes, 256),
+            max_nodes=args.max_nodes,
+            max_expanded_nodes=args.max_expanded_nodes or args.max_nodes,
+            max_candidate_evaluations=args.max_candidate_evaluations or args.max_nodes * 8,
+            max_intervention_evaluations=args.max_intervention_evaluations or args.max_nodes * 32,
+            random_seed=0,
+            strict=True,
+        )
+        structural = build_structural_graph(request)
+        edges = structural["edges"]
+        if args.method == "d0":
+            edges = [{**edge, "contribution_score": 1.0} for edge in edges]
+        graph = {
+            **structural,
+            "schema_version": "chiselcause_method_graph.v1",
+            "signal_nodes": structural["nodes"],
+            "semantic_nodes": [],
+            "edges": edges,
+        }
+        graph.pop("nodes")
+        graph["graph_id"] = "vcmg_" + _canonical_sha256(
+            {key: value for key, value in graph.items() if key != "graph_id"}
+        )[:24]
+        search_trace = []
     runtime = time.perf_counter() - started
     peak_rss = max(before_rss, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
     _write_json(method_dir / "causal_graph.json", graph)
     _write_json(method_dir / "request.json", request.to_dict())
-    _write_search_trace(method_dir / "search_trace.jsonl", search_trace, policy_id)
+    if search_trace:
+        _write_search_trace(method_dir / "search_trace.jsonl", search_trace, policy_id)
     elaboration_path = run_dir / case["faulty_variant"]["elaboration"]["path"]
+    elaboration = _read_json(elaboration_path)
+    source_root = elaboration_path.parent / "workspace"
+    source_index = _build_case_source_index(
+        elaboration,
+        source_root,
+        method_dir / "source_index.json",
+        Path(__file__).resolve().parents[2] / "tools/chisel-source-indexer",
+    )
     ranking = build_source_ranking(
         graph,
-        _read_json(elaboration_path),
+        elaboration,
+        source_index=source_index,
         case_id=args.case_id,
         method=args.method,
-        source_root=elaboration_path.parent / "workspace",
+        source_root=source_root,
+        clean_rtl=run_dir / case["clean_variant"]["rtl"]["path"],
+        faulty_rtl=run_dir / case["faulty_variant"]["rtl"]["path"],
     )
     _write_json(method_dir / "source_ranking.json", ranking)
     complete = graph["status"] == "complete" and ranking["status"] == "complete"
@@ -858,13 +1079,20 @@ def run_localization(args: argparse.Namespace) -> Path:
             "request_sha256": request.request_sha256,
             "graph_sha256": _sha256(method_dir / "causal_graph.json"),
             "source_ranking_sha256": _sha256(method_dir / "source_ranking.json"),
-            "search_trace_sha256": _sha256(method_dir / "search_trace.jsonl"),
+            "search_trace_sha256": (
+                _sha256(method_dir / "search_trace.jsonl") if search_trace else None
+            ),
+            "source_index_sha256": _sha256(method_dir / "source_index.json"),
+            "implementation_sha256": _chiselcause_implementation_sha256(
+                Path(__file__).resolve().parents[2]
+            ),
             "search_policy_id": policy_id,
-            "comparison_arms": list(POLICY_COMPARISON_ARMS[policy_id]),
             "policy_sha256": request.search_policy.policy_sha256,
         },
         "source_ranking": _artifact(run_dir, method_dir / "source_ranking.json"),
-        "search_trace": _artifact(run_dir, method_dir / "search_trace.jsonl"),
+        "search_trace": (
+            _artifact(run_dir, method_dir / "search_trace.jsonl") if search_trace else None
+        ),
         "work": {
             "graph_nodes": len(graph["signal_nodes"]) + len(graph["semantic_nodes"]),
             "graph_signal_nodes": len(graph["signal_nodes"]),
@@ -1007,7 +1235,7 @@ def run_coupledl2(args: argparse.Namespace) -> Path:
                 "kind": "assertion_endpoint_projection",
             }
         ],
-        search_policy=policy_identity("legacy_dfs_v1").to_dict(),
+        search_policy=policy_identity().to_dict(),
         bounds={
             "max_signal_depth": min(args.max_nodes, 256),
             "max_signal_nodes": args.max_nodes,
@@ -1036,6 +1264,7 @@ def run_coupledl2(args: argparse.Namespace) -> Path:
     ranking = build_source_ranking(
         graph,
         {"objects": [], "source_locators": []},
+        source_index={"objects": [], "statements": []},
         case_id=case_id,
         method="d2",
         source_root=case_root,
@@ -1106,11 +1335,6 @@ def _coupledl2_support_rtl(case_root: Path, primary: Path) -> list[Path]:
 
 def score(args: argparse.Namespace) -> Path:
     run_dir = Path(args.run).resolve()
-    policy_id = (
-        _resolve_search_policy(args.search_policy)
-        if getattr(args, "search_policy", None)
-        else None
-    )
     gold = _read_json(Path(args.gold).resolve())
     locations = [row for row in gold.get("locations", []) if row.get("bug_id") == args.bug_id]
     if len(locations) != 1:
@@ -1119,10 +1343,6 @@ def score(args: argparse.Namespace) -> Path:
     matches = [
         row for row in results
         if row["case_id"] == args.case_id and row["method"] == args.method
-        and (
-            policy_id is None
-            or row.get("input_identity", {}).get("search_policy_id") == policy_id
-        )
     ]
     if len(matches) != 1:
         raise ChiselCauseExperimentError("one method/policy result is required before score")
@@ -1199,6 +1419,11 @@ def _evaluate_source_ranking(
         status, reason = "gold_unreachable", "gold_not_in_statement_universe"
     elif len(matches) != 1:
         status, reason = "gold_unreachable", "gold_location_ambiguous"
+    elif (
+        gold_row.get("execution_phase") == "elaboration"
+        and not gold_row.get("exact_origins")
+    ):
+        status, reason = "gold_unreachable", "unsupported_source_phase"
     elif not gold_reachable:
         status, reason = (
             "gold_unreachable",
@@ -1357,8 +1582,7 @@ def _write_tables(run_dir: Path) -> None:
                 "top_5": metrics.get("top_5") if metrics else None,
                 "top_10": metrics.get("top_10") if metrics else None,
             }
-        arms = result.get("input_identity", {}).get("comparison_arms") or [None]
-        smoke_rows.extend({**base_smoke, "comparison_arm": arm} for arm in arms)
+        smoke_rows.append(base_smoke)
         if metrics:
             for checkpoint in metrics["budget_checkpoints"]:
                 base_budget = {
@@ -1367,9 +1591,7 @@ def _write_tables(run_dir: Path) -> None:
                         "search_policy_id": result.get("input_identity", {}).get("search_policy_id"),
                         **checkpoint,
                     }
-                budget_rows.extend(
-                    {**base_budget, "comparison_arm": arm} for arm in arms
-                )
+                budget_rows.append(base_budget)
     _write_json(
         run_dir / "tables" / "localization_smoke.json",
         {"schema_version": "chiselcause_localization_smoke.v1", "rows": smoke_rows},
@@ -1453,12 +1675,7 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
     run_parser = actions.add_parser("run")
     run_parser.add_argument("--run", required=True)
     run_parser.add_argument("--case-id", required=True)
-    run_parser.add_argument("--method", choices=METHODS, required=True)
-    run_parser.add_argument(
-        "--search-policy",
-        default="legacy_dfs_v1",
-        help="local-search policy ID or CS0/CS1/H0/H1/H2 alias",
-    )
+    run_parser.add_argument("--method", choices=("d0", "d1", "d2"), required=True)
     run_parser.add_argument("--max-nodes", type=int, default=240)
     run_parser.add_argument("--max-expanded-nodes", type=int)
     run_parser.add_argument("--max-candidate-evaluations", type=int)
@@ -1471,7 +1688,6 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
     score_parser.add_argument("--method", choices=("d0", "d1", "d2"), default="d2")
     score_parser.add_argument("--bug-id", required=True)
     score_parser.add_argument("--gold", required=True)
-    score_parser.add_argument("--search-policy")
     coupled_parser = actions.add_parser("coupledl2")
     coupled_parser.add_argument("--repo", default=".")
     coupled_parser.add_argument(
@@ -1494,17 +1710,53 @@ def _safe_id(value: str) -> str:
     return value
 
 
-def _resolve_search_policy(value: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ChiselCauseExperimentError("search policy must be a non-empty string")
-    alias = SEARCH_POLICY_ALIASES.get(value.upper())
-    if alias is not None:
-        return alias
-    if value in SEARCH_POLICY_IDS:
-        return value
-    raise ChiselCauseExperimentError(
-        f"unknown search policy {value!r}; expected one of "
-        f"{', '.join(SEARCH_POLICY_ALIASES)} or {', '.join(SEARCH_POLICY_IDS)}"
+def _build_case_source_index(
+    elaboration: Mapping[str, Any],
+    source_root: Path,
+    output_path: Path,
+    tool_root: Path,
+) -> dict[str, Any]:
+    paths = sorted(
+        {
+            str(row.get("path", ""))
+            for row in elaboration.get("source_locators", [])
+            if isinstance(row, Mapping) and str(row.get("path", "")).endswith(".scala")
+        }
+    )
+    files = []
+    for relative in paths:
+        path = source_root / relative
+        if not path.is_file():
+            raise ChiselCauseExperimentError(f"indexed Chisel source is missing: {relative}")
+        files.append(
+            {
+                "path": relative,
+                "sha256": _sha256(path),
+                "source_id": "src_" + _canonical_sha256(relative)[:20],
+            }
+        )
+    if not files:
+        raise ChiselCauseExperimentError("elaboration has no indexable Chisel source")
+    return build_source_index(
+        source_root,
+        {"schema_version": "model_view_manifest", "files": files},
+        output_path,
+        tool_root,
+        elaboration,
+    )
+
+
+def _chiselcause_implementation_sha256(repo: Path) -> str:
+    paths = (
+        repo / "src/experiments/chiselcause_exp.py",
+        repo / "src/chiselspecflow/source_index.py",
+        repo / "tools/chisel-source-indexer/src/main/scala/chisellmfv/indexer/Main.scala",
+        repo / "VerilogCausalAnalysis/src/verilog_causal_analysis/causal_slicer.py",
+        repo / "VerilogCausalAnalysis/src/verilog_causal_analysis/local_search.py",
+        repo / "VerilogCausalAnalysis/src/verilog_causal_analysis/source_ranking.py",
+    )
+    return _canonical_sha256(
+        [{"path": str(path.relative_to(repo)), "sha256": _sha256(path)} for path in paths]
     )
 
 

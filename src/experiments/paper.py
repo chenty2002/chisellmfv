@@ -129,16 +129,21 @@ SENSITIVE_ENV_NAMES = {
 P0_OUTPUT_BUDGET = (32768,)
 P1_OUTPUT_BUDGET = (8192, 8192, 16384)
 SELECTED_AUTHORING_SCOPE = {
-    "counter": ("CTR-P-TIM-002", "CTR-P-TIM-002"),
+    "counter": ("CTR-P-TIM-001", "CTR-P-TIM-001"),
     "fsm_16": ("FSM16-P-TIM-001", "FSM16-P-TIM-001"),
     "i2c": ("I2C-P004", "I2C-P004.bit-phase-completion"),
     "alu": ("ALU-P-SAF-001", "ALU-P-SAF-001"),
     "decoder_3_to_8": ("DEC-P-SAF-001", "DEC-P-SAF-001"),
     "arbiter": ("ARB-P001", "ARB-P001"),
-    "led_controller": ("LED-P001", "LED-P001"),
+    "led_controller": ("LED-P003", "LED-P003"),
     "sdram_controller": ("SDR-P001", "SDR-P001"),
     "reed_solomon_decoder": ("RS204-P-REL-001", "RS204-P-REL-001"),
     "sha3": ("K512-P-REL-001", "K512-P-REL-001"),
+}
+SELECTED_AUTHORING_CLAUSES = {
+    "fsm_16": ("FSM16-N-021",),
+    "i2c": ("I2C-010",),
+    "led_controller": ("LED-004",),
 }
 DEVELOPMENT_FAMILIES = ("counter", "fsm_16", "i2c")
 EVALUATION_FAMILIES = (
@@ -309,6 +314,7 @@ def _family_entry(repo: Path, run_dir: Path, family: str) -> dict[str, Any]:
         public_spec,
         (selected_property,),
         (selected_primary,),
+        SELECTED_AUTHORING_CLAUSES.get(family, ()),
     )
     expected_group = decomposition["component_groups"].get(selected_primary)
     if (
@@ -955,6 +961,9 @@ def track_p_author(args: argparse.Namespace) -> Path:
             component_ids=tuple(
                 family_entry["selected_authoring_scope"]["primary_component_ids"]
             ),
+            clause_ids=tuple(
+                family_entry["selected_authoring_scope"]["clause_ids"]
+            ),
         ),
         source_run,
         suite_ledger,
@@ -1309,6 +1318,9 @@ def track_p_verify(args: argparse.Namespace) -> Path:
                     family_entry["selected_authoring_scope"][
                         "primary_component_ids"
                     ]
+                ),
+                clause_ids=tuple(
+                    family_entry["selected_authoring_scope"]["clause_ids"]
                 ),
             ),
             target_run,

@@ -154,6 +154,7 @@ class SpecFlowWorkspace:
                 public_spec_package,
                 self.config.expected_property_ids,
                 self.config.component_ids,
+                self.config.clause_ids,
             )
             _write_json(inputs / "authoring_scope.json", authoring_scope)
             model_view = _materialize_model_view(

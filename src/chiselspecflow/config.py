@@ -86,6 +86,7 @@ class SpecFlowRunConfig:
     opaque_task_id: Optional[str] = None
     expected_property_ids: Tuple[str, ...] = ()
     component_ids: Tuple[str, ...] = ()
+    clause_ids: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -121,6 +122,17 @@ class SpecFlowRunConfig:
         ):
             raise ValueError("component_ids must contain unique safe component IDs")
         object.__setattr__(self, "component_ids", selected_components)
+        selected_clauses = tuple(self.clause_ids)
+        if (
+            len(set(selected_clauses)) != len(selected_clauses)
+            or any(
+                not isinstance(row, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", row)
+                for row in selected_clauses
+            )
+        ):
+            raise ValueError("clause_ids must contain unique safe clause IDs")
+        object.__setattr__(self, "clause_ids", selected_clauses)
 
 
 class SpecFlowConfigError(ValueError):

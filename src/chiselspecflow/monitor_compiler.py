@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
@@ -279,6 +280,9 @@ def lower_monitor(
         typed_objects[object_id] = ChiselExpr(
             source, _type_from_mapping(row["chisel_type"])
         )
+    typed_objects["__formal_reset__"] = ChiselExpr(
+        reset_source, ExpressionType("Bool", 1, False)
+    )
     for binding_id in required_binding_ids:
         object_id = bindings[binding_id]["object_id"]
         if object_id not in typed_objects:
@@ -332,6 +336,7 @@ def render_overlay(
     configuration: Mapping[str, Any],
     semantic_index: Mapping[str, Any],
     adapter: Mapping[str, Any],
+    reference_relation: Optional[Mapping[str, Any]] = None,
 ) -> RenderedOverlay:
     if not units:
         raise MonitorCompilerError("no overlay units to render")
@@ -347,6 +352,23 @@ def render_overlay(
         f"import {item}" for item in adapter["imports"]
     ]
     lines = ["package chisellmfv.generated", "", *imports, "", "final class SpecFlowOverlay extends Module {", f"  val dut = Module({constructor})"]
+    if reference_relation is not None:
+        class_name = _scala_identifier(reference_relation["class_name"])
+        if class_name != reference_relation["class_name"]:
+            raise MonitorCompilerError("reference relation class name is unsafe")
+        lines.append(f"  val csf_reference = Module(new {class_name})")
+        for monitor_port, dut_port in sorted(reference_relation["connections"].items()):
+            if any(_scala_identifier(value) != value for value in (monitor_port, dut_port)):
+                raise MonitorCompilerError("reference relation connection is unsafe")
+            lines.append(f"  csf_reference.{monitor_port} := dut.{dut_port}")
+        for ghost in reference_relation["ghost_inputs"]:
+            port = str(ghost["monitor_port"])
+            name = str(ghost["name"])
+            if any(_scala_identifier(value) != value for value in (port, name)):
+                raise MonitorCompilerError("reference relation ghost input is unsafe")
+            chisel_type = _chisel_type(_type_from_mapping(ghost["type"]))
+            lines.append(f"  val {name} = IO(Input({chisel_type}))")
+            lines.append(f"  csf_reference.{port} := {name}")
     confirmed = [row for row in semantic_index["objects"] if row.get("fact_status") == "elaboration_confirmed"]
     for row in sorted(confirmed, key=lambda item: item["name"]):
         if row.get("owner_module") != semantic_index.get("top"):
@@ -362,12 +384,26 @@ def render_overlay(
             lines.append(f"  dut.{name} := {name}")
         else:
             lines.append(f"  {name} := dut.{name}")
+    if reference_relation is not None and reference_relation.get("assumption") is not None:
+        assumption = reference_relation["assumption"]
+        expression = _reference_output(assumption["expression"])
+        guard = _reference_output(assumption["guard"])
+        lines.append(f"  assume((!({guard})) || ({expression}))")
     properties = []
     for unit in units:
         lines.append("")
         lines.append(f"  // Monitor {unit.monitor_id}")
         lines.extend("  " + line for line in unit.state_lines)
-        for row in unit.property_rows:
+        for original_row in unit.property_rows:
+            row = dict(original_row)
+            if reference_relation is not None:
+                output = reference_relation["role_outputs"].get(row["role"])
+                if output is None:
+                    raise MonitorCompilerError(
+                        f"reference relation has no output for role {row['role']}"
+                    )
+                row["expression"] = _reference_output(output["expression"])
+                row["guard"] = _reference_output(output["guard"])
             label = row["expected_label"]
             predicate_name = f"{label}_predicate"
             role = row["role"]
@@ -457,6 +493,37 @@ def compile_reviewed_package(
     adapter = assets.api_adapters.get(adapter_id)
     if adapter is None:
         raise MonitorCompilerError(f"reviewed API adapter is missing: {adapter_id}")
+    reference_monitors = [
+        monitor
+        for monitor in package["monitors"]
+        if monitor.get("archetype_id") == "algorithmic_reference"
+    ]
+    reference_relation = None
+    if reference_monitors:
+        if len(reference_monitors) != len(package["monitors"]):
+            raise MonitorCompilerError("reference and scalar monitors cannot share one overlay")
+        primary_ids = {
+            prop["source_property_id"]
+            for monitor in reference_monitors
+            for prop in monitor["properties"]
+            if prop["role"] == "primary_assertion"
+        }
+        matches = [
+            row
+            for row in assets.reference_relations.values()
+            if row.get("project_id") == project["project_id"]
+            and row.get("source_property_id") in primary_ids
+        ]
+        if len(primary_ids) != 1 or len(matches) != 1:
+            raise MonitorCompilerError("one exact reviewed reference relation is required")
+        reference_relation = matches[0]
+        component_ids = {
+            prop["source_property_id"]
+            for monitor in reference_monitors
+            for prop in monitor["properties"]
+        }
+        if component_ids != set(reference_relation["component_ids"]):
+            raise MonitorCompilerError("reference relation component IDs differ")
     units = []
     for monitor in package["monitors"]:
         validate_monitor_ir(monitor, semantic, assets)
@@ -469,12 +536,23 @@ def compile_reviewed_package(
                 adapter=adapter,
             )
         )
-    rendered = render_overlay(units, project, configuration, semantic, adapter)
+    rendered = render_overlay(
+        units, project, configuration, semantic, adapter, reference_relation
+    )
     source_root = workspace.project_workspace / project["build"]["overlay_source_root"]
     source_path = source_root / "SpecFlowOverlay.scala"
     if source_path.exists():
         raise FileExistsError(f"overlay source already exists: {source_path}")
     source_root.mkdir(parents=True, exist_ok=True)
+    relation_source_path = None
+    if reference_relation is not None:
+        reviewed_source = assets.root / reference_relation["source"]["path"]
+        relation_source_path = source_root / reviewed_source.name
+        if relation_source_path.exists():
+            raise FileExistsError(
+                f"reference relation source already exists: {relation_source_path}"
+            )
+        shutil.copyfile(reviewed_source, relation_source_path)
     temporary = source_path.with_name(source_path.name + ".tmp")
     temporary.write_text(rendered.source, encoding="utf-8")
     temporary.replace(source_path)
@@ -491,9 +569,7 @@ def compile_reviewed_package(
         },
     )
     overlay_manifest_path = output / "overlay_manifest.json"
-    _write_json(
-        overlay_manifest_path,
-        {
+    overlay_manifest = {
             "schema_version": OVERLAY_MANIFEST_SCHEMA,
             "verification_package_sha256": file_sha256(package_path),
             "wrapper_top": rendered.wrapper_top,
@@ -505,16 +581,28 @@ def compile_reviewed_package(
             "monitor_ids": [unit.monitor_id for unit in units],
             "property_count": len(rendered.properties),
             "compiler": "chiselspecflow.monitor_compiler",
-        },
-    )
+        }
+    if relation_source_path is not None:
+        overlay_manifest["reference_relation"] = {
+            "asset_id": reference_relation["asset_id"],
+            "path": str(relation_source_path.relative_to(workspace.project_workspace)),
+            "sha256": file_sha256(relation_source_path),
+        }
+    _write_json(overlay_manifest_path, overlay_manifest)
     diff_path = output / "overlay_diff.patch"
+    diff_sources = [(source_path, rendered.source)]
+    if relation_source_path is not None:
+        diff_sources.insert(
+            0, (relation_source_path, relation_source_path.read_text(encoding="utf-8"))
+        )
     diff_path.write_text(
         "".join(
-            difflib.unified_diff(
-                [],
-                rendered.source.splitlines(keepends=True),
+            line
+            for generated_path, generated_source in diff_sources
+            for line in difflib.unified_diff(
+                [], generated_source.splitlines(keepends=True),
                 fromfile="/dev/null",
-                tofile=str(source_path.relative_to(workspace.project_workspace)),
+                tofile=str(generated_path.relative_to(workspace.project_workspace)),
             )
         ),
         encoding="utf-8",
@@ -621,6 +709,14 @@ def _scala_identifier(value: str) -> str:
     if not normalized or not re.match(r"[A-Za-z_]", normalized):
         normalized = "id_" + normalized
     return normalized
+
+
+def _reference_output(value: Any) -> str:
+    if value == "true.B":
+        return value
+    if not isinstance(value, str) or _scala_identifier(value) != value:
+        raise MonitorCompilerError("reference relation output is unsafe")
+    return "csf_reference." + value
 
 
 def _read_json(path: Path) -> Dict[str, Any]:

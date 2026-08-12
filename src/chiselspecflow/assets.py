@@ -22,6 +22,7 @@ class AssetLibrary:
     obligation_schemas: Mapping[str, Mapping[str, Any]]
     monitor_archetypes: Mapping[str, Mapping[str, Any]]
     api_adapters: Mapping[str, Mapping[str, Any]]
+    reference_relations: Mapping[str, Mapping[str, Any]]
 
     def snapshot(self) -> Dict[str, Any]:
         def rows(assets: Mapping[str, Mapping[str, Any]]) -> list[Dict[str, Any]]:
@@ -39,6 +40,7 @@ class AssetLibrary:
             "obligation_schemas": rows(self.obligation_schemas),
             "monitor_archetypes": rows(self.monitor_archetypes),
             "api_adapters": rows(self.api_adapters),
+            "reference_relations": rows(self.reference_relations),
         }
 
 
@@ -54,9 +56,28 @@ def load_reviewed_assets(root: Path | None = None) -> AssetLibrary:
     api_adapters = _load_kind(
         root, "api_adapters", "api_adapter", reviewed_hashes
     )
+    reference_relations = _load_kind(
+        root, "reference_relations", "reference_relation", reviewed_hashes
+    )
+    for row in reference_relations.values():
+        source = row.get("source")
+        if not isinstance(source, Mapping) or set(source) != {"path", "sha256"}:
+            raise AssetError("reference relation source contract is malformed")
+        source_path = (root / str(source["path"])).resolve()
+        try:
+            source_path.relative_to(root)
+        except ValueError as exc:
+            raise AssetError("reference relation source escapes the asset root") from exc
+        if not source_path.is_file() or file_sha256(source_path) != source["sha256"]:
+            raise AssetError("reference relation source is missing or hash-mismatched")
     loaded_paths = {
         row["path"]
-        for collection in (obligation_schemas, monitor_archetypes, api_adapters)
+        for collection in (
+            obligation_schemas,
+            monitor_archetypes,
+            api_adapters,
+            reference_relations,
+        )
         for row in collection.values()
     }
     if set(reviewed_hashes) != loaded_paths:
@@ -66,6 +87,7 @@ def load_reviewed_assets(root: Path | None = None) -> AssetLibrary:
         obligation_schemas=MappingProxyType(obligation_schemas),
         monitor_archetypes=MappingProxyType(monitor_archetypes),
         api_adapters=MappingProxyType(api_adapters),
+        reference_relations=MappingProxyType(reference_relations),
     )
 
 

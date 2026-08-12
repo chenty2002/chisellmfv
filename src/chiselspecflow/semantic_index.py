@@ -51,6 +51,7 @@ def merge_semantic_index(
         if isinstance(path, str) and isinstance(line, int) and isinstance(name, str):
             elaborated_by_locator.setdefault((path, line, name), []).append(row)
     rows = []
+    source_observer_keys = set()
     for candidate in source_index.get("objects", []):
         name = candidate.get("name")
         source_type = candidate.get("chisel_type", {})
@@ -63,6 +64,8 @@ def merge_semantic_index(
             candidate_anchor.get("path"),
             candidate_anchor.get("line_start"),
         )
+        if observer_key in allowed_hierarchical:
+            source_observer_keys.add(observer_key)
         if fact is None and observer_key in allowed_hierarchical:
             matches = []
             for (path, line, fact_name), located in elaborated_by_locator.items():
@@ -146,6 +149,76 @@ def merge_semantic_index(
             }
         )
         rows.append(row)
+    for observer_key, observer in allowed_hierarchical.items():
+        if observer_key in source_observer_keys:
+            continue
+        matches = elaborated_by_locator.get(
+            (
+                observer["source_path"],
+                observer["source_line"],
+                observer["name"],
+            ),
+            [],
+        )
+        if len(matches) != 1:
+            raise SemanticIndexError(
+                "reviewed hierarchical observer is missing or ambiguous in baseline"
+            )
+        fact = matches[0]
+        chisel_type = observer["chisel_type"]
+        if fact.get("width") != chisel_type["width"]:
+            raise SemanticIndexError("hierarchical observer width mismatch")
+        source_path = (project.project_root / observer["source_path"]).resolve()
+        try:
+            source_path.relative_to(project.project_root)
+        except ValueError as exc:
+            raise SemanticIndexError("hierarchical observer escapes the project root") from exc
+        if not source_path.is_file():
+            raise SemanticIndexError("hierarchical observer source does not exist")
+        object_id = "obj_" + hashlib.sha256(
+            "\0".join(str(part) for part in observer_key).encode("utf-8")
+        ).hexdigest()[:20]
+        rows.append(
+            {
+                "object_id": object_id,
+                "name": observer["name"],
+                "source_anchor": {
+                    "path": observer["source_path"],
+                    "line_start": observer["source_line"],
+                    "line_end": observer["source_line"],
+                    "enclosing_symbol": observer["owner_module"],
+                    "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                },
+                "hardware_kind": "reg",
+                "scala_hardware_domain": "hardware",
+                "chisel_type": {
+                    **chisel_type,
+                    "fields": [],
+                    "index_domain": None,
+                },
+                "direction": "internal",
+                "owner_module": observer["owner_module"],
+                "guard_context": {},
+                "clock_reset": {
+                    "clock_domain": project.formal["clock"],
+                    "reset_domain": project.formal["reset"],
+                    "reset_kind": (
+                        "synchronous_active_high"
+                        if project.formal["reset_active_high"]
+                        else "synchronous_active_low"
+                    ),
+                },
+                "configuration_condition": configuration.configuration_id,
+                "accessibility": "wrapper",
+                "fact_status": "elaboration_confirmed",
+                "validation_errors": [],
+                "evidence_refs": [
+                    "reviewed hierarchical observer",
+                    "baseline_elaboration.json#objects/" + observer["name"],
+                ],
+                "source_id": "reviewed_adapter",
+            }
+        )
     value = {
         "schema_version": SEMANTIC_INDEX_SCHEMA,
         "project_id": project.project_id,
@@ -167,7 +240,7 @@ def merge_semantic_index(
 
 def _validate_hierarchical_observers(
     rows: Sequence[Mapping[str, Any]],
-) -> set[Tuple[Any, Any, Any, Any]]:
+) -> Dict[Tuple[Any, Any, Any, Any], Mapping[str, Any]]:
     required = {
         "owner_module",
         "name",
@@ -175,8 +248,9 @@ def _validate_hierarchical_observers(
         "source_line",
         "access_path",
         "trace_path",
+        "chisel_type",
     }
-    result = set()
+    result = {}
     for row in rows:
         if not isinstance(row, Mapping) or set(row) != required:
             raise SemanticIndexError("hierarchical observer has invalid fields")
@@ -193,6 +267,17 @@ def _validate_hierarchical_observers(
             raise SemanticIndexError("hierarchical observer has invalid text")
         if not isinstance(row["source_line"], int) or row["source_line"] < 1:
             raise SemanticIndexError("hierarchical observer has invalid source line")
+        chisel_type = row["chisel_type"]
+        if (
+            not isinstance(chisel_type, Mapping)
+            or set(chisel_type) != {"kind", "width", "signed"}
+            or chisel_type.get("kind") not in {"Bool", "UInt", "SInt"}
+            or not isinstance(chisel_type.get("width"), int)
+            or isinstance(chisel_type.get("width"), bool)
+            or chisel_type["width"] < 1
+            or not isinstance(chisel_type.get("signed"), bool)
+        ):
+            raise SemanticIndexError("hierarchical observer has invalid chisel type")
         for field in ("access_path", "trace_path"):
             if any(
                 re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) is None
@@ -209,7 +294,7 @@ def _validate_hierarchical_observers(
         )
         if key in result:
             raise SemanticIndexError("duplicate hierarchical observer")
-        result.add(key)
+        result[key] = row
     return result
 
 

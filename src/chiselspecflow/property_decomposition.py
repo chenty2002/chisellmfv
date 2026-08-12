@@ -28,6 +28,18 @@ _FIELDS = {
     "role_hints",
     "rows",
 }
+_INTENT_FIELDS = {
+    "intent_id",
+    "component_id",
+    "clause_locator",
+    "family",
+    "trigger_role",
+    "observation_role",
+    "expected_role",
+    "temporal_kind",
+    "bound",
+    "relation",
+}
 _ROLES = {
     "primary_assertion",
     "activation_cover",
@@ -85,7 +97,10 @@ def build_identity_decomposition(public_spec: Mapping[str, Any]) -> Dict[str, An
 def validate_property_decomposition(
     value: Mapping[str, Any], public_spec: Mapping[str, Any]
 ) -> Dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != _FIELDS:
+    if not isinstance(value, Mapping) or set(value) not in (
+        _FIELDS,
+        _FIELDS | {"intent_candidates"},
+    ):
         raise PropertyDecompositionError("property decomposition has an invalid exact schema")
     if (
         value.get("schema_version") != SCHEMA_VERSION
@@ -168,10 +183,70 @@ def validate_property_decomposition(
         ):
             raise PropertyDecompositionError("component group is malformed or overlapping")
         grouped.update(members)
+    intents = value.get("intent_candidates", [])
+    if not isinstance(intents, list):
+        raise PropertyDecompositionError("intent candidates must be an array")
+    intent_ids = set()
+    intent_counts: Dict[tuple[str, str], int] = {}
+    normalized_intents = []
+    for intent in intents:
+        if not isinstance(intent, Mapping) or set(intent) != _INTENT_FIELDS:
+            raise PropertyDecompositionError("intent candidate fields differ")
+        intent_id = intent.get("intent_id")
+        component = intent.get("component_id")
+        clause = intent.get("clause_locator")
+        owner = component_owner.get(component)
+        if (
+            not _text(intent_id)
+            or not _ID_RE.fullmatch(intent_id)
+            or intent_id in intent_ids
+            or role_hints.get(component) != "primary_assertion"
+            or owner is None
+            or clause not in by_expected[owner]["clause_refs"]
+            or intent.get("family") not in {
+                "combinational_mapping",
+                "reset_initialization",
+                "state_transition",
+                "stability",
+                "cardinality",
+                "bounded_response",
+                "algorithmic_reference",
+            }
+            or intent.get("trigger_role") not in {"none", "high", "low", "high_and_low"}
+            or intent.get("observation_role") != "observation"
+            or intent.get("expected_role") not in {
+                "semantic_object",
+                "zero",
+                "one",
+                "same_observation",
+                "incremented_observation",
+                "reference_model",
+            }
+            or intent.get("temporal_kind") not in {
+                "same_cycle",
+                "next_cycle",
+                "bounded_response",
+                "previous_value",
+                "reset_initialization",
+                "reference_relation",
+            }
+            or not isinstance(intent.get("bound"), int)
+            or isinstance(intent.get("bound"), bool)
+            or not 0 <= intent["bound"] <= 16
+            or intent.get("relation") not in {"eq", "neq", "ult", "ule", "ugt", "uge"}
+        ):
+            raise PropertyDecompositionError("intent candidate is invalid")
+        key = (component, clause)
+        intent_counts[key] = intent_counts.get(key, 0) + 1
+        if intent_counts[key] > 4:
+            raise PropertyDecompositionError("intent candidates exceed the per-clause bound")
+        intent_ids.add(intent_id)
+        normalized_intents.append(dict(intent))
     normalized = dict(value)
     normalized["rows"] = sorted(
         normalized_rows, key=lambda row: expected.index(row["expected_property_id"])
     )
+    normalized["intent_candidates"] = normalized_intents
     return normalized
 
 
@@ -188,6 +263,7 @@ def build_authoring_scope(
     public_spec: Mapping[str, Any],
     selected_property_ids: tuple[str, ...] = (),
     selected_component_ids: tuple[str, ...] = (),
+    selected_clause_ids: tuple[str, ...] = (),
 ) -> Dict[str, Any]:
     """Freeze one bounded public task without dropping unselected suite rows."""
 
@@ -203,6 +279,20 @@ def build_authoring_scope(
     )
     if not clauses:
         clauses = list(public_spec["normative_clause_ids"])
+    if selected_clause_ids:
+        if (
+            len(set(selected_clause_ids)) != len(selected_clause_ids)
+            or any(clause not in clauses for clause in selected_clause_ids)
+        ):
+            raise PropertyDecompositionError(
+                "authoring clause scope is unknown, duplicated, or outside the selected property"
+            )
+        selected_clause_set = set(selected_clause_ids)
+        clauses = [
+            clause
+            for clause in public_spec["normative_clause_ids"]
+            if clause in selected_clause_set
+        ]
     available_components = [component for row in rows for component in row["component_ids"]]
     if selected_component_ids:
         if (
@@ -242,6 +332,12 @@ def build_authoring_scope(
         "require_complete_primary_set": require_complete,
         "clause_ids": clauses,
         "decomposition_rows": [dict(row) for row in rows],
+        "intent_candidates": [
+            dict(intent)
+            for intent in value.get("intent_candidates", [])
+            if intent["component_id"] in primary_components
+            and intent["clause_locator"] in clauses
+        ],
     }
 
 

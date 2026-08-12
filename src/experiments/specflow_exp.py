@@ -204,6 +204,9 @@ def run_task(args: argparse.Namespace) -> Path:
                 opaque_task_id=f"{args.bug_id}-{args.method}-{name}",
                 expected_property_ids=(expected,),
                 component_ids=(primary,),
+                clause_ids=tuple(
+                    source["selected_authoring_scope"]["clause_ids"]
+                ),
             ),
             method_root / name,
             repo / "benchmark/synth/SPECIFICATIONS.sha256",
@@ -392,6 +395,9 @@ def run_diagnostic(args: argparse.Namespace) -> Path:
                 opaque_task_id=f"{args.bug_id}-diagnostic-{name}",
                 expected_property_ids=(expected,),
                 component_ids=(primary,),
+                clause_ids=tuple(
+                    source["selected_authoring_scope"]["clause_ids"]
+                ),
             ),
             diagnostic_root / name,
             repo / "benchmark/synth/SPECIFICATIONS.sha256",
