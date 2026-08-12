@@ -985,5 +985,250 @@ W3 集成者：
 
 1. W3 前置门失败，按第 11、13、16 节停止；不运行 deterministic baselines、trainer、W4 全 41 case 或 W5，不扩大 corpus、不调 fuzz、不换模型；
 2. 本轮正确完成状态是 `failed_stop/do_not_train`。已证明的是 native Verilog 仿真、candidate identity、exact graph join 和 13-case capability；没有 ML effectiveness 或跨 family 增量结论；
-3. 若以后明确开启新迭代，先在 VCA 共享 parser 中补齐常量 assignment 与独立 guard candidate identity，并在结果不可见前冻结至少含 passing/failing 的 gold-blind workload pool；任何 candidate、trace 或 evaluator 变化都必须使用新的 run root 重跑 W3；
+3. 若以后明确开启新迭代，按第 18 节依次修复 waveform/oracle 周期合同、statement-level execution authority 和 gold-blind contrast pool；任何 candidate、trace 或 evaluator 变化都必须使用新的 run root 重跑 W3；
 4. 只有新的 W3 同时通过 candidate、relation 和 contrast gate，才授权 W4。当前不再增加代码或测试。
+
+### 18. W3 failed-stop 根因诊断与根本修复计划
+
+#### Material Passport
+
+- Origin Skill：experiment-agent
+- Origin Mode：validate + plan
+- Origin Date：2026-08-12
+- Verification Status：ANALYZED（基于 v5 canonical artifacts 和当前代码调用链）
+- Version Label：native_verilog_root_repair_plan_v1
+
+#### 18.1 核心结论
+
+核心问题不是模型容量、特征权重、搜索 bounds 或 edge ID，而是**训练前的 statement-level execution authority 尚未闭合**：当前 VCA 从 signal dependency edge 间接推断 statement；它能给语句稳定 ID，却不能完整回答“在失败周期，究竟是哪条 assignment/guard 真实执行并产生了目标值”。同时，parent 把 testbench 在 `posedge` 写出的 CSV 行号直接当成 VCA 的 cycle-end FST 周期，导致部分 case 在错误 workload vector 或错误状态转换上切片。固定 trace pool 又只有已知 failing trigger，没有任何 contrast。
+
+因此 v5 的低 win rate 是上游 authority 和 sampling contract 的结果，不能通过训练器、调权、扩大 bounds 或更换模型修复。需要先修复两个共享根：
+
+1. **VCA statement execution semantics**：从 parser AST 建立完整 executable statement universe，并对具体 `(target, cycle)` 给出 exact active assignment/guard；
+2. **parent waveform/contrast contract**：correct/faulty oracle 与 VCA 使用同一 FST 时钟边界和采样相位，并在看见 gold/rank 前一次性冻结 gold-blind passing/failing workload pool。
+
+#### 18.2 证据链
+
+最终 v5 的关键事实如下：
+
+| 证据 | v5 结果 | 说明 |
+|---|---:|---|
+| candidate 总数 | 227 | candidate universe 已生成，不是空集问题 |
+| graph complete | 13/13 | 只证明搜索未异常终止，不证明 statement authority 正确 |
+| representable case | 9/13 | ALU-2、Counter-3、FSM-16-3/4 缺 statement kind |
+| reviewed gold statement | 10 | ALU-1 是两语句 set-valued gold，其余 representable case 各一条 |
+| 有 graph relation 的 candidate | 15/227，6.61% | relation 极稀疏 |
+| 有 graph relation 的 gold | 4/10，40% | 只有 ALU-1 的一条、ALU-4、Counter-1、Counter-2 |
+| gold-negative pair | 146 | 其中 win/tie/loss 为 15/128/3，87.67% 为 tie |
+| family win rate | ALU 0.158；Counter 0.5；FSM-16 0.0 | 三个 family 均未严格大于 0.5 |
+| passing/failing | 0/13 有 passing；13/13 有 failing | contrast feature 按合同不可训练 |
+| identity/leak | unknown/fuzzy/Chisel provenance/leak 均为 0 | 已排除 ID 错绑和标签泄漏作为当前主因 |
+
+调用链显示两个具体根因。
+
+第一，周期采样合同不一致：
+
+```text
+prepare
+  -> _prepare_case
+  -> compare_outputs                  # 把 output-signals.txt 行号记为 failure cycle
+  -> _vca_request                     # 原样传给 endpoint.cycle
+  -> build_causal_graph
+  -> CycleAlignedWaveform.get_signal_value
+                                      # 读取本 cycle 末、下一上升沿之前的值
+```
+
+Wit-HW testbench 在 `@(posedge clk)` 立即 `$fwrite`。组合输出记录的是当前上升沿值；nonblocking register output 通常是该上升沿更新前的值。VCA 的 `get_signal_value(cycle)` 则读取下一上升沿前的 cycle-end 值。两者不能用同一个整数行号直接连接。
+
+- ALU-3：CSV 的 `cycle=1/time=15` 为 `y=0, zero=0`，真实 faulty statement 是 line 26；v5 graph 的 `cycle=1` 却读到下一 vector 的 `y=0xBF`，选择 line 28。只读诊断把 endpoint 临时移到 cycle 0 后，gold line 26 才进入 graph；
+- ALU-5/6：两个分支的 faulty RHS 相同，仅靠 observed RHS 会选择第一条匹配分支，无法证明真正 guard；
+- FSM-16-1/2：v5 分别应定位 line 79/101，graph 却都选择 line 34 的 `state==S0 -> S1`。这不仅有输出/波形相位错位，还暴露 sequential guard 没有用 `state(t-1)` 和 localparam 常量做 exact evaluation。
+
+第二，candidate/graph 以 dependency 为中心，而 evaluator 的对象是 executable statement：
+
+- `_process_assignment` 会记录 assignment，但 `_process_statement` 没有形成独立 guard candidate；case default 也没有完整进入当前 AST traversal，所以 ALU-2 line 22 缺失；
+- Counter-3 是删除型错误，faulty RTL 中没有被删 assignment；没有 exact conditional guard candidate 时不能映射到最小 executable enclosure；
+- FSM-16-3/4 的错误本身是 guard，assignment candidate 不能代替 guard gold；
+- constant assignment 没有 RHS signal dependency；即使 assignment 在 candidate 中，也可能没有可承载它的 positive dependency edge；
+- sequential state guard 中的 target self-state 被 dependency self-loop 过滤，S0/S7 等 localparam 又没有进入完整 value environment，因此“RHS 与 observed target 相同”的第一条语句会被误当成活动分支；
+- 当前 `causal_trace_coverage` 以 `contribution.status=supported && score>0` 为存在条件，把“语句真实执行”与“某个输入 toggle 有正贡献”混为一件事。常量写和控制 guard 即使真实执行，也可能合法地没有正 RHS contribution。
+
+#### 18.3 根本修复原则
+
+只修共享根，不增加模型或兜底：
+
+1. **同相位比较**：failure endpoint 必须由 correct/faulty FST 在同一 rising-edge cycle-end sampler 上比较得到；legacy CSV 只保留为 simulator diagnostic，不再提供 VCA cycle；禁止用固定 `cycle-1` 猜测，因为首周期、组合逻辑和 NBA 的相位并不等价；
+2. **statement-first**：parser 先建立 executable statement records，再由 records 派生 dependency；candidate 不再由“是否有 source edge”决定；
+3. **activation 与 contribution 分离**：`active_exact` 回答“哪条语句执行”，intervention contribution 回答“哪个输入变化有贡献”。ranking relation coverage 使用前者，contribution score 仍作为独立可用特征；
+4. **exact 或停止**：guard、case default、localparam、previous-state 任一无法精确求值时记录 `ambiguous|unavailable` 并使 gate 失败；不采用首个 RHS 匹配、邻行、basename、fuzzy 或 correct-RTL runtime fallback；
+5. **fresh run**：sampling、candidate、graph 或 trace pool 任一改变都创建新 run root；v5 永久保留为本次诊断证据，不补写。
+
+#### 18.4 分步实施计划
+
+##### R0：冻结修复合同
+
+在编码前只冻结以下最小变化：
+
+- `rtl_candidate_universe.v2` 新增 `conditional_guard`，继续使用 `(artifact_id, statement_id)` identity；
+- semantic graph 复用已有 `semantic_nodes/edges`，不增加第二套 graph：
+  - `semantic_nodes.type=rtl_statement_activation`；
+  - relation 只增加 `active_statement_write` 和 `active_guard`；
+  - 每条 relation 必须含 exact `artifact_id/statement_id/target_node_id/cycle/activation_status`；
+- manifest 明确记录 `endpoint_sampling=cycle_end_before_next_rising` 和 workload-pool hash；
+- `causal_trace_coverage` 改为每条 failing trace 中 candidate 是否存在 `active_exact` statement relation；input contribution 不再决定 statement 是否存在；
+- 旧 v1 artifact 不加 compatibility reader，新的 W3-R 只读 v2 contract。
+
+验收：先用一个 contract test 固定上述字段；parent/VCA 任一侧若需要新增其他 schema，停止并先更新本节。
+
+##### R1：修复 waveform/oracle 对齐（parent）
+
+修改范围限定在 `src/experiments/verilogcause.py` 和现有 focused test：
+
+1. correct、original-faulty、sanitized-faulty 都保留可转换的 run-local trace；correct/original trace 继续放 evaluator-private；
+2. 使用现有 `CycleAlignedWaveform`、同一个 exact DUT clock、同一个 cycle-end sampler 读取公开 output；
+3. correct 与 sanitized-faulty 按 `(exact output signal, cycle-end cycle)` 比较，直接产生 failure endpoint；
+4. original-faulty 与 sanitized-faulty 使用同一 sampler 做 sanitizer equivalence；
+5. CSV 仍保存用于人工检查，但其行号不再进入 `_vca_request`；
+6. manifest 记录两侧 FST hash、clock identity、sampling phase 和 first divergent values。
+
+最小测试只保留一个参数化用例，覆盖组合和 sequential 两种相位：ALU-3 必须在 cycle-end cycle 0 观察到 correct/faulty `zero=1/0`；FSM-16-1 必须在 cycle-end cycle 4 观察到 correct/faulty `state=0/1`。测试不得用手工 `cycle-1` 修正；active statement line 由 R3 的集成检查负责。
+
+R1 gate：同一 case 的 oracle faulty endpoint value 必须与 VCA endpoint signal/cycle 读取值逐位一致；13 case 任一不一致即 `failed_stop`，不进入 candidate 修复效果判断。
+
+##### R2：补齐 executable statement universe（VCA）
+
+修改范围限定在 parser、candidate builder 和一个 focused test：
+
+1. 复用 hdlConvertor AST walker，为以下现存 executable entity 统一生成 `StatementEvidence`：
+   - blocking/nonblocking assignment；
+   - case item 和 default 内 assignment；
+   - `if/else-if`、case-item guard；
+   - port binding；
+2. guard identity 使用 module、规范化完整 guard path 和所包围 statement IDs；line 只用于 evidence/display，不进入 stable ID；若 identity collision 或 source position 不精确则 fail closed；
+3. 收集 parameter/localparam 的 exact constant value environment；不能解析的常量显式 unavailable；
+4. `build_rtl_candidates` 直接遍历 statement records，不要求该 statement 已产生 dependency edge；
+5. 删除型 gold 仍不自动生成不存在的 assignment。Counter-3 只能由 Codex 在 review 时决定是否映射到 exact reset guard 这个最小现存 executable enclosure。
+
+R2 focused acceptance：
+
+- ALU-2 line 22 default assignment 出现在 candidate；
+- Counter-3 reset guard 有 exact candidate；
+- FSM-16-3 line 88 和 FSM-16-4 lines 45/52 是 `conditional_guard`；
+- 原 assignment/register-update/port-binding identity 仍通过 line-insertion stability check；
+- 无 source 的 constant assignment 仍进入 universe。
+
+##### R3：建立 exact statement activation relation（VCA）
+
+这是核心修复，复用现有 parser records、waveform reader 和 expression evaluator，不新建分析框架：
+
+1. 对 causal slice 访问到的每个 `(target signal, cycle)`，枚举该 target 的 statement records；
+2. combinational statement 在同 cycle-end snapshot 求值完整 guard path 和 RHS；
+3. sequential statement 用 `guard/RHS@cycle-1`、`observed target@cycle`；target register 的 previous-state 必须参与 guard，不能因 dependency self-loop 过滤而丢失；
+4. 用 parameter/localparam environment 解析 S0、S7 等状态常量；
+5. 仅当完整 guard 为 true 且 RHS 与 observed target exact match 时输出 `active_statement_write(active_exact)`；其 enclosing guard 同时输出 `active_guard(active_exact)`；
+6. 多条语句同时满足时保留 `ambiguous` 诊断，不选择 source order 第一条；X/Z、缺 operand、常量未解析均为 `unavailable`；
+7. constant RHS 无需伪造 source dependency，也能通过 statement activation relation 进入 graph；
+8. 现有 signal dependency/contribution edges 保留，供 contribution 特征使用，但不再承担 statement reachability authority。
+
+R3 的最小反例检查固定为：
+
+| Case | exact active statement 期望 |
+|---|---|
+| ALU-3 | line 26，而不是 line 28 |
+| ALU-5 | line 28，而不是 line 26 |
+| ALU-6 | line 34，而不是 line 32 |
+| FSM-16-1 | line 79，而不是 line 34 |
+| FSM-16-2 | line 101，而不是 line 34 |
+
+这些是根因回归检查，不是只对五个 case 写 special case。实现中禁止 case name、line number或 gold 条件分支。
+
+##### R4：冻结 gold-blind contrast pool（parent）
+
+候选、gold review 和 rank 可见前，对每个 metadata trigger 一次性生成同一规则的最多四个 workload：
+
+1. 原始完整 trigger；
+2. 只保留第一条 input vector；
+3. 与原 workload 行数相同的全零 vectors；
+4. 与原 workload 行数相同的全一 vectors；
+5. 按 workload SHA-256 去重；字节级保留逗号格式和末尾无换行约束。
+
+规则只读取 metadata input widths 和 trigger bytes，不读取 correct output、gold、candidate、graph 或既有 pass/fail。四个 workload 全部生成后才运行 correct oracle 分类，禁止“生成到出现 passing 为止”。
+
+为避免重复编译，直接复用 Verilator binary：每个 correct/original-faulty/sanitized-faulty 版本只编译一次，每个 workload 在独立 trace cwd 执行并产生独立 output、coverage、VCD/FST。无需 scheduler、retry 或 cache framework。
+
+R4 gate：每个 case 至少一条 failing 和一条 passing faulty-design trace；如果固定池仍缺一类，记录 `contrast_incomplete` 并停止，不追加第五个定制 workload。
+
+##### R5：重新审查 gold 并运行 fresh W3-R
+
+R1–R4 合入并提交后创建全新 run root，严格执行：
+
+```text
+prepare all four workloads
+  -> stop_for_codex_gold_review
+  -> build rtl_candidate_universe.v2
+  -> Codex review 13-case gold/representability
+  -> build failing-trace causal graphs
+  -> exact candidate/activation join
+  -> relation diagnostic
+  -> gate
+```
+
+W3-R 必须同时满足：
+
+1. 13/13 manifest、sanitizer equivalence、FST endpoint sampling 完整且 hash-bound；
+2. 13/13 有 Codex review decision；预期 guard/enclosure 修复后可到 13/13 representable，但必须由实际 candidate review 确认，不能预填；
+3. 每个 representable gold 至少一个 statement 在至少一条 failing trace 中为 `active_exact`；
+4. `ambiguous/unavailable/unknown/fuzzy/Chisel provenance/leak` 均为 0；
+5. 13/13 各有至少一条 failing 和 passing trace；
+6. all-candidate、gold-only activation coverage 完整报告；
+7. `causal_trace_coverage` gold-vs-negative win rate 在 ALU、Counter、FSM-16 三个 family 都严格大于 0.5。
+
+任何一项失败仍写 `failed_stop/do_not_train`。只有全部通过才运行计划中已有 deterministic baselines；W3-R 仍不训练 ML。
+
+##### R6：W4 条件授权
+
+只有 W3-R 和 deterministic baseline gate 都通过，才冻结 41-case candidate/gold/trace/split 并创建 fresh W4。W4 之前不实现新模型；继续复用现有 deterministic averaged pairwise perceptron。若 full corpus 暴露新 statement kind，回到 R2 修共享 parser 并重新运行 fresh W3-R，不在 W4 加 case-local fallback。
+
+#### 18.5 并行边界、冲突点与合并顺序
+
+R0 完成后可并行两条仓库隔离工作线：
+
+| 工作线 | 顺序 | 写入范围 | 共享接口 | 主要冲突 |
+|---|---|---|---|---|
+| parent | R1 -> R4 | `src/experiments/verilogcause.py`、现有 focused test | endpoint sampling、workload/manifest schema | 两项都改同一 parent 文件，必须同线串行 |
+| VCA | R2 -> R3 | parser、engine/candidate、现有 focused test | candidate v2、activation relation | R2/R3 共用 statement records，必须同线串行 |
+
+同步点：
+
+1. R0 双方确认 candidate/graph/manifest exact fields；
+2. R1 给出 ALU-3/FSM-16-1 phase smoke；
+3. R2 给出四类此前缺失 candidate；
+4. R3 给出五个错误分支回归；
+5. parent 只在 VCA commit 完成后更新 gitlink；
+6. 集成者运行 focused tests 和一个 native API smoke，再创建 W3-R run。
+
+最终合并顺序：
+
+```text
+VCA R2 candidate commit
+  -> VCA R3 activation commit
+  -> parent R1 sampling commit
+  -> parent R4 contrast-pool commit
+  -> parent 更新 VCA gitlink
+  -> focused checks / one-case smoke
+  -> fresh W3-R artifacts
+  -> 文档记录 gate 结论
+```
+
+#### 18.6 明确不做
+
+- 不调整当前十项 feature 的权重，不增加 GNN/Transformer；
+- 不扩大 causal search bounds；
+- 不用 `cycle-1`、邻行、首个 RHS match 或 case-specific mapping；
+- 不自动把 deletion 映射为 assignment；
+- 不添加旧 v1 run reader、retry、auto-repair、scheduler 或第五个自适应 workload；
+- 不在 W3-R 通过前运行 41-case、LOBO/LODO/LOFO 或报告 ML effectiveness。
+
+#### 18.7 当前状态与下一步
+
+本节完成的是 artifact-grounded 诊断和实施合同，尚未实施 R1–R4，也没有产生新的效果证据。下一步从 R0 开始；最先应实现 R1 的 FST 同相位 oracle 和 R2 的完整 statement records，两条工作线可并行。任何实现都必须保留 v5 和现有 dirty worktree，不覆盖旧 run。
