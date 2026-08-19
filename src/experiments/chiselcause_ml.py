@@ -56,7 +56,6 @@ SPLITS = {
     "lodo": "design_id",
     "lofo": "family_id",
 }
-GOLD_TASKS = Path("runs/specflow-paper/20260808-c4-r-complete-formula-v1/tasks.json")
 CASE_ID = re.compile(
     rf"^((?:{'|'.join(map(re.escape, ML_DESIGNS))})-\d+)-(?:base|w\d{{2}})$"
 )
@@ -227,7 +226,7 @@ def candidate_features(
 def build_dataset(
     run: Path,
     case_root: Path,
-    tasks_path: Path = GOLD_TASKS,
+    tasks_path: Path,
     replay_run: Path | None = None,
     designs: Sequence[str] = ML_DESIGNS,
 ) -> None:
@@ -803,6 +802,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     dataset_parser = actions.add_parser("dataset")
     dataset_parser.add_argument("--run", required=True)
     dataset_parser.add_argument("--case-root", required=True)
+    dataset_parser.add_argument("--tasks", required=True)
     dataset_parser.add_argument("--replay-run")
     dataset_parser.add_argument("--design", action="append", choices=ML_DESIGNS)
     train_parser = actions.add_parser("train")
@@ -818,6 +818,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         build_dataset(
             run,
             Path(args.case_root).resolve(),
+            Path(args.tasks).resolve(),
             replay_run=Path(args.replay_run).resolve() if args.replay_run else None,
             designs=args.design or ML_DESIGNS,
         )

@@ -305,6 +305,14 @@ def _prepare_case(
         ),
         encoding="utf-8",
     )
+    faulty_diagnosis_wrapper = formal_dir / "faulty_diagnosis_wrapper.sv"
+    faulty_diagnosis_wrapper.write_text(
+        _render_faulty_diagnosis_wrapper(
+            faulty_top=f"ChiselCauseFaulty_{project.generator['top_name']}",
+            interface=interface,
+        ),
+        encoding="utf-8",
+    )
     rtl_rows = [
         _artifact(run_dir, clean_formal_rtl),
         _artifact(run_dir, faulty_formal_rtl),
@@ -334,10 +342,14 @@ def _prepare_case(
         "faulty_variant": _variant_row(faulty_config, faulty, run_dir),
         "interface": interface,
         "artifacts": {
-            "diagnosis_rtl_set": rtl_rows,
+            "diagnosis_rtl_set": [
+                _artifact(run_dir, faulty_formal_rtl),
+                _artifact(run_dir, faulty_diagnosis_wrapper),
+            ],
             "clean_formal_rtl": _artifact(run_dir, clean_formal_rtl),
             "faulty_formal_rtl": _artifact(run_dir, faulty_formal_rtl),
             "miter": _artifact(run_dir, miter_path),
+            "faulty_diagnosis_wrapper": _artifact(run_dir, faulty_diagnosis_wrapper),
             "jaspergold_log": _artifact(run_dir, formal_dir / "jaspergold.log"),
             "vcd": _artifact(run_dir, vcd_path),
             "fst": _artifact(run_dir, fst_path),
@@ -511,6 +523,24 @@ def _render_differential_diagnosis_wrapper(
         f"  {faulty_top} faulty_dut (\n{_connections(inputs, outputs, 'faulty')}\n  );\n"
         "  wire chiselcause_mismatch_any;\n"
         f"  assign chiselcause_mismatch_any = {mismatches};\n"
+        "endmodule\n"
+    )
+
+
+def _render_faulty_diagnosis_wrapper(
+    *, faulty_top: str, interface: Mapping[str, Any]
+) -> str:
+    inputs = interface["inputs"]
+    outputs = interface["outputs"]
+    ports = ",\n".join(
+        f"  input {_width(row['width'])}{row['name']}" for row in inputs
+    )
+    wires = "\n".join(
+        f"  wire {_width(row['width'])}faulty_{row['name']};" for row in outputs
+    )
+    return (
+        f"module ChiselCauseMiter(\n{ports}\n);\n{wires}\n"
+        f"  {faulty_top} faulty_dut (\n{_connections(inputs, outputs, 'faulty')}\n  );\n"
         "endmodule\n"
     )
 
@@ -959,7 +989,9 @@ def run_localization(args: argparse.Namespace) -> Path:
     trace_path = (run_dir / case["artifacts"]["fst"]["path"]).resolve()
     trace_sha256, trace_bytes = sha256_file(trace_path)
     with CycleAlignedWaveform(str(trace_path), "clock") as waveform:
-        endpoint = waveform.resolve_signal(case["cex"]["diagnosis_endpoint"])
+        endpoint = waveform.resolve_signal(
+            f"ChiselCauseMiter.faulty_{case['cex']['violated_output']}"
+        )
         clock = waveform.resolve_signal(case["endpoint_projection"]["clock_signal"])
     if endpoint.resolved_signal is None or clock.resolved_signal is None:
         raise ChiselCauseExperimentError("CEX endpoint or clock is not uniquely present in FST")
@@ -1063,8 +1095,6 @@ def run_localization(args: argparse.Namespace) -> Path:
         case_id=args.case_id,
         method=args.method,
         source_root=source_root,
-        clean_rtl=run_dir / case["clean_variant"]["rtl"]["path"],
-        faulty_rtl=run_dir / case["faulty_variant"]["rtl"]["path"],
     )
     _write_json(method_dir / "source_ranking.json", ranking)
     complete = graph["status"] == "complete" and ranking["status"] == "complete"
